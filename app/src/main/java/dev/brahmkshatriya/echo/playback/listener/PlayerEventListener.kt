@@ -339,6 +339,87 @@ class PlayerEventListener(
             bufferingWatchdog?.cancel()
             bufferingWatchdog = null
         }
+        // ⚠⚠ SETTLE playWhenReady AT THE END OF THE QUEUE. ExoPlayer does NOT clear it on STATE_ENDED,
+        // and nothing else here did either, so a queue that simply ran out sat at ENDED with the player
+        // still declaring INTENT TO PLAY — indefinitely. ONE FLAG, FIVE CONSUMERS, all wrong at once:
+        //   1. PlayerFragment:832 trackPlayPause.isChecked      -> the transport shows PAUSE
+        //   2. PlayerFragment:833 collapsedTrackPlayPause       -> the mini-bar shows PAUSE too
+        //   3. PlayerFragment.updateWaveMotion (via :776)       -> the seek wave keeps animating
+        //   4. PlayerFragment:838 playingIndicator.alpha        -> via `buffering && playWhenReady`
+        //   5. MainActivity.keepScreenOn (the `if (isTV)` observer) -> screen held awake on a finished queue
+        // Reported from device as "a PAUSE button offering to pause something that is not playing", which
+        // is the one a user actually notices — the others read as cosmetic until you know the cause.
+        //
+        // ⚠️ pause(), NEVER stop(), AND THE DIFFERENCE IS NOT STATE HYGIENE:
+        //   • stop() sends the INNER player to STATE_IDLE, and PlayerService sets
+        //     SHOW_NOTIFICATION_FOR_IDLE_PLAYER_NEVER — MediaNotificationManager.shouldShowNotification
+        //     (media3-session 1.11.0, :382) returns true for any non-IDLE state and false for IDLE under
+        //     NEVER — so the notification would be removed the instant the last track ended.
+        //   • The recorded sequencing for adopting stop() is "switch to AFTER_STOP_OR_ERROR first". THAT
+        //     SEQUENCING IS NOT SAFE HERE AND READS AS IF IT WERE. That mode returns
+        //     `!wasNotificationDismissed && hasBeenPrepared` for an IDLE player (:394-396), and
+        //     hasBeenPrepared LATCHES TRUE the first time anything plays and is never reset — so every
+        //     later IDLE posts a MediaStyle notification with a PLAY button. This app already shipped that
+        //     once, via a hardcoded `2` with a comment claiming 2 == NEVER (the real mapping is
+        //     0=ALWAYS, 1=NEVER, 2=AFTER_STOP_OR_ERROR), and it drove onPlaybackResumption ->
+        //     unconditional player.play(). Do not re-enter it as a stepping stone.
+        //   • stop() also leaves getPlayerError() non-null (stopInternal passes resetError=false) and only
+        //     prepare() clears it. Not a problem AT ENDED — reaching ENDED requires a completed prepare(),
+        //     so the error is null by construction — but stop() would move us to an IDLE that a later
+        //     failure can populate.
+        //
+        // ⚠️ AND pause() DOES NOT ACTIVATE ShufflePlayer's FAKE STATE_READY. That fake needs
+        // `inner == STATE_IDLE && mediaItemCount > 0 && !playWhenReady`. Here the inner player is ENDED,
+        // not IDLE, so the condition fails on its first term. The trap to avoid is doing BOTH — stop() to
+        // IDLE and clearing playWhenReady — which would satisfy it and blind all four prepare() guards
+        // that test `playbackState == STATE_IDLE` (PlayerRadio's post-append prepare and PlayerCallback's
+        // three). Checked against the Media3-internal readers too: shouldShowNotification and
+        // MediaLibrarySessionImpl's recent-root branch both test against IDLE, and isAnySessionUserEngaged
+        // (:288-300) requires READY or BUFFERING — so it is ALREADY false at ENDED regardless of this
+        // pause, meaning the foreground timeout was already running before this change.
+        //
+        // WHAT THIS DELIBERATELY DOES NOT CHANGE: the frozen 02:10/02:10 readout (PlayerUiListener stops
+        // the progress ticker for ENDED — correct, and only conspicuous because the wave next to it kept
+        // moving), and the replay-on-press behaviour, since ShufflePlayer.play()/setPlayWhenReady() still
+        // seekTo(0, 0) at ENDED. That branch carries its own never-monitored note and is the same family as
+        // the open cold-start autoplay bug: a queue parked at ENDED is what converts a phantom play request
+        // into audible playback of a finished track. Pausing does not remove ENDED, so that interaction is
+        // UNCHANGED — it is only the five playWhenReady consumers above that are fixed.
+        //
+        // hasNextMediaItem() rather than a bare ENDED test: ENDED with a next item is a state the radio
+        // append path can transiently produce, and pausing there would fight the append.
+        //
+        // ⚠⚠ NOT GATED ON !isTv, AND THE FIRST VERSION OF THIS WAS — THAT WAS A BUG. The reasoning was
+        // "PlayerRadio.onPlaybackStateChanged already owns end-of-queue on TV". It owns the RADIO
+        // CONTINUATION there; it does not settle playWhenReady, and TV HAS THE SAME FIVE-CONSUMER PROBLEM:
+        //   PlayerTvFragment.updateWaveMotion   reads viewModel.playWhenReady.value   (its own tvSeekWaveBar)
+        //   PlayerTvFragment                    tvTrackPlayPause.isChecked = it
+        //   PlayerTvFragment                    tvPlayingIndicator.alpha via buffering && it
+        //   MainActivity                        `if (isTV) observe(playWhenReady) { keepScreenOn = it }`
+        // THE LAST ONE IS TV-ONLY. keepScreenOn is only wired on TV, so gating this fix off on TV excluded
+        // the single platform where that consumer exists — a finished queue would hold the screen awake
+        // indefinitely, on the device most likely to be left unattended.
+        // GENERAL LESSON, ALREADY PAID FOR ONCE: this project has shipped a fix that did nothing because
+        // "the running fragment is PlayerTvFragment, not PlayerFragment — and the fix lives entirely in
+        // PlayerFragment". MainActivity picks PlayerTvFragment on isTV else PlayerFragment. WHEN A FIX
+        // TARGETS PLAYER UI STATE, CHECK BOTH FRAGMENTS BEFORE ASSUMING ONE OF THEM IS COVERED.
+        // AND THE TV CASE IS THE WORSE ONE, not the safer one: tvDriveRadio(atEnd = true) calls
+        // loadPlaylist() and only then seeks and plays, so on the empty-station data shape TV regenerates,
+        // gets nothing, and sits at ENDED with no settle at all.
+        // COST OF NOT GATING: when tvDriveRadio DOES append, this pause lands first and its `play()`
+        // restores playWhenReady a moment later — a brief glyph/wave flicker for the length of the fetch.
+        // That is honest state (nothing is playing during it) and it cannot break the append: pause()
+        // leaves playbackState at ENDED, so tvDriveRadio's `if (STATE_ENDED && hasNextMediaItem())`
+        // recovery still matches.
+        // ⚠️ REMOVING THE GATE ALSO REMOVES A DEPENDENCE ON isTv BEING RIGHT, which is worth having:
+        // isTv has been observed FALSE ON A GOOGLE TV before UiUtils.isTv was corrected to check
+        // UiModeManager.currentModeType == UI_MODE_TYPE_TELEVISION BEFORE falling back to
+        // FEATURE_LEANBACK (Google TV reports the former but not the latter). The current implementation is
+        // the corrected one — but a fix that does not need to ask the question cannot be wrong about it.
+        if (playbackState == Player.STATE_ENDED && !player.hasNextMediaItem()) {
+            Log.d("GladixPlayback", "STATE_ENDED with no next item: settling playWhenReady")
+            player.pause()
+        }
         if (playbackState == Player.STATE_READY) {
             // PROBE (2026-08-29) - see the field declarations. This is the only moment the current item's
             // timeline is final and the shouldLoadNextMediaPeriod gate is being evaluated against it, which

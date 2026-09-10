@@ -387,7 +387,7 @@ class PlayerCallback(
             clearMediaItems()
             shuffleModeEnabled = false
         }
-        PlayerRadio.play(player, downloadFlow, app, radioFlow, loaded)
+        PlayerRadio.play(player, downloadFlow, app, radioFlow, loaded, extension)
         player.with { play() }
         SessionResult(RESULT_SUCCESS)
     }
@@ -433,7 +433,7 @@ class PlayerCallback(
             val extension = extensions.music.getExtension(extId)
             if (extension != null) {
                 val loaded = PlayerRadio.start(throwableFlow, extension, seed, context)
-                if (loaded != null) PlayerRadio.play(player, downloadFlow, app, radioFlow, loaded)
+                if (loaded != null) PlayerRadio.play(player, downloadFlow, app, radioFlow, loaded, extension)
             }
         } catch (e: CancellationException) {
             throw e

@@ -250,6 +250,16 @@ class DeezerRadioClient(private val api: DeezerApi, private val parser: DeezerPa
         )
     )
 
+    // ⚠️ MIRRORED APP-SIDE — EDIT BOTH OR NEITHER. PlayerRadio's companion carries VERSION_SUFFIX with
+    // the identical pattern, used by its append dedup (dedupKey's title+artist fallback when a Track has no
+    // ISRC). It is a COPY on purpose: the app cannot depend on this extension module, and the app-side rule
+    // has to hold for every extension, not just Deezer. The two are therefore free to drift, and drift is
+    // the whole risk — if you widen this one (e.g. to strip " - Live at X", which neither currently does),
+    // widen the app's too or TRACK stations will filter differently from every other kind.
+    // The two filters do NOT overlap fully and both are deliberate: this one compares against the SEED
+    // (radio.extras seed_title / seed_artist_name), which the app-side filter cannot see — it only knows
+    // what is in the queue — so this still removes a seed that was never queued or has scrolled out of the
+    // app's dedup window. Keeping both was decided 2026-09-09, not left by omission.
     private val versionSuffixRegex = Regex(
         """\s*\(.*\)\s*$""",
         RegexOption.IGNORE_CASE

@@ -71,6 +71,30 @@ android {
         // True only when google-services.json is present. Compile-time constant used to guard
         // every Firebase call site so no-JSON builds never load the (compileOnly) Firebase classes.
         buildConfigField("boolean", "HAS_FIREBASE", "$hasGoogleServices")
+        // Last.fm api_key for the endless-queue radio fallback (see RadioFallback). PUBLIC, READ-ONLY,
+        // NO USER DATA, NO BILLING — the free tier needs only an api_key in the query string, and a key in
+        // a shipped APK is assumed extractable. That is acceptable for this class of key; it would not be
+        // for anything authenticated.
+        // ⚠️ READ FROM local.properties, NOT gradle.properties. gradle.properties IS TRACKED in this repo
+        // (checked 2026-09-09) so a key placed there would be committed; local.properties is git-ignored on
+        // line 3 of .gitignore. LASTFM_API_KEY env var is the CI path. Empty is a FIRST-CLASS DISABLE, the
+        // same shape as HAS_FIREBASE: RadioFallback.isEnabled is false, the fallback never fires, and
+        // contributor and CI builds compile and run unchanged. Rotating the key needs no code change.
+        val lastFmKey = runCatching {
+            java.util.Properties().apply {
+                rootProject.file("local.properties").takeIf { it.exists() }?.inputStream()?.use { load(it) }
+            }.getProperty("lastfm.apiKey")
+        }.getOrNull() ?: System.getenv("LASTFM_API_KEY") ?: ""
+        // ⚠⚠ THIS VALUE EXISTS IN EXACTLY ONE PLACE, ON ONE MACHINE, AND IS IN NO BACKUP. local.properties
+        // is git-ignored, so a fresh clone, a second machine or a CI runner builds with an EMPTY key and
+        // the fallback silently disabled. SAME SHAPE AS THE DEBUG KEYSTORE (see the signingConfig note
+        // below): one unversioned local file, no copy anywhere, and losing it is not detectable at build
+        // time — the build succeeds. BACK IT UP OUTSIDE THE REPO.
+        // Mitigated, not solved: RadioFallback logs `reason=no-api-key` when it would have fired, so a
+        // keyless build is distinguishable from a working one in logcat rather than being silent. That is
+        // the only signal; there is deliberately no build-time warning, because contributor and CI builds
+        // must stay clean.
+        buildConfigField("String", "LASTFM_API_KEY", "\"$lastFmKey\"")
     }
 
     // ── WHICH VARIANT GOES WHERE. Not derivable from this file, so it is written down. VERIFIED

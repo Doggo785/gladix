@@ -18,7 +18,56 @@
          the drift risk documented on collapsed_end_controls_width without buying anything. -->
     <dimen name="player_pill_max_width">210dp</dimen>
     <dimen name="context_menu_cover_size">48dp</dimen>
-    <dimen name="max_cover_size">384dp</dimen>
+    <!-- Ceiling on the full-screen player's square cover (BasePlayerTrackCoverContainer sets both
+         layout_constraintWidth_max and layout_constraintHeight_max to this, with dimensionRatio 1,1).
+         384dp → 448dp on 2026-09-09. THE REASON IS DENSITY, NOT DEVICE.
+
+         WHAT WAS WRONG. The cover is width-bound, never height-bound, so it takes screenWidth minus its
+         32dp of margins — UNTIL this cap binds, after which extra screen room becomes dead space instead
+         of cover. The cap binds when screenWidthDp - 32 > cap, i.e. above 416dp of width. A Pixel 10 is
+         1080px wide, so it is 411dp at the factory density of 420 and 485dp at 356 (Display size set to
+         its smallest). FACTORY DENSITY CLEARS THE OLD CAP BY 1.1% AND NOTHING ELSE DOES:
+           420: available 379dp → cover 379dp = 92% of the screen.
+           356: available 453dp → cover CAPPED at 384dp = 79%, with the difference pooling as slack at
+                both ends of the packed chain (measured on device: player_track_cover 854x854 px, which is
+                384dp to the pixel).
+         Any user who reduces Display size, and any phone wider than 416dp, got the 79% layout.
+
+         ⚠️ 420 CANNOT CHANGE, BY CONSTRUCTION — THIS IS THE PROOF, NOT AN OBSERVATION. Available width at
+         420 is 379dp, which is already below the OLD cap; the cover is limited by its margins there, not
+         by this value. So ANY cap >= 380dp leaves factory density bit-identical. 448 is chosen to land 356
+         at 448/485 = 92.4%, matching 420's 92.2% rather than exceeding it, while keeping a real ceiling for
+         tablets (at 800dp wide: 48% → 56%).
+
+         ⚠️ LANDSCAPE IS AFFECTED AND THAT WAS CHECKED, NOT ASSUMED — DO NOT RE-RAISE IT. This dimen sits
+         on BasePlayerTrackCoverContainer, the parent of BOTH the portrait style and the values-land one,
+         and the cap already binds in landscape today. Measured and reconciled:
+           today, 420, landscape:    cover 384dp = 1008px in a 1080px-tall screen → ~36px clearance,
+                                     and that is what the app ships with and looks correct on device.
+           proposed, 356, landscape: cover 448dp =  997px → ~42px clearance, i.e. MORE room than the
+                                     default configuration already runs with.
+         Raising the cap moves landscape TOWARD a clearance the app already ships, not away from one. No
+         values-land override, no split value, no new mechanism — deliberately, because a second value
+         would create exactly the drift risk documented on collapsed_end_controls_width.
+         PRECEDENT FOR CHECKING RATHER THAN ASSUMING: an earlier session caught "Landscape risk — 388dp
+         AppBarLayout would fill entire screen in landscape (no layout-land variant exists)" before
+         building. Same shape of risk, same answer: measure the landscape configuration first.
+         layout-land/fragment_player.xml is a maintained surface, edited in at least two prior sessions.
+
+         PROVENANCE, BECAUSE AN UNEXPLAINED CONSTANT DESERVES IT: this is inherited upstream scaffolding.
+         `git log -S max_cover_size` puts it in 3817ceb5 "Initial Commit, Only contains base UI" at 280dp,
+         later raised to 384dp — with NO COMMENT IN ANY REVISION. Both readings belong here: a constant
+         whose reason is unrecorded warrants caution, AND it has already been raised once with no recorded
+         fallout, which is evidence it is tunable rather than load-bearing.
+
+         RESIDUAL SLACK IS NOT FIXED BY THIS AND IS NOT MEANT TO BE. Growing the cover adds 64dp to the
+         packed chain, so the leftover pooled at each end drops by roughly a third — it does not vanish.
+         That is structural: paddingTop/paddingBottom on PlayerExpandedConstraintLayout are RESERVATIONS
+         (expanded toolbar, more-sheet peek), not spacing knobs. THE NAMED LEVER IS THE CHAIN BIAS — see
+         PlayerTrackCoverContainer in styles.xml, "Neither is a spacing knob; the cover chain's bias is."
+         CONSIDERED AND NOT TAKEN 2026-09-09: bias changes 420, which is the one configuration that must
+         not move, and the cover proportion was the complaint rather than the slack. -->
+    <dimen name="max_cover_size">448dp</dimen>
     <dimen name="media_header_cover_size">250dp</dimen>
     <dimen name="bottom_player_peek_height">136dp</dimen>
     <dimen name="nav_width">@dimen/collapsed_cover_size</dimen>

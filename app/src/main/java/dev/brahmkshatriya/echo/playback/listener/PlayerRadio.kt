@@ -11,6 +11,7 @@ import dev.brahmkshatriya.echo.common.clients.RadioClient
 import dev.brahmkshatriya.echo.common.models.EchoMediaItem
 import dev.brahmkshatriya.echo.common.models.Feed.Companion.pagedDataOfFirst
 import dev.brahmkshatriya.echo.common.models.Radio
+import dev.brahmkshatriya.echo.common.models.Track
 import dev.brahmkshatriya.echo.di.App
 import dev.brahmkshatriya.echo.download.Downloader
 import dev.brahmkshatriya.echo.extensions.ExtensionUtils.get
@@ -47,6 +48,50 @@ class PlayerRadio(
     companion object {
         const val AUTO_START_RADIO = "auto_start_radio"
         private const val RADIO_PREFETCH_THRESHOLD = 3
+
+        // How far back down the queue the append dedup looks. Big enough to survive a rotation of the same
+        // recording across several album ids; small enough that a long restored queue is not rescanned and
+        // that a station revisiting a track much later is not treated as a loop. Not tuned against data —
+        // if a rotation ever exceeds this, the symptom is the loop returning and this is the first suspect.
+        private const val DEDUP_WINDOW = 24
+
+        // ⚠⚠ THE SINGLE APP-SIDE DEFINITION. RadioFallback calls stripVersionSuffix below rather than
+        // holding a copy; anything else app-side that needs it must do the same.
+        //
+        // WHY THIS IS NOT IN `common`, WHICH IS THE OBVIOUS HOME SINCE BOTH THE APP AND EVERY EXTENSION
+        // DEPEND ON IT — judged 2026-09-09 and worth stating because "the app cannot depend on an extension
+        // module" is TRUE BUT INCOMPLETE as a reason:
+        //   • `common` IS THE EXTENSION ABI. Every symbol there is a permanent public contract kept by
+        //     `-keep class dev.brahmkshatriya.echo.common.** { *; }` and anchored in verifyExtensionAbi.
+        //     ADDING is much safer than changing — the R8 break was repackaging, not surface size — but it
+        //     creates a NEW VERSION-SKEW HAZARD: an extension compiled against a `common` that has this
+        //     function, running against an app whose `common` does not, throws the
+        //     NoSuchMethodError/AbstractMethodError family. ExtensionUtils.getOrThrow already degrades that
+        //     family SILENTLY as "outdated extension", so the failure would be invisible.
+        //   • That is a real, if small, permanent cost. The thing being shared is a TWO-LINE REGEX. The
+        //     trade does not clear the bar this project sets for that surface.
+        // SO: ONE COPY PER MODULE BOUNDARY IS THE MAXIMUM DEFENSIBLE, and that is now the state — one here,
+        // one in DeezerRadioClient. Three was one too many and the extra one was pure duplication.
+        //
+        // ⚠️ WHAT MAKES THE REMAINING PAIR DRIFT-RESISTANT, BEYOND THE MIRROR NOTES — because notes alone
+        // have demonstrably not been enough in this repo: STRUCTURE, not prose. There is now exactly ONE
+        // definition reachable from app code, so a future app-side consumer references it instead of
+        // retyping (retyping is what produced the third copy in the first place). The cross-module pair is
+        // only reconcilable by the notes, so it is kept to the SMALLEST possible surface — one regex, one
+        // function, no options and no call-site variation — which is what makes a divergence obvious on
+        // sight rather than something to reason about.
+        private val VERSION_SUFFIX = Regex("""\s*\(.*\)\s*$""", RegexOption.IGNORE_CASE)
+
+        fun stripVersionSuffix(s: String) = s.replace(VERSION_SUFFIX, "").trim()
+
+        // Null when the track carries nothing comparable — caller keeps it. See the note at the call site.
+        private fun Track.dedupKey(): String? {
+            isrc?.trim()?.takeIf { it.isNotEmpty() }?.let { return "isrc:${it.uppercase()}" }
+            val t = stripVersionSuffix(title)
+            if (t.isEmpty()) return null
+            val a = artists.firstOrNull()?.name?.trim().orEmpty()
+            return "ta:${t.lowercase()}\u0000${a.lowercase()}"
+        }
         suspend fun start(
             throwableFlow: MutableSharedFlow<Throwable>,
             extension: Extension<*>,
@@ -63,12 +108,25 @@ class PlayerRadio(
             }.getOrThrow(throwableFlow)
         }
 
+        // Single-slot latch for the endless-queue fallback: at most ONE Last.fm lookup per station, ever.
+        // A thin station would otherwise re-trigger on every topUpQueue. Keyed on the station's id
+        // (loaded.context is the Radio item), single-valued so it cannot grow, and reset implicitly when a
+        // different station becomes current. Companion-scoped because play() is a companion function with
+        // five call sites and no instance to hang state on — deliberately NOT a field on
+        // PlayerState.Radio.Loaded, which is a shared model.
+        @Volatile
+        private var fallbackTriedForRadioId: String? = null
+
         suspend fun play(
             player: Player,
             downloadFlow: StateFlow<List<Downloader.Info>>,
             app: App,
             stateFlow: MutableStateFlow<PlayerState.Radio>,
-            loaded: PlayerState.Radio.Loaded
+            loaded: PlayerState.Radio.Loaded,
+            // The extension that owns the PLAYING item, for the endless-queue fallback's catalogue search.
+            // Nullable with a default so a call site that cannot cheaply resolve it still compiles and
+            // simply does not get the fallback — rather than forcing a resolution that could be wrong.
+            extension: Extension<*>? = null
         ) {
             stateFlow.value = PlayerState.Radio.Loading
             val tracks = loaded.tracks(loaded.cont) ?: run {
@@ -116,9 +174,74 @@ class PlayerRadio(
                 // loadPlaylist() to regenerate. The one behaviour change is that a station whose entire
                 // remaining content is the current track now ENDS instead of replaying that track — which is
                 // the correct outcome and the point of the filter.
-                val currentId = player.currentMediaItem?.track?.id
+                // ⚠⚠ DEDUP AGAINST THE QUEUE TAIL — THIS REPLACED AN id-ONLY CHECK AGAINST THE CURRENT
+                // ITEM ON 2026-09-09, AND THE GAP IT CLOSES WAS IDENTIFIED TWO WEEKS BEFORE IT WAS FELT.
+                //
+                // THE DEFECT, STATED PLAINLY: THERE WAS NO DEDUP ON NON-TRACK STATION APPENDS, ON EITHER
+                // SIDE. DeezerRadioClient dedups its seed for RadioKind.TRACK ONLY (title + artist, with a
+                // version-suffix strip); ARTIST, PLAYLIST, ALBUM and FLOW hit its `else tracks` branch and
+                // are dedup'd by nothing at all except the app's old id-only test against the SINGLE
+                // current item. That is not enough for the data shape Deezer actually serves.
+                //
+                // MEASURED, BOTH DIRECTIONS, SAME RECORDING, SAME DAY (2026-09-09, "Underwater" by The
+                // Frogmen — Deezer returns that one recording under TWO album ids, i.e. two track ids):
+                //   RadioKind.TRACK      — the extension's title+artist filter removed BOTH copies, the
+                //                          append was empty, and the queue ended in silence.
+                //   any other kind       — nothing filtered but `it.id != currentId`, so the copy that was
+                //                          not currently playing survived, was appended, became current,
+                //                          and next round the OTHER copy survived. AN INDEFINITE
+                //                          TWO-TRACK LOOP: same recording, forever, invisible to both the
+                //                          buffering watchdog and StuckPlayerDetector because the player is
+                //                          READY and genuinely progressing.
+                // One data shape, opposite outcomes, decided entirely by which RadioKind was in play.
+                //
+                // ⚠️ [CORRECTED 2026-09-09] THE DECISION THAT LEFT THIS OPEN. A July pass considered exactly
+                // this and declined it: "P3 — no dedup on appends — LEFT AS-IS (deliberate)… radio already
+                // has its own dedup." THAT PREMISE IS TRUE FOR RadioKind.TRACK AND FALSE FOR EVERY OTHER
+                // KIND. It is also disproved by this project's own later finding, recorded in August at the
+                // note below: forcing a first track "created the FIRST CASE WHERE A NON-TRACK STATION IS
+                // GENERATED BEHIND A FORCED SEED. Deezer's own seed filter is RadioKind.TRACK-only, and for
+                // ARTIST it could not work anyway — it compares it.id != radio.id, where radio.id is the
+                // ARTIST id" and so never matches a track id. The gap was identified, written down, and left
+                // for two weeks; the loop above is that finding arriving as a symptom. Recorded here rather
+                // than deleted because the reasoning is the instructive part: "the extension handles it" was
+                // checked against ONE code path and generalised to five.
+                //
+                // WHY APP-SIDE IS THE RIGHT LAYER — unchanged from the note below, which already said it:
+                // the invariant is a property of THE PLAYER forcing a first track, not of any extension's
+                // radio algorithm. This is not a competing mechanism; it is the one that should have been
+                // here.
+                //
+                // ⚠️ THE KEY IS ISRC FIRST, NORMALISED TITLE+ARTIST AS FALLBACK. An ISRC identifies a
+                // RECORDING, which is exactly the equivalence wanted: the same master on two albums shares
+                // one ISRC, while a remaster, a live take and a cover each get their own. Track.isrc exists
+                // on the common model and DeezerParser populates it from data.ISRC. Where it is null or
+                // blank the fallback mirrors the extension's own rule (strip a trailing parenthesised
+                // suffix, compare case-insensitively) — weaker, because it WILL merge a re-recording or a
+                // same-artist cover, and will NOT catch " - Live at X" since only "(…)" is stripped. That
+                // asymmetry is deliberate: a false merge costs one skipped track, a false split costs an
+                // infinite loop. A NULL KEY MEANS "CANNOT COMPARE" AND THE TRACK IS KEPT — never dropped.
+                //
+                // ⚠️ COMPARED AGAINST A WINDOW OF THE QUEUE, NOT AGAINST THE CURRENT ITEM. A pairwise check
+                // against `current` cannot see a THREE-WAY rotation (A,B,C where each append is merely not
+                // the one now playing), and this is the same recording served under N album ids — nothing
+                // bounds N at two. The queue itself is the record of what was appended, so the window needs
+                // no new state, survives process death, and is correct for every caller of play(), which
+                // matters because this is a companion function with three call sites and no instance to
+                // hold a set on. Bounded rather than whole-queue: a 5,000-item restored queue must not be
+                // rescanned per append, and a station legitimately revisiting a recording an hour later is
+                // not a loop.
+                val existing = HashSet<String>()
+                player.currentMediaItem?.track?.dedupKey()?.let { existing.add(it) }
+                val windowStart = (player.mediaItemCount - DEDUP_WINDOW).coerceAtLeast(0)
+                for (i in windowStart until player.mediaItemCount) {
+                    runCatching { player.getMediaItemAt(i).track }.getOrNull()
+                        ?.dedupKey()?.let { existing.add(it) }
+                }
                 val item = tracks.data
-                    .filter { currentId == null || it.id != currentId }
+                    // add() returns false when the key is already present, so this also removes duplicates
+                    // WITHIN a single page, not just against what is already queued.
+                    .filter { t -> t.dedupKey()?.let { existing.add(it) } ?: true }
                     .map {
                         MediaItemUtils.build(
                             app,
@@ -129,6 +252,52 @@ class PlayerRadio(
                     }
                 player.addMediaItems(item)
                 if (player.playbackState == Player.STATE_IDLE) player.prepare()
+                item.size
+            }.let { appended ->
+                // ── ENDLESS-QUEUE FALLBACK ── see RadioFallback for the whole rationale.
+                //
+                // TRIGGER: EMPTY OR THIN, MEASURED AFTER FILTERING. Both are "the extension has nothing
+                // useful left" and both were observed on the same track on the same day:
+                //   empty  — every candidate was a duplicate of what is already queued (the silence case)
+                //   thin   — one track and NO CONTINUATION, i.e. a station that cannot sustain a queue
+                // Deliberately NOT "fewer than RADIO_PREFETCH_THRESHOLD": a healthy station legitimately
+                // appends small pages WITH a continuation, and treating that as failure would fire the
+                // fallback constantly on working stations.
+                // Measured post-dedup on purpose — the raw page in the loop case had two entries and looked
+                // perfectly healthy; it was only after filtering that it was revealed as nothing.
+                val thin = appended == 0 || (appended < 2 && tracks.continuation == null)
+                val radioId = loaded.context.id
+                if (thin && extension != null && fallbackTriedForRadioId != radioId) {
+                    fallbackTriedForRadioId = radioId
+                    val seed = withContext(Dispatchers.Main) { player.currentMediaItem?.track }
+                    if (seed != null) {
+                        val extra = RadioFallback.similarTracks(extension, seed)
+                        if (extra.isNotEmpty()) withContext(Dispatchers.Main) {
+                            // ⚠️ STAMP FROM THE SEARCH RESULT'S EXTENSION, NEVER THE STATION'S. This is the
+                            // FOURTH extension_id failure of this family in one week — after the radio
+                            // non-fatal (fixed by ResumptionUtils.restamped), loadTrack's missing stamp
+                            // masked by the cache fallback, and the four UnifiedExtension tracker
+                            // callbacks. See also Track.toSlim's extras stripping, which is the mechanism
+                            // that keeps producing them.
+                            // It matters MORE here than it looks: under Unified the station belongs to one
+                            // sub-extension while the search fans out across all of them, so the matched
+                            // track can legitimately come from a DIFFERENT sub-extension. Inheriting the
+                            // station's id would then fail at loadStreamableMedia — one layer below and
+                            // several seconds after the mistake, with no obvious link back to here.
+                            // MediaState.Unloaded carries the clientId that resolution will use, so
+                            // extension.id (the searched extension) is the correct value.
+                            player.addMediaItems(
+                                extra.map {
+                                    MediaItemUtils.build(
+                                        app, downloadFlow.value,
+                                        MediaState.Unloaded(extension.id, it), loaded.context
+                                    )
+                                }
+                            )
+                            if (player.playbackState == Player.STATE_IDLE) player.prepare()
+                        }
+                    }
+                }
             }
         }
     }
@@ -172,7 +341,7 @@ class PlayerRadio(
         stateFlow.value = loaded ?: PlayerState.Radio.Empty
         if (loaded != null) {
             radioQueueActive = true
-            play(player, downloadFlow, app, stateFlow, loaded)
+            play(player, downloadFlow, app, stateFlow, loaded, extension)
         }
     }
 
@@ -186,7 +355,8 @@ class PlayerRadio(
         }
         if (remaining > RADIO_PREFETCH_THRESHOLD) return
         when (val state = stateFlow.value) {
-            is PlayerState.Radio.Loaded -> play(player, downloadFlow, app, stateFlow, state)
+            is PlayerState.Radio.Loaded ->
+                play(player, downloadFlow, app, stateFlow, state, extensionList.getExtension(state.clientId))
             is PlayerState.Radio.Empty -> loadPlaylist()
             else -> {}
         }
@@ -217,6 +387,9 @@ class PlayerRadio(
         when (val state = stateFlow.value) {
             is PlayerState.Radio.Loading -> {}
             is PlayerState.Radio.Empty -> loadPlaylist()
+            // No `extension` argument, so the endless-queue fallback does NOT run on TV. Deliberate for
+            // this pass: TV owns its own end-of-queue path (tvDriveRadio) and reach beyond the motivating
+            // extension is explicitly not a goal here. Wiring it is one argument, the same as line 335.
             is PlayerState.Radio.Loaded -> play(player, downloadFlow, app, stateFlow, state)
         }
     }

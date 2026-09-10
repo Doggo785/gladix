@@ -39,6 +39,18 @@
 
         </androidx.constraintlayout.widget.ConstraintLayout>
 
+        <!-- ⚠️ THE 107dp BELOW IS A DESIGN-TIME VALUE ONLY. IT NEVER RENDERS. PlayerFragment measures
+             item_player_controls into uiViewModel.playerControlsHeight, and PlayerTrackAdapter's
+             updateInsets writes that onto this view's layoutParams.height on every inset pass — so at
+             runtime this is the REAL controls height (measured 556px = 250dp at density 356), which is
+             what keeps this page's cover chain resolving identically to the one in fragment_player.xml.
+             If you measure this view and the real player_controls and find them EQUAL, THAT IS THE
+             MECHANISM WORKING, not a coincidence and not a mismatch with the literal.
+             [CORRECTED 2026-09-09] A scoping report read this literal as a fixed 107dp contribution to the
+             chain and concluded the placeholder "does not track what it mirrors". It does. The claim was
+             wrong, and it is recorded here rather than deleted because the wrong reading is the natural
+             one from the XML alone — the writer is in Kotlin, two files away. See the note at
+             item_player_controls.xml's seek block, which states the same thing from the other end. -->
         <View
             android:id="@+id/player_controls_placeholder"
             android:layout_width="0dp"
