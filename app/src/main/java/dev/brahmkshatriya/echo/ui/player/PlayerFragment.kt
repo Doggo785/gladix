@@ -145,6 +145,17 @@ import kotlin.math.min
 private const val CHROME_FADE_FRACTION = 1f / 3f
 
 class PlayerFragment : Fragment() {
+    // ⚠⚠ `binding != null` IS NOT AN ATTACHMENT PROXY. READ THIS BEFORE WRITING ANOTHER
+    // `binding?.foo ?: return` GUARD — the shape is used widely in this file and it is weaker than it looks.
+    // PROVEN BY A CRASH, not argued: the build-1084 fatal in configurePlayerControls' submitList callback
+    // reached Fragment.requireContext() and threw "Fragment not attached to a context" — which it could
+    // only do AFTER passing `val viewPager = binding?.viewPager ?: return@submitList` on the line above.
+    // So binding was NON-NULL while the fragment was DETACHED.
+    // WHAT THE GUARD ACTUALLY BUYS: it proves the VIEW still exists (autoClearedNullable clears it at
+    // onDestroyView), which is enough to touch views and to read View.getContext(). IT PROVES NOTHING ABOUT
+    // THE FRAGMENT being attached, so it does not make requireContext(), requireActivity(),
+    // getViewLifecycleOwner() or any other require*/Fragment-host call safe. If you need a Context in a
+    // callback that may run late, take it from a VIEW you have already null-checked.
     private var binding by autoClearedNullable<FragmentPlayerBinding>()
     private val viewModel by activityViewModel<PlayerViewModel>()
     private val uiViewModel by activityViewModel<UiViewModel>()
@@ -645,7 +656,83 @@ class PlayerFragment : Fragment() {
                 // page committed, not animated. This flag is the ONLY thing changed; the writers of the
                 // page position are untouched, which is what the reverted pre-draw re-commit got wrong (it
                 // added a third writer and produced a permanent one-behind).
-                val displayOn = requireContext().getSystemService(DisplayManager::class.java)
+                // ⚠⚠ viewPager.context, NEVER requireContext() — THIS LINE WAS A FATAL CRASH ON BUILD 1084.
+                // "IllegalStateException: Fragment not attached to a context", Fragment.requireContext at
+                // configurePlayerControls$submit$lambda, reached from AsyncListDiffer.onCurrentListChanged
+                // -> latchList -> Handler. AsyncListDiffer diffs OFF-THREAD and posts the commit callback
+                // back to the main looper; the fragment detached inside that window and the callback then
+                // asked the Fragment for a Context. View.getContext() never throws and is the same Activity
+                // context, and `viewPager` is already non-null here — so this reads the display exactly as
+                // before with no attachment dependency.
+                // ⚠️ THE READ STAYS INSIDE THE CALLBACK. DO NOT HOIST IT INTO submit() FOR TIDINESS — that
+                // would sample the screen BEFORE the off-thread diff, and a stale displayOn=true is exactly
+                // the false positive that produces a stale page.
+                // AND displayOn EXISTS BECAUSE AN ACTIVITY-STATE PROXY WAS ALREADY TRIED AND FOUND WRONG.
+                // The gate used to read `started && !isInitialLoad && abs(index - current) <= 1`. A POWER
+                // BUTTON drives the Activity to STOPPED promptly, so `started` went false and the page
+                // committed instantly — fine. A NATURAL TIMEOUT dims the display FIRST and the Activity may
+                // still report STARTED while frames have stopped: `started` stayed true, the smooth scroll
+                // waited on Choreographer frames that never came, and ViewPager2's logical mCurrentItem
+                // desynced from the rendered page with nothing pending to reconcile it. Reading the DISPLAY
+                // is the fix for that, and reading it LATE is what keeps it true. A hoist reintroduces the
+                // same class of staleness the read was added to remove.
+                //
+                // ⚠️ CONFIRMED SAFE ON A DETACHED-ACTIVITY CONTEXT, which is the one link this fix depends
+                // on. View.getContext() on a detached fragment returns the Context the view was inflated
+                // with — possibly a destroyed Activity or a ContextThemeWrapper around one. That is fine:
+                // AOSP's DisplayManager constructor is `mContext = context; mGlobal =
+                // DisplayManagerGlobal.getInstance();` and getDisplay(int) delegates to that PROCESS-WIDE
+                // singleton, not to per-Context state — the Context is used for resources/user-id, not for
+                // display enumeration. So the state read is real regardless of the Activity's condition.
+                // Belt and braces anyway: the chain below is null-safe and a null service yields
+                // displayOn=false, which is the CONSERVATIVE value (smooth=false is always correct — see
+                // the asymmetry note). The worst case degrades to an un-animated commit, never a stale page.
+                //
+                // ⚠️ THIS CHANGES *WHERE THE CONTEXT COMES FROM*, NOT *WHEN THE WRITE HAPPENS* — stated
+                // explicitly because "we changed the submit callback" is alarming on this surface. The page
+                // position has THREE independent writers racing the async adapter: current.value (async),
+                // viewModel.queue (synchronous), and adapter.currentList (async DiffUtil commit, lagging
+                // both), and this file has a history of one-behind bugs from exactly that. Nothing here
+                // adds, removes or reorders a writer: the same callback fires at the same moment, computes
+                // the same boolean from the same display, and calls the same setCurrentItem with the same
+                // index. Only the source of the Context object changed.
+                //
+                // ⚠️ WHY NOT THE TWO OBVIOUS GUARDS — both were considered and both are WORSE THAN THE CRASH:
+                //   `context ?: return@submitList` and an `isAdded` check stop the throw by SKIPPING THE
+                //   PAGE COMMIT, which is the entire purpose of this callback. A fragment that detaches and
+                //   reattaches then sits on the WRONG PAGE, silently — a worse bug than a crash, because
+                //   nothing reports it. The commit must still happen; only the Fragment dependency goes.
+                //   `viewLifecycleOwner` is not merely insufficient here, it is INAPPLICABLE: this is a
+                //   Handler-posted diff callback, not a coroutine, and no lifecycle scope governs it. (That
+                //   distinction matters because the ~25 observe() calls in this file bound to the Fragment
+                //   rather than viewLifecycleOwner ARE a real and separate family — same symptom, different
+                //   mechanism. Do not fix this one by reaching for that one's tool.)
+                //
+                // ⚠️ WHY THE SIBLING CRASH'S REJECTION DOES NOT TRANSFER — THE MECHANISM IS ABSENT HERE, NOT
+                // MERELY UNLIKELY. The same exception at PlayerTvFragment.configureColors (:290) was fixed
+                // WITHOUT hoisting the context, because that callback wrote uiViewModel.playerColors —
+                // ACTIVITY-SCOPED, survives recreate — so a silent guard let it write null, MainActivity
+                // themed without the accent, and the next fragment's observer saw null != last accent and
+                // called recreate() again: a loop. THIS callback writes only isInitialLoad (:565),
+                // pendingPageScroll (:566) and ViewPager state — every one of which dies with the fragment
+                // or the view. Nothing here outlives a recreate, so there is nothing to feed a loop.
+                // Inherit the caution only where the write is; do not inherit it as a rule.
+                //
+                // WHY STARTUP — A PROBABILITY AMPLIFIER, NOT A PRECONDITION. Keys: process_age_s 0, all ages
+                // 0-1, restore_build_count 80, heap 26MB. Both factors peak in the same second: the FIRST
+                // submit after a cold restore diffs an empty list against the WHOLE restored queue (the
+                // longest off-thread window there is), and the accent path calls requireActivity().recreate()
+                // (:1062, :1067) as the first track's colours arrive. INFERENCE, NOT PROOF: the keys
+                // establish the WINDOW, not the CAUSE — a config change or process teardown would look
+                // identical. The bug is reachable whenever a detach coincides with a commit; startup just
+                // makes both likely at once.
+                // Not a stale diff: AsyncListDiffer's mMaxScheduledGeneration means a SUPERSEDED diff
+                // produces no callback at all, so this was the CURRENT diff. The fix is about attachment.
+                //
+                // POSITIVE EXAMPLE, ALREADY CORRECT: QueueFragment's commit callback (:114) uses only
+                // `binding?.root?.scrollToPosition(...)` — null-safe binding read, no fragment API. That is
+                // the shape a commit callback should have.
+                val displayOn = viewPager.context.getSystemService(DisplayManager::class.java)
                     ?.getDisplay(Display.DEFAULT_DISPLAY)?.state == Display.STATE_ON
                 val smooth = displayOn && isResumed && !isInitialLoad && abs(index - current) <= 1
                 isInitialLoad = false

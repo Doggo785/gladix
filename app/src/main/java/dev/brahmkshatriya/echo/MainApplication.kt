@@ -96,6 +96,21 @@ class MainApplication : Application(), KoinStartup, SingletonImageLoader.Factory
         if (!initDone.compareAndSet(false, true)) return
         ensureKoin()
         applyLocale(settings)
+        // ⚠⚠ LOOKS LIKE THE BUILD-974 CRASH SHAPE AND IS NOT. EXAMINED TWICE; LEAVE IT.
+        // A bare CoroutineScope(Dispatchers.IO) has no CoroutineExceptionHandler, so a throw inside it
+        // reaches the DEFAULT UNCAUGHT HANDLER and kills the process — which is how a Spotify 500 became a
+        // FATAL on build 974. Taking `extensionLoader` as an argument makes this look like the same gap,
+        // and a reader scanning for bare scopes WILL stop here. It was flagged that way on 2026-09-10 and
+        // the flag was wrong.
+        // WHY IT IS SAFE: configureAppShortcuts IMMEDIATELY HANDS OFF (AppShortcuts:105-108). Its whole body
+        // is `val scope = loader.scope; val musicExt = loader.music; scope.launch { … }` — two property
+        // reads and a re-launch onto ExtensionLoader.scope, WHICH CARRIES THE HANDLER. Nothing that can
+        // throw from extension code ever runs on THIS scope; the collectLatest that touches extensions runs
+        // on the guarded one.
+        // ⚠️ WHAT WOULD BREAK IT: adding work to this launch body, or changing configureAppShortcuts to do
+        // anything before its hand-off. Then this scope needs the handler — use app.scope (Koin-provided,
+        // see DI.kt) rather than adding a second bare one. See the called-vs-launched note at
+        // App.exceptionHandler.
         CoroutineScope(Dispatchers.IO).launch { configureAppShortcuts(extensionLoader) }
     }
 

@@ -32,7 +32,6 @@ class QuickSearchAdapter(
         fun onClick(item: Item, transitionView: View)
         fun onLongClick(item: Item, transitionView: View): Boolean
         fun onInsert(item: Item)
-        fun onDeleteClick(item: Item)
     }
 
     override fun getItemViewType(position: Int) = when (getItem(position).actual) {
@@ -57,11 +56,6 @@ class QuickSearchAdapter(
         }
         holder.insertView.setOnClickListener {
             listener.onInsert(item)
-        }
-
-        holder.deleteView.isVisible = item.actual.searched
-        holder.deleteView.setOnClickListener {
-            listener.onDeleteClick(item)
         }
 
         // O6 (TV): UP on the FIRST row returns focus to the search field (the plain overlay RecyclerView has

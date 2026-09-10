@@ -17,6 +17,7 @@ import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED
 import com.google.android.material.search.SearchView
 import com.google.android.material.transition.MaterialSharedAxis
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import dev.brahmkshatriya.echo.R
 import dev.brahmkshatriya.echo.common.clients.SearchFeedClient
 import dev.brahmkshatriya.echo.common.models.EchoMediaItem
@@ -172,7 +173,27 @@ class SearchFragment : Fragment(R.layout.fragment_search) {
         }
         binding.quickSearchView.inflateMenu(R.menu.search_mic_menu_white)
         binding.quickSearchView.setOnMenuItemClickListener { item ->
-            if (item.itemId == R.id.menu_voice_search) { launchVoiceSearch(); true } else false
+            when (item.itemId) {
+                R.id.menu_voice_search -> { launchVoiceSearch(); true }
+                // Confirmed, matching the app's shape for irreversible single-gesture destruction
+                // (MaterialAlertDialogBuilder + remove_from_library_confirm in MediaHeaderAdapter, and
+                // DeletePlaylistBottomSheet). The dialog is HONEST here rather than corrective: it guards a
+                // genuinely bulk action instead of apologising for a mislabelled per-item one. Read the note
+                // in search_mic_menu_white.xml before moving this back onto the rows.
+                R.id.menu_clear_search_history -> {
+                    MaterialAlertDialogBuilder(requireContext())
+                        .setMessage(R.string.clear_search_history_confirm)
+                        .setNegativeButton(R.string.cancel, null)
+                        .setPositiveButton(R.string.clear) { _, _ ->
+                            searchViewModel.clearSearchHistory(
+                                extensionId, binding.quickSearchView.editText.text.toString()
+                            )
+                        }
+                        .show()
+                    true
+                }
+                else -> false
+            }
         }
         val searchAdapter = SearchBarAdapter(searchViewModel, binding.quickSearchView) {
             launchVoiceSearch()
@@ -228,19 +249,13 @@ class SearchFragment : Fragment(R.layout.fragment_search) {
                 }
             }
 
-            override fun onDeleteClick(item: QuickSearchAdapter.Item) =
-                searchViewModel.deleteSearch(
-                    item.extensionId,
-                    item.actual,
-                    binding.quickSearchView.editText.text.toString()
-                )
-
             override fun onLongClick(item: QuickSearchAdapter.Item, transitionView: View) =
                 when (val actualItem = item.actual) {
-                    is QuickSearchItem.Query -> {
-                        onDeleteClick(item)
-                        true
-                    }
+                    // Was `onDeleteClick(item); true` — removed 2026-09-10 with the per-row ✕. Long-press
+                    // promising per-item removal was the same lie in a different gesture: it reached the
+                    // same account-wide wipe. Returns false (unhandled) so a Query row simply has no
+                    // long-press action; clearing is on the overlay's overflow menu.
+                    is QuickSearchItem.Query -> false
 
                     is QuickSearchItem.Media -> {
                         val extensionId = item.extensionId

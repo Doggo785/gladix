@@ -662,10 +662,18 @@ abstract class AndroidAutoCallback(
             }
 
             SEARCH -> {
+                // ⚠️ isUserInitiated = false, AND THIS IS THE BROWSE-REFRESH PATH, NOT THE VOICE PATH.
+                // The query here is parsed back out of a parentId that a PREVIOUS search produced, so this
+                // re-serves an existing result page whenever Android Auto re-requests the node. Recording it
+                // would write the same query again on every refresh.
+                // ⚠️ DO NOT "FIX" onGetSearchResult/performSearch FOR CONSISTENCY — IT IS DELIBERATELY LEFT
+                // AS A USER SEARCH. The user asked for that one OUT LOUD; a spoken search is as much a
+                // gesture as a typed one, and it belongs in their history. The distinction is
+                // gesture-vs-not, NOT typed-vs-not.
                 val query = parentId.substringAfter("$ROOT/$extId/$SEARCH/", "")
                 extension.getFeed<SearchFeedClient>(
                     context, parentId, page, throwableFlow
-                ) { loadSearchFeed(query) }
+                ) { loadSearchFeed(query, isUserInitiated = false) }
             }
 
             PLAYLISTS -> extension.getList<LibraryFeedClient>(context, throwableFlow) {

@@ -12,6 +12,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
@@ -92,6 +93,17 @@ object RadioFallback {
     private const val SIMILAR_LIMIT = 12
     private const val MAX_APPEND = 6
 
+    // Hard ceiling on EXTENSION SEARCHES per exhausted station. Each search is a network round trip AND —
+    // until the non-gesture search signal lands — a write into the user's server-side search history, so
+    // this is the number that bounds the pollution, not MAX_APPEND. 15 sits above SIMILAR_LIMIT (12) so it
+    // does not bite on today's candidate count; it is the backstop if SIMILAR_LIMIT is ever raised.
+    private const val MAX_SEARCHES = 15
+
+    // Wall clock for the SEARCH LOOP ONLY — deliberately not wrapping the Last.fm fetch, which carries its
+    // own OUTER_TIMEOUT_MS. Two bounded phases rather than one bound over both: a slow fetch can no longer
+    // eat the entire budget and leave nothing for the searches that actually produce the append.
+    private const val SEARCH_BUDGET_MS = 6_000L
+
     // ⚠️ EXCLUDED BY IDENTITY, NOT BY CAPABILITY — AND THE CAPABILITY TEST WOULD NOT CATCH IT.
     // OfflineExtension implements BOTH RadioClient and SearchFeedClient, and its radio is a real local
     // feature (loadTracks(radio) pulls same-artist songs plus library.songList.shuffled().take(25)), so it
@@ -120,9 +132,19 @@ object RadioFallback {
         val q = "$artist - $title"
         val started = System.currentTimeMillis()
 
-        fun log(reason: String, similar: Int = 0, matched: Int = 0) = Log.d(
+        // ⚠️ `searched` IS THE FIELD THAT DOES THE WORK NOW THAT APPENDS CAN BE PARTIAL. Before the
+        // partial change, reason=ok meant one thing: a full bridge. It no longer does — matched=3 and
+        // matched=6 both succeed, and without `searched` they are indistinguishable across sessions, so a
+        // steadily degrading catalogue hit-rate would look identical to a healthy one. The three numbers
+        // read together tell the whole story:
+        //   similar=12 searched=12 matched=6  — full bridge, candidates to spare
+        //   similar=12 searched=15 matched=3  — partial: hit MAX_SEARCHES with a poor hit-rate
+        //   similar=12 searched=7  matched=3  — partial: the search budget expired mid-loop
+        //   similar=12 searched=12 matched=0  — searched everything, catalogue had none of it
+        // reason carries the TERMINAL CAUSE and the counts carry the shape; neither alone is enough.
+        fun log(reason: String, similar: Int = 0, searched: Int = 0, matched: Int = 0) = Log.d(
             "GladixRadio",
-            "LASTFM q=\"$q\" reason=$reason similar=$similar matched=$matched " +
+            "LASTFM q=\"$q\" reason=$reason similar=$similar searched=$searched matched=$matched " +
                 "ms=${System.currentTimeMillis() - started}"
         )
 
@@ -144,14 +166,77 @@ object RadioFallback {
         val similar = runCatching { fetchSimilar(artist, title) }
             .getOrElse { e ->
                 if (e is CancellationException) throw e
-                log(if (e is IllegalStateException) "parse" else "timeout")
+                log(if (e is IllegalStateException) "parse" else "fetch-timeout")
                 return emptyList()
             }
         if (similar.isEmpty()) { log("no-similar"); return emptyList() }
 
-        val matched = mapToCatalogue(extension, similar) { log("no-search-client", similar.size) }
-        if (matched.isEmpty()) { log("no-match", similar.size); return emptyList() }
-        log("ok", similar.size, matched.size)
+        // ⚠⚠ THE PARTIAL APPEND IS THE FIX. THE CAP ALONE WOULD HAVE CHANGED NOTHING.
+        // Before this, the whole mapping ran inside one all-or-nothing bound: if the budget expired after
+        // five of six matches, withTimeout threw, the result was discarded and NOTHING WAS APPENDED — five
+        // successful catalogue searches thrown away because the sixth was slow. The queue then died exactly
+        // as if Last.fm had returned nothing. Capping the search count reduces how often the budget is hit;
+        // it does not change what happens WHEN it is hit. Only collecting into an outer list and returning
+        // whatever is in it makes a timeout degrade instead of erase.
+        // withTimeoutOrNull, not withTimeout, for the same reason: the block's value is discarded and the
+        // ACCUMULATED list is what is returned.
+        //
+        // ⚠️ TWO INDEPENDENT CEILINGS — an established pattern here, not invented for this:
+        // "RESOLVE_GRACE_MS (25 s) must stay below StreamableLoader's withTimeout(30_000) — that is what
+        // gives two independent ceilings." Same shape: MAX_SEARCHES x ~300ms lands around 4.5s under the
+        // SEARCH_BUDGET_MS wall clock, so the count bound normally bites first and the clock is the backstop
+        // for a single slow search rather than the primary limit. Raising MAX_SEARCHES without raising the
+        // budget collapses the two into one and puts the partial path on the common route.
+        // ⚠️ THE ~300ms IS MEASURED ONCE, NOT A DISTRIBUTION. One observation on one extension, one
+        // network, one catalogue. It is the weakest number here; if partial appends become the norm rather
+        // than the exception, this is the assumption that broke, not the budget.
+        // ⚠⚠ THE BUDGET ASSUMES THE EXTENSION'S SEARCH IS CANCELLABLE, AND FOR THREE OF THE FOUR
+        // EXTENSIONS THAT REACH HERE WE CANNOT KNOW THAT. Kotlin cancellation is COOPERATIVE: withTimeoutOrNull
+        // marks the coroutine cancelled and throws at the next SUSPENSION POINT. A third-party searchFeed doing
+        // non-interruptible blocking I/O has no suspension point, so the timeout DOES NOT RETURN EARLY — this
+        // call sits until that I/O completes on its own. Precedent in this project: "a third-party extension
+        // performing non-cancellable blocking I/O wouldn't be interrupted by withTimeoutOrNull, so withLock's
+        // finally never runs and every browse node hangs."
+        // ⚠️ BUT IT IS A LEAK, NOT A WEDGE, AND THE DIFFERENCE IS STRUCTURAL — checked rather than assumed:
+        //   • NO LOCK IS HELD. That incident wedged because the hang was inside cacheMutex.withLock; nothing
+        //     on this path takes a mutex, so a stuck search blocks no other caller.
+        //   • PLAYBACK IS UNAFFECTED. This runs in a scope.launch off the player's critical path; the current
+        //     track keeps playing and the append simply never arrives. The queue then ends as it did before
+        //     the fallback existed, and PlayerEventListener's STATE_ENDED settle handles it.
+        //   • IT CANNOT REPEAT PER STATION. fallbackTriedForRadioId is set BEFORE this call, so a hung search
+        //     cannot be re-entered for the same station.
+        //   • THE COST IS ONE PARKED COROUTINE AND ONE Dispatchers.IO THREAD (getIf wraps in withContext(IO))
+        //     per exhausted station, until the extension returns. Bounded by stations, not unbounded.
+        // Survivable and worth knowing. If a wedge is ever observed instead, the thing that changed is that
+        // something on this path started holding a lock — look there first, not at the budget.
+        val matched = mutableListOf<Track>()
+        var searched = 0
+        var noSearchClient = false
+        val completed = withTimeoutOrNull(SEARCH_BUDGET_MS) {
+            for (candidate in similar.take(MAX_SEARCHES)) {
+                if (matched.size >= MAX_APPEND) break
+                searched++
+                val found = extension.getIf<SearchFeedClient, List<Track>> {
+                    searchOne(candidate)
+                }.getOrNull()
+                if (found == null && searched == 1) noSearchClient = true
+                val first = found?.firstOrNull() ?: continue
+                if (matches(first, candidate)) matched.add(first)
+            }
+            true
+        }
+
+        if (noSearchClient) { log("no-search-client", similar.size, searched); return emptyList() }
+        if (matched.isEmpty()) {
+            log(if (completed == null) "search-timeout" else "no-match", similar.size, searched)
+            return emptyList()
+        }
+        val reason = when {
+            completed == null -> "ok-timeout"          // budget expired, but we kept what we had
+            matched.size >= MAX_APPEND -> "ok"         // full bridge
+            else -> "ok-partial"                       // ran out of candidates or hit MAX_SEARCHES
+        }
+        log(reason, similar.size, searched, matched.size)
         return matched
     }
 
@@ -186,41 +271,38 @@ object RadioFallback {
         }
 
     /**
-     * Maps Last.fm results back to playable tracks through the PLAYING extension's own search.
+     * One candidate, one search. The loop, the caps and the budget live at the call site so that a timeout
+     * can keep what it already has — see the partial-append note there.
      *
      * ⚠️ DELIBERATELY SIMPLE, NOT CLEVER. Wrong matches are acceptable here — live versions and
-     * re-recordings already reach the queue today with older catalogue, and a wrong-but-plausible
-     * neighbour beats silence. The failure mode of cleverness is worse than the failure mode of
-     * strictness: a mis-scored fuzzy match is unexplainable, a dropped candidate is one fewer track.
-     * So: exact-ish compare after the same version-suffix strip the append dedup uses, first result only,
-     * no scoring and no second-choice logic.
+     * re-recordings already reach the queue today with older catalogue, and a wrong-but-plausible neighbour
+     * beats silence. The failure mode of cleverness is worse than the failure mode of strictness: a
+     * mis-scored fuzzy match is unexplainable, a dropped candidate is one fewer track. So: exact-ish compare
+     * after the same version-suffix strip the append dedup uses, first result only, no scoring.
+     *
+     * ⚠️ THIS CALL WRITES THE USER'S SERVER-SIDE SEARCH HISTORY, AND THAT IS AN OPEN DEFECT.
+     * DeezerSearchClient.loadSearchFeed calls api.setSearchHistory(query) unconditionally when the history
+     * setting is on, so every candidate searched here — matched or not — becomes a "Recent" entry on the
+     * user's Deezer account. Reported from device: twelve junk queries per exhausted station, the user's own
+     * searches pushed out. The app-side local store (SearchViewModel.saveInHistory) is NOT involved; it has
+     * one caller and that caller is the user-typed path.
+     * THE FIX IS NOT HERE — loadSearchFeed is the only entry point SearchFeedClient exposes and the write is
+     * inside the extension, so it needs a non-gesture signal on the common interface (a defaulted overload,
+     * safe because the app supplies `common` at runtime). Two other callers share the defect:
+     * AndroidAutoCallback's voice search and its browse SEARCH node. MAX_SEARCHES is what bounds the damage
+     * until then.
      *
      * NOTE ON PRECEDENT: the smarttracklist work is NOT a precedent for this — it resolved by ID
-     * (GraphQL edges[].node.id -> song.getListData), never by text. This is a new operation for this
-     * codebase. The working template is AndroidAutoCallback.performSearch, which this mirrors.
+     * (GraphQL edges[].node.id -> song.getListData), never by text. The template is
+     * AndroidAutoCallback.performSearch, which this mirrors.
      */
-    private suspend fun mapToCatalogue(
-        extension: Extension<*>, similar: List<Similar>, onNoSearchClient: () -> Unit
-    ): List<Track> {
-        var hadClient = false
-        val out = mutableListOf<Track>()
-        for (s in similar) {
-            if (out.size >= MAX_APPEND) break
-            val found = extension.getIf<SearchFeedClient, List<Track>> {
-                hadClient = true
-                val feed = loadSearchFeed("${s.artist} ${s.title}")
-                // Case-insensitive TRACK tab, with a firstOrNull fallback for extensions that name it
-                // differently — same shape AndroidAutoCallback.performSearch uses.
-                val tab = feed.notSortTabs.firstOrNull { it.id.equals("TRACK", ignoreCase = true) }
-                    ?: feed.notSortTabs.firstOrNull()
-                val (shelves, _) = feed.getPagedData(tab).pagedData.loadPage(null)
-                shelves.toTracks()
-            }.getOrNull()
-            val first = found?.firstOrNull() ?: continue
-            if (matches(first, s)) out.add(first)
-        }
-        if (!hadClient) onNoSearchClient()
-        return out
+    private suspend fun SearchFeedClient.searchOne(s: Similar): List<Track> {
+        val feed = loadSearchFeed("${s.artist} ${s.title}", isUserInitiated = false)
+        // Case-insensitive TRACK tab, with a firstOrNull fallback for extensions that name it differently.
+        val tab = feed.notSortTabs.firstOrNull { it.id.equals("TRACK", ignoreCase = true) }
+            ?: feed.notSortTabs.firstOrNull()
+        val (shelves, _) = feed.getPagedData(tab).pagedData.loadPage(null)
+        return shelves.toTracks()
     }
 
     private fun matches(track: Track, s: Similar): Boolean {

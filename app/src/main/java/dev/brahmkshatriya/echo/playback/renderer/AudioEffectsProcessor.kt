@@ -39,6 +39,18 @@ class AudioEffectsProcessor : BaseAudioProcessor() {
     private var activeLut: ShortArray = passthroughLut()
     private val pendingLut = AtomicReference<Pair<String, ShortArray>?>(null)
     private val currentTrackToken = AtomicReference("")
+    // No CoroutineExceptionHandler, and that is CORRECT here — CHECKED 2026-09-10, DO NOT RE-FLAG.
+    // A handler-less scope is the build-974 crash shape (an uncaught throw goes to the default uncaught
+    // handler and kills the app), so this was audited alongside MainApplication's. It differs in the one
+    // way that matters: EXTENSION CODE CANNOT REACH IT. All three scope.launch bodies (the init LUT, and
+    // setTrackGain/resetGain below) do pure local work — generateDualStageLUT arithmetic, AtomicReference
+    // sets and token comparisons. No ExtensionLoader, no network, no third-party call, nothing that can
+    // throw an unknown type from someone else's APK.
+    // ⚠️ AND THERE IS A SECOND REASON IT STAYS AS IT IS, from the earlier examination: this class is
+    // constructed with NO App REFERENCE, so routing to throwFlow would need constructor plumbing through
+    // the renderer. That cost is not worth paying for closed-form CPU work that cannot throw an unknown
+    // type. Deferred deliberately, twice; this note exists so a third sweep does not re-surface it.
+    // If anything extension-facing is ever launched here, this needs the handler — see App.exceptionHandler.
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
     init {

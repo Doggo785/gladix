@@ -9,4 +9,47 @@
         android:title="@string/voice_search"
         app:showAsAction="always" />
 
+    <!-- ⚠⚠ THE AFFORDANCE MOVED HERE FROM THE ROWS, AND IT MOVED BECAUSE THE ROW VERSION LIED.
+         item_quick_search_query.xml and item_quick_search_media.xml each carried a per-row close (✕)
+         button wired to QuickSearchClient.deleteQuickSearch. Deezer's implementation IGNORES the item it is
+         handed and calls user.clearSearchHistory — an ACCOUNT-WIDE wipe — so an ✕ on one chip, and an ✕ on
+         a suggested TRACK row, both destroyed every entry the user had. The icon promised per-item removal
+         on two surfaces and delivered a bulk destructive action on both.
+         A confirmation dialog was considered and rejected: an ✕ whose dialog says "this clears everything"
+         is an affordance that contradicts itself, and users trust the icon over the dialog.
+         ⚠️ ANYONE RESTORING A PER-ROW ✕ IS RESTORING THAT BUG unless a per-entry deletion method exists by
+         then — see the note at DeezerExtension.deleteQuickSearch for why none is known.
+         KNOWN LOSS, NAMED RATHER THAN GLOSSED: extensions WITHOUT QuickSearchClient (Offline, Unified) fall
+         through to SearchViewModel.defaultDeleteSearch, which removes ONE entry from a local list
+         correctly. Removing the ✕ takes that working capability away from them to stop Deezer's broken one.
+         Accepted deliberately: one honest bulk action beats a per-item action that works on two extensions
+         and lies on the one people actually use.
+
+         ⚠⚠ OPEN TV ITEM — NOT CHECKED, AND THE DIRECTION IS UNFAVOURABLE. NOTHING BELOW IS VERIFIED; it is
+         written as the honest state so a future TV pass picks it up rather than re-deriving it.
+           • THE OLD ✕ WAS PROBABLY REACHABLE. It sat inside each row of the overlay RecyclerView, which
+             already has D-pad wiring (QuickSearchAdapter's O6 onFirstRowUp), so a D-pad user in the list
+             could plausibly reach it with RIGHT from a focused row.
+           • THIS MENU ITEM PROBABLY IS NOT. It lives in the SearchView's TOOLBAR — a different surface, with
+             no app-directed focus entry except onFirstRowUp landing on the EDIT TEXT. Getting from there to
+             here needs three unverified links: geometric RIGHT from the edit text into the ActionMenuView,
+             the overflow button being focusable, and the popup being D-pad navigable. `never` puts this in
+             the overflow, so it is strictly deeper than the mic item beside it (`always`, a visible button)
+             — and the mic is NOT evidence either, since a TV often has no microphone and that item may never
+             have been exercised on one.
+           • SO THIS CHANGE MAY REMOVE THE ONLY TV-REACHABLE ROUTE TO CLEARING SEARCH HISTORY, rather than
+             being neutral. Consequence if true: a TV user cannot clear their search history at all.
+           • KNOWINGLY NOT SPENT ON (2026-09-10): effectively no TV users, and that consequence does not
+             justify a build. Recorded, not fixed.
+           HOW A TV PASS WOULD CHECK IT, cheapest first: focus the search field, DOWN into the list, UP back
+           (confirms the O6 baseline), then RIGHT from the edit text — if focus reaches the mic, link one
+           holds and the rest is likely; if it does not, the toolbar menu is unreachable on TV TODAY,
+           independently of this change, and the action needs to live in the suggestions LIST instead, which
+           is provably reachable. Making this item icon + `ifRoom` rather than `never` would collapse three
+           unverified links to one at the cost of a second visible button on phone. -->
+    <item
+        android:id="@+id/menu_clear_search_history"
+        android:title="@string/clear_search_history"
+        app:showAsAction="never" />
+
 </menu>

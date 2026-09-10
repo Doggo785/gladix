@@ -15,7 +15,6 @@ import dev.brahmkshatriya.echo.utils.ui.scrolling.ScrollAnimViewHolder
 sealed class QuickSearchViewHolder(itemView: View) : ScrollAnimViewHolder(itemView) {
     abstract fun bind(item: QuickSearchAdapter.Item)
     abstract val insertView: View
-    abstract val deleteView: View
     open val transitionView: View
         get() = this.insertView
 
@@ -23,8 +22,6 @@ sealed class QuickSearchViewHolder(itemView: View) : ScrollAnimViewHolder(itemVi
         override val insertView: View
             get() = binding.insert
 
-        override val deleteView: View
-            get() = binding.delete
 
         override fun bind(item:  QuickSearchAdapter.Item) {
             val item = item.actual as QuickSearchItem.Query
@@ -48,8 +45,6 @@ sealed class QuickSearchViewHolder(itemView: View) : ScrollAnimViewHolder(itemVi
         override val insertView: View
             get() = binding.insert
 
-        override val deleteView: View
-            get() = binding.delete
 
         override val transitionView: View
             get() = binding.coverContainer

@@ -397,6 +397,16 @@ class UnifiedExtension(
 
     override suspend fun loadHomeFeed() = feed<HomeFeedClient> { loadHomeFeed() }
 
+    // ⚠⚠ BOTH FORMS ARE OVERRIDDEN, AND THE TWO-ARG ONE IS NOT OPTIONAL. Without it, a two-arg call on
+    // Unified would resolve to SearchFeedClient's DEFAULT, which delegates to the one-arg override below —
+    // which fans out to the sub-extensions WITHOUT the signal. Unified would silently keep writing history
+    // for app-initiated searches while appearing to be fixed, which is the worst of the three outcomes.
+    // (Unified implements SearchFeedClient DIRECTLY, not by `by` delegation — checked, because Kotlin's
+    // delegation does not reliably forward Java default methods and would have made this subtler still.)
+    override suspend fun loadSearchFeed(query: String, isUserInitiated: Boolean): Feed<Shelf> {
+        return feed<SearchFeedClient> { loadSearchFeed(query, isUserInitiated) }
+    }
+
     override suspend fun loadSearchFeed(query: String): Feed<Shelf> {
         return feed<SearchFeedClient> { loadSearchFeed(query) }
     }

@@ -237,6 +237,10 @@ public abstract interface class dev/brahmkshatriya/echo/common/clients/QuickSear
 	public abstract fun quickSearch (Ljava/lang/String;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;
 }
 
+public final class dev/brahmkshatriya/echo/common/clients/QuickSearchClient$DefaultImpls {
+	public static fun loadSearchFeed (Ldev/brahmkshatriya/echo/common/clients/QuickSearchClient;Ljava/lang/String;ZLkotlin/coroutines/Continuation;)Ljava/lang/Object;
+}
+
 public abstract interface class dev/brahmkshatriya/echo/common/clients/RadioClient {
 	public abstract fun loadRadio (Ldev/brahmkshatriya/echo/common/models/Radio;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;
 	public abstract fun loadTracks (Ldev/brahmkshatriya/echo/common/models/Radio;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;
@@ -250,6 +254,11 @@ public abstract interface class dev/brahmkshatriya/echo/common/clients/SaveClien
 
 public abstract interface class dev/brahmkshatriya/echo/common/clients/SearchFeedClient {
 	public abstract fun loadSearchFeed (Ljava/lang/String;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;
+	public fun loadSearchFeed (Ljava/lang/String;ZLkotlin/coroutines/Continuation;)Ljava/lang/Object;
+}
+
+public final class dev/brahmkshatriya/echo/common/clients/SearchFeedClient$DefaultImpls {
+	public static fun loadSearchFeed (Ldev/brahmkshatriya/echo/common/clients/SearchFeedClient;Ljava/lang/String;ZLkotlin/coroutines/Continuation;)Ljava/lang/Object;
 }
 
 public abstract interface class dev/brahmkshatriya/echo/common/clients/SettingsChangeListenerClient : dev/brahmkshatriya/echo/common/providers/SettingsProvider {

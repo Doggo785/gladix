@@ -231,13 +231,53 @@ object AppUpdater {
         // semantics are still wrong for this one.
         //
         // RESIDUAL RISK, ACCEPTED AND NOT FIXED HERE: app.messageFlow's only subscriber is a
-        // lifecycle-gated observe() (ContextUtils.observe -> flowWithLifecycle, STARTED). Its 64-slot
+        // lifecycle-gated observe() (ContextUtils.observe -> flowWithLifecycle, STARTED).
+        // WHERE THAT SUBSCRIBER ACTUALLY IS, since the two obvious descriptions sound contradictory and are
+        // not: there is ONE flow. SnackBarHandler holds `private val messageFlow = app.messageFlow` — an
+        // ALIAS, not a second flow — and the collector is `observe(handler.messageFlow) { createSnackBar }`
+        // inside `fun MainActivity.setupSnackBar(...)`. So the CODE lives in SnackBarHandler and the
+        // LIFECYCLE OWNER is MainActivity; both readings describe the same collector. A direct emit like
+        // this one reaches that collector normally — what it bypasses is create(), i.e. the dedupe and the
+        // recreation-surviving `messages` queue, not the observer.
+        // ⚠️ SO THE DROP RISK IS UNAFFECTED BY WHICH DESCRIPTION YOU USE: same observe, same STARTED gate.
+        // What the bypass costs is different: no dedupe (intended — see above), no queueing behind a
+        // showing snackbar, and no survival across activity recreation. Its 64-slot
         // DROP_OLDEST buffer stops an emit from suspending, but a buffer does not retain values for a
         // subscriber that is not there yet, so a message emitted while MainActivity is STOPPED is still
         // lost. That is a live concern for this particular message, because it is emitted immediately after
         // returning from the system settings screen, i.e. right at the moment our Activity is coming back
         // to STARTED. Making it survive that window needs a held-state mechanism (something the Activity
         // drains on start), not a bigger buffer and not a different emit shape.
+        //
+        // ⚠️ AND THE MITIGATION, SO THE RISK ABOVE IS NOT OVER-RATED: THE MESSAGE IS MOST RELIABLE EXACTLY
+        // WHERE IT MATTERS MOST. The two paths fail in opposite directions.
+        //   NORMAL PATH — the user was just on the system permission screen, so our Activity left and is
+        //     returning: the drop risk is real here. But it is also the path where they need the snackbar
+        //     LEAST, because they have just seen and dismissed the screen themselves and have the context.
+        //   NO-HANDLER PATH — ACTION_MANAGE_UNKNOWN_APP_SOURCES has no handler, waitForResult throws, and
+        //     ensureCanInstallPackages returns false HAVING SHOWN NOTHING. Our Activity never left, so the
+        //     observer is still STARTED and the emit lands. That is the path where this message is the only
+        //     thing the user will ever see — and it is the path where it works.
+        // Read the two notes together: the drop is structural, and it is anti-correlated with need.
+        //
+        // ⚠⚠ THIRD INSTANCE OF ONE MECHANISM THIS SESSION — THIS IS THE ARGUMENT FOR THE HELD-STATE FIX,
+        // AND IT BELONGS HERE SO IT IS NOT REDISCOVERED A FOURTH TIME. All three are a hot flow with NO
+        // RETENTION and a subscriber that exists only while STARTED:
+        //   1. queueFlow — a replay-0 emission dropped while the observer was stopped.
+        //   2. awaitInstallation — a replay-0 future that then never completes.
+        //   3. messageFlow — this one.
+        // Each was diagnosed independently, each carries its own local note, and NONE of the three is
+        // fixable at its own site: a bigger buffer does not help (buffers do not retain for an absent
+        // subscriber), and neither does a different emit shape. One mechanism, three sites, one fix.
+        //
+        // ⚠️ THE 2026-09-10 STAGE-KEY RENAME DOES NOT REDUCE THE CASE FOR THE HELD-STATE FIX. It removed a
+        // false claim from the key; it changed nothing about delivery. The real fix is still the mechanism
+        // named above — something the Activity DRAINS ON START rather than a flow that must be observed at
+        // emit time — which would fix this message AND every other one emitted while backgrounded, and
+        // would make instrumenting delivery unnecessary because delivery would stop being conditional.
+        // Deliberately NOT instrumented instead: a key at SnackBarHandler.createSnackBar would measure a
+        // mechanism already known to be unreliable rather than fixing it, and would need a message-identity
+        // discriminator to be readable at all, on a path that has fired once.
         //
         // In the normal case the user has ALREADY seen the system "install unknown apps" screen by now —
         // ensureCanInstallPackages launches it and re-queries afterwards — so this reads as the follow-up
@@ -246,7 +286,12 @@ object AppUpdater {
         // false having shown NOTHING, and this message is the only thing the user ever sees. That case is
         // an argument for the message, not against it.
         if (!ensureInstallPermission()) {
-            CrashKeys.onAppUpdateStage("permission_denied")
+            // ⚠️ NAMES WHAT IT OBSERVES, NOT AN OUTCOME. Was "permission_denied" until 2026-09-10; that
+            // implied the user had been told, and this key cannot observe that — it is written HERE, before
+            // the emit below, and that emit can be dropped (see the residual-risk note above). Renamed so
+            // the key stops making a claim it cannot support. It DOES support: the update was offered,
+            // downloaded, and the install was refused for want of permission.
+            CrashKeys.onAppUpdateStage("install_permission_missing")
             messageFlow.emit(
                 Message(
                     app.context.run {

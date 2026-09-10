@@ -11,6 +11,44 @@ java {
     targetCompatibility = JavaVersion.VERSION_17
 }
 
+// ⚠⚠ INTERFACE DEFAULTS IN :common ARE ABI-CRITICAL, AND THE MODE THAT MAKES THEM WORK IS A COMPILER
+// DEFAULT RATHER THAN A SETTING. This note is the durable part; the `jvmDefault` line below is optional.
+//
+// WHAT THE MODE DOES. Kotlin compiles an interface method that has a body to a REAL Java default method
+// AND keeps the <Interface>$DefaultImpls compatibility class. Both halves are load-bearing here:
+//   • the default method is what lets an extension compiled against an OLDER :common inherit a NEWLY ADDED
+//     interface method instead of throwing AbstractMethodError when the app calls it;
+//   • DefaultImpls is what keeps already-compiled implementors linking.
+// Verified from bytecode rather than docs — javap on the built ExtensionClient shows
+//     public default java.lang.Object onExtensionSelected(kotlin.coroutines.Continuation<...>);
+// alongside an ExtensionClient$DefaultImpls class.
+//
+// ⚠️ THIS CHANGE RELIES ON IT. SearchFeedClient's two-arg loadSearchFeed(query, isUserInitiated) overload
+// is only safe for installed extensions because of that default method. See the note there.
+//
+// ⚠️ IT WAS NOT ALWAYS THE DEFAULT. -Xjvm-default defaulted to `disable` until Kotlin 2.2 replaced it
+// with -jvm-default, whose default is `enable`. So on this toolchain (2.4.10) the behaviour is correct by
+// accident of VERSION. A downgrade below 2.2, or a future change of default, would silently turn every
+// interface default in :common into an abstract method and break every ALREADY INSTALLED extension — with
+// nothing in this build able to see it, because extensions are not in the repo and no compiler or test has
+// a caller to fail. Build 1058 shipped exactly this family (a NoSuchMethodError from a :common member
+// change, breaking installed extensions) and its Crashlytics trace is kept as a working control.
+//
+// ⚠️ WHAT ACTUALLY CATCHES A CHANGE TO IT: checkKotlinAbi. The mode is visible in the ABI dump — a
+// method that stopped being a default changes shape in common/api/jvm/common.api — so the dump diff fails
+// the build before anything ships. THAT is the guard; the pin below only makes the intent explicit and
+// removes the dependence on a default. If the pin ever fails to resolve after a Kotlin bump, DELETE IT AND
+// KEEP THIS NOTE rather than working down a list of fallbacks: freeCompilerArgs bypasses validation, so a
+// renamed flag would pin nothing silently, which is worse than not pinning at all.
+//
+// Placed on the TASK TYPE, not inside kotlin { }: this is a multiplatform module, so kotlin { compilerOptions }
+// is KotlinCommonCompilerOptions and has no JVM-specific properties. KotlinJvmCompile extends
+// KotlinCompilationTask<KotlinJvmCompilerOptions>, which is where jvmDefault lives, and matching by task
+// type covers BOTH JVM-producing targets (android and jvm) without naming either target's DSL.
+tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile>().configureEach {
+    compilerOptions.jvmDefault.set(org.jetbrains.kotlin.gradle.dsl.JvmDefaultMode.ENABLE)
+}
+
 kotlin {
     jvmToolchain(17)
 

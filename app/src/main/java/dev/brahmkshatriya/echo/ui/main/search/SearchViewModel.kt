@@ -34,6 +34,39 @@ class SearchViewModel(
         }
     }
 
+    /**
+     * Clears the whole search history for [extensionId] — the overlay's "Clear search history" action.
+     *
+     * ⚠️ ITERATES deleteQuickSearch RATHER THAN CALLING A BULK METHOD, BECAUSE THERE ISN'T ONE.
+     * QuickSearchClient exposes only per-item deletion, so a bulk clear has to be expressed as "delete
+     * each history entry". That is the honest shape for BOTH semantics currently in the tree:
+     *   • an extension that deletes per entry (SearchViewModel.defaultDeleteSearch, used by Offline and
+     *     Unified on the local store) removes each one and ends up empty — correct;
+     *   • Deezer IGNORES the item and calls user.clearSearchHistory, so the FIRST call empties the account
+     *     and the rest are redundant re-wipes of an already empty list — also correct, just wasteful.
+     * A single call with an arbitrary item would be correct for Deezer and wrong for the first kind.
+     *
+     * Only `searched` items are passed: quickSearch("") returns history AND trending queries concatenated
+     * (Deezer flags trending as searched=false), and trending is not the user's data to delete.
+     * Refreshes once at the end rather than per deletion.
+     */
+    fun clearSearchHistory(extensionId: String, query: String) {
+        viewModelScope.launch {
+            val extension = music.getExtension(extensionId)
+            val history = quickFeed.value.filterIsInstance<QuickSearchItem.Query>()
+                .filter { it.searched }
+            history.forEach { item ->
+                extension?.getIf<QuickSearchClient, Any?>(app.throwFlow) {
+                    deleteQuickSearch(item)
+                } ?: defaultDeleteSearch(extension, app.context, item)
+            }
+            quickSearch(extensionId, query)
+        }
+    }
+
+    // Retained: no UI calls it since the per-row ✕ was removed on 2026-09-10 (see
+    // search_mic_menu_white.xml), but it is the correct per-item operation and the thing to re-wire if a
+    // per-entry deletion method ever becomes known for the extensions that need one.
     fun deleteSearch(extensionId: String, item: QuickSearchItem, query: String) {
         viewModelScope.launch {
             val extension = music.getExtension(extensionId)

@@ -271,7 +271,16 @@ object CrashKeys {
      *   "offered"    a release exists whose tag differs from the running build; nothing downloaded yet.
      *                Absence of this key with app_update_gate_passed=true means no update was on offer,
      *                which is the normal state.
-     *   "permission_denied"  an update existed and the install permission was refused or unavailable.
+     *   "install_permission_missing"  an update existed, was offered, and the install was refused for want
+     *                of the "install unknown apps" permission — either the user declined the system screen
+     *                or no handler for ACTION_MANAGE_UNKNOWN_APP_SOURCES exists on the device.
+     *                ⚠️ THIS DOES NOT MEAN THE USER WAS TOLD. It was named "permission_denied" until
+     *                2026-09-10, which read as a user-facing outcome; it is not one. The key is written
+     *                BEFORE the snackbar emit and the emit can be dropped — see the note at the emit site in
+     *                AppUpdater. WHAT IT SUPPORTS: "the update was offered, downloaded, and the install was
+     *                refused for want of permission." That is solid and is what the first field event
+     *                (build 1084) proved. Whether anything reached the screen is OUTSIDE what this key
+     *                observes; do not infer delivery from the stage name.
      *   "downloaded" the APK/zip transferred and passed the length check.
      *   "ready"      the file is a plain APK, or was successfully unwrapped from nightly's artifact zip,
      *                and is being handed to the installer.

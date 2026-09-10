@@ -55,11 +55,22 @@ class DeezerSearchClient(private val deezerExtension: DeezerExtension, private v
         }
     }
 
-    suspend fun loadSearchFeed(query: String, shelf: String): Feed<Shelf> {
+    suspend fun loadSearchFeed(
+        query: String, shelf: String, isUserInitiated: Boolean = true
+    ): Feed<Shelf> {
         deezerExtension.handleArlExpiration()
         query.ifBlank { return browseFeed(shelf).toFeed() }
 
-        if (history) {
+        // ⚠⚠ TWO CONDITIONS, AND THEY MEAN DIFFERENT THINGS — DO NOT COLLAPSE THEM.
+        //   `history`         — the USER'S SETTING. Master switch: off means never record, ever.
+        //   `isUserInitiated` — WHETHER THIS PARTICULAR SEARCH WAS A GESTURE. Narrows WHICH searches count.
+        // This write goes to the user's Deezer ACCOUNT (user.addEntryInSearchHistory), not to a local list,
+        // so it is visible in Deezer's own app and is not clearable per-entry from here.
+        // WHAT WENT WRONG WITHOUT THE SECOND CONDITION (device, 2026-09-09): the app's endless-queue radio
+        // fallback searches the catalogue once per Last.fm candidate — up to fifteen per exhausted station,
+        // matched or not — and every one became a "Recent" entry, pushing the user's own searches out.
+        // Nothing was wrong with this code; it simply could not tell the two apart.
+        if (history && isUserInitiated) {
             scope.launch { runCatching { api.setSearchHistory(query) } }
         }
 

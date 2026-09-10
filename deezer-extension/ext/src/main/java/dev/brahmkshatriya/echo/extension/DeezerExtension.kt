@@ -371,9 +371,39 @@ class DeezerExtension : HomeFeedClient, TrackClient, LikeClient, RadioClient,
 
     override suspend fun quickSearch(query: String): List<QuickSearchItem.Query> = deezerSearchClient.quickSearch(query)
 
+    // ⚠⚠ `item` IS DELIBERATELY UNUSED. THIS IS NOT AN OVERSIGHT — NO PER-ENTRY DELETION METHOD IS KNOWN.
+    // The interface promises "deletes a quick search item"; this calls user.clearSearchHistory (via
+    // api.deleteSearchHistory -> DeezerSearch.deleteSearchHistory, USER_ID only), which wipes the ACCOUNT'S
+    // ENTIRE search history. That is a contract violation, and it is upstream Echo's code — unmodified here
+    // since 8f4c2f29 imported the extension from a submodule — so it is a candidate to send upstream rather
+    // than only carry.
+    //
+    // VERIFIED, TWO SOURCES, BOTH FOUND NOTHING (2026-09-10), per the open-source-verification rule:
+    //   • deezer-py (RemixDev/deezer-py, deezer/gw.py) implements NO search-history methods at all — no add,
+    //     no clear, no per-entry delete.
+    //   • dzr (yne/dzr, the `dzr` script) implements none either.
+    //   • This tree knows exactly two: user.addEntryInSearchHistory and user.clearSearchHistory.
+    // Gemini independently reached the same conclusion, so this is two searches finding nothing rather than
+    // one — which is weak evidence of absence, but it is the evidence there is.
+    //
+    // ⚠️ THE OPEN END, SO NOBODY RE-DERIVES IT: deezer.com's own UI DOES offer removing individual
+    // entries, so an endpoint presumably exists — its NAME is simply unverified. A browser-devtools capture
+    // of the kind that recovered the smarttracklist GraphQL query would close this. Do not guess a method
+    // name; the gateway is not enumerable and a wrong guess fails silently as an empty result.
+    //
+    // WHAT THE UI DOES ABOUT IT MEANWHILE: the per-row ✕ that called this was removed on 2026-09-10 — it
+    // appeared on Query AND Media rows and promised per-item removal on both. Clearing now lives on the
+    // search overlay's overflow menu, confirmed, where the affordance matches the behaviour. See
+    // search_mic_menu_white.xml.
     override suspend fun deleteQuickSearch(item: QuickSearchItem) = api.deleteSearchHistory()
 
-    override suspend fun loadSearchFeed(query: String): Feed<Shelf> = deezerSearchClient.loadSearchFeed(query, shelf)
+    override suspend fun loadSearchFeed(query: String): Feed<Shelf> =
+        deezerSearchClient.loadSearchFeed(query, shelf, isUserInitiated = true)
+
+    // The two-arg form is the one non-user callers reach; the one-arg form above keeps the old meaning
+    // (a user typed it) so no existing caller changes behaviour by omission.
+    override suspend fun loadSearchFeed(query: String, isUserInitiated: Boolean): Feed<Shelf> =
+        deezerSearchClient.loadSearchFeed(query, shelf, isUserInitiated)
 
     /**
      * ⚠️ A MISSING SECTION TITLE IS NOT A REASON TO DROP THE SECTION. Until 2026-09-07 this required

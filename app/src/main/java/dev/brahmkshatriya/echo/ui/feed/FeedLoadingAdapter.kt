@@ -78,6 +78,25 @@ class FeedLoadingAdapter(
         = ItemShelfLoginRequiredBinding.inflate(inflater, parent, false)
     ) : ViewHolder(binding.root) {
         override fun bind(loadState: LoadState) {
+            // ⚠⚠ THIS UNCHECKED CAST IS SAFE ONLY BECAUSE getStateViewType BELOW GATES ON THE SAME TYPE.
+            // Holder type 3 is returned there ONLY for `is AppException.LoginRequired`, so nothing else can
+            // reach this bind. THE GUARANTEE LIVES IN A DIFFERENT FUNCTION AND THERE IS NO LOCAL EVIDENCE OF
+            // IT — widening that `when` without fixing this line manufactures a ClassCastException.
+            //
+            // ⚠️ THE CLASS IS LIVE, NOT THEORETICAL — ONE OF THESE HAS ALREADY FIRED. AndroidAutoCallback
+            // carried `itemMap[id] as Playlist`, safe only while every caller happened to supply a
+            // playlist-typed item; a sub-extension returning a mistyped item threw a ClassCastException in
+            // the field (reported with extension_id = echo_combine). It was hardened in 3d159cbb = build 978
+            // to `as? Playlist ?: return@getList emptyList()`, and the whole file was swept — there are now
+            // ZERO unchecked casts in AndroidAutoCallback.
+            // PATTERN: an unchecked cast whose safety lives in another function is a LATENT CRASH. It reads
+            // as correct at both sites — the cast looks guarded, the gate looks total — and the coupling is
+            // invisible from either one. The AA site proves the failure mode is reachable in practice, not
+            // just in principle.
+            // NOT FIXED HERE, DELIBERATELY (2026-09-10): unlike the AA case there is no field evidence for
+            // this one, and `as?` here would need a fallback rendering for a state that currently cannot
+            // occur. Recorded so the coupling is visible from the risky end, which is where the AA one was
+            // missed until it fired.
             val error = (loadState as LoadState.Error).error
             val appError = error as AppException.LoginRequired
             binding.error.run {
@@ -106,6 +125,10 @@ class FeedLoadingAdapter(
             is LoadState.Loading -> 0
             is LoadState.NotLoading -> 1
             is LoadState.Error -> {
+                // ⚠️ THIS `when` IS LOAD-BEARING FOR A CAST IT DOES NOT MENTION. The LoginRequired arm is the
+                // only thing that makes `error as AppException.LoginRequired` in the LoginRequired holder's
+                // bind() safe. Widening this arm — or adding a type that also routes to 3 — crashes there,
+                // not here. Read the note at that cast before touching this branch.
                 when (loadState.error) {
                     is AppException.LoginRequired -> 3
                     is PagedSource.LoadingException -> 0

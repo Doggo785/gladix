@@ -31,27 +31,4 @@
         android:layout_weight="1"
         tools:text="@tools:sample/full_names" />
 
-    <com.google.android.material.button.MaterialButton
-        android:id="@+id/insert"
-        style="?attr/materialIconButtonStyle"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:contentDescription="@string/more"
-        android:padding="12dp"
-        android:rotation="45"
-        app:icon="@drawable/ic_back"
-        app:iconSize="24dp"
-        app:iconTint="?colorOnSurface" />
-
-    <com.google.android.material.button.MaterialButton
-        android:id="@+id/delete"
-        style="?attr/materialIconButtonStyle"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginHorizontal="4dp"
-        android:contentDescription="@string/close"
-        android:padding="12dp"
-        app:icon="@drawable/ic_close"
-        app:iconSize="24dp"
-        app:iconTint="?colorOnSurface" />
 </LinearLayout>

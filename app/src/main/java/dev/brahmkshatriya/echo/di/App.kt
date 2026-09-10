@@ -71,6 +71,32 @@ data class App(
     // inferred from an expression containing this handler — a cycle the compiler reports as "Type checking
     // has run into a recursive problem", pointing at the SCOPE line rather than the annotation that was
     // removed. All four handlers (App, ExtensionLoader, PlayerService, Downloader) carry this note.
+    // ⚠⚠ CALLED vs LAUNCHED — THIS IS WHY SOME EXTENSION FAILURES ARE NON-FATALS AND ONE WAS A FATAL.
+    // It is the single most useful distinction for triaging an extension crash, so it lives here rather
+    // than in a summary:
+    //   CALLED — anything we invoke through ExtensionUtils.get/getAs/getIf is wrapped in nested runCatching
+    //     and rethrown as toAppException(this). That is where BOTH the catching and the ATTRIBUTION come
+    //     from (App.throwingExtensionId walks the chain for the first AppException). Every extension
+    //     failure that surfaced correctly took this path: Tidal serving HTML instead of JSON, Combine
+    //     failing to fetch Spotify secrets, YTM's ytmkt MissingFieldException.
+    //   LAUNCHED — a coroutine started on a SCOPE is not called by us and returns no Result to anyone. It
+    //     is only as safe as the scope it runs on: a throw goes to that scope's CoroutineExceptionHandler,
+    //     and if there is none, to the DEFAULT UNCAUGHT HANDLER, which kills the process.
+    // BUILD 974 WAS THE SECOND KIND: a Spotify 500 (api-partner.spotify.com/pathfinder/v2/query) died with
+    // NO APP FRAMES between the extension and the dispatcher — SpotifyApi.call -> invokeSuspend ->
+    // DispatchedTask.run — which is the signature of a launch nobody was catching. This handler, and its
+    // three siblings (ExtensionLoader, PlayerService, Downloader), are the fix for that class; they landed
+    // in 92ab2e08 = build 997, 23 builds after that crash.
+    //
+    // ⚠️ AND THE LIMIT OF THAT FIX, STATED RATHER THAN ROUNDED UP: a handler protects THE SCOPE IT IS
+    // INSTALLED ON. An extension that creates its OWN CoroutineScope and launches on it is outside every
+    // handler we own, and nothing in this app can reach it. The 974 stack shows LimitedDispatcher$Worker,
+    // and no scope of ours uses limitedParallelism (the only such dispatcher in this tree is
+    // EffectsListener's broadcast one), which SUGGESTS the coroutine was on a scope the Spotify extension
+    // created internally. INFERENCE, NOT PROOF — LimitedDispatcher can also appear via withContext on a
+    // limited dispatcher inside an ordinary scope, and the extension is a third-party APK nobody here can
+    // read. So: THE FIX COVERS THE CLASS; WHETHER IT COVERS THAT EXACT CRASH IS UNKNOWABLE. Do not record
+    // it as closed-by-verification; it is closed by the class being guarded and 94 builds of silence.
     private val exceptionHandler: CoroutineExceptionHandler = CoroutineExceptionHandler { _, throwable ->
         if (throwable is CancellationException) return@CoroutineExceptionHandler
         runCatching { scope.launch { throwFlow.emit(throwable) } }
