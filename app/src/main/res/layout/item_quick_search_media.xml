@@ -54,4 +54,15 @@
 
     </LinearLayout>
 
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/insert"
+        style="?attr/materialIconButtonStyle"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:contentDescription="@string/more"
+        android:padding="12dp"
+        android:rotation="45"
+        app:icon="@drawable/ic_back"
+        app:iconSize="24dp"
+        app:iconTint="?colorOnSurface" />
 </LinearLayout>
