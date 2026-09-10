@@ -12,6 +12,13 @@
 @file:Suppress("GrDeprecatedAPIUsage", "AvoidDuplicateDependencies", "AvoidApplyPluginMethod")
 
 import java.io.File
+// ⚠️ REQUIRED — `java.util.Properties()` WRITTEN INLINE DOES NOT COMPILE HERE, and the error does not
+// say why. In a .gradle.kts with the Java/Android plugin applied, `java` resolves to the generated
+// JavaPluginExtension ACCESSOR, which SHADOWS the root `java` package. So `java.util.Properties()` parses
+// as <javaExtension>.util and fails with "Unresolved reference 'util'", taking the surrounding
+// runCatching/apply/load/getProperty down with it as inference cascades. The file already imports
+// java.io.File for the same reason; keep new java.* types imported here rather than fully qualified.
+import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
@@ -28,6 +35,34 @@ plugins {
 // Parsing here degrades a bad/absent JSON to the Firebase-free (compileOnly) path instead.
 val hasGoogleServices = file("google-services.json").let { f ->
     f.exists() && runCatching { groovy.json.JsonSlurper().parse(f); true }.getOrDefault(false)
+}
+// Last.fm api_key for the endless-queue radio fallback (see RadioFallback). Computed at TOP LEVEL beside
+// hasGoogleServices, matching this file's existing shape for "derive a build input once, feed it to
+// buildConfigField" — the first version computed it inside defaultConfig { }, which works in principle but
+// put a multi-line file read in the middle of the variant config.
+//
+// THERE IS NO FIRST-CLASS GRADLE READER FOR local.properties, and it is worth saying so because the
+// obvious candidate is wrong: providers.gradleProperty() reads gradle.properties / -P / systemProp, NOT
+// local.properties, so it cannot be used here — and gradle.properties is TRACKED in this repo (checked
+// 2026-09-09), which is the whole reason the key is not there. Properties + a guarded file read is the
+// standard pattern for this file.
+// providers.environmentVariable() IS used for the env fallback rather than System.getenv(): it is the
+// configuration-cache-friendly API, and this file already cares about that (see verifyExtensionAbi's
+// note on resolving everything at configuration time).
+//
+// Order is local.properties first, then LASTFM_API_KEY env var (the CI path). Missing file, unreadable
+// file, missing key and empty value ALL degrade to "" — no build failure on any of them, which is
+// required: contributor and CI builds have no local.properties and must still build. Empty is a
+// first-class disable, same shape as HAS_FIREBASE.
+val lastFmApiKey: String = run {
+    val fromLocal = rootProject.file("local.properties").takeIf(File::exists)?.let { f ->
+        runCatching {
+            Properties().apply { f.inputStream().use { load(it) } }.getProperty("lastfm.apiKey")
+        }.getOrNull()
+    }
+    fromLocal?.takeIf { it.isNotBlank() }
+        ?: providers.environmentVariable("LASTFM_API_KEY").orNull
+        ?: ""
 }
 val gitHash = runCatching { execute("git", "rev-parse", "HEAD").take(7) }.getOrDefault("dev")
 val gitCount = runCatching { execute("git", "rev-list", "--count", "HEAD").toInt() }.getOrDefault(1)
@@ -80,11 +115,6 @@ android {
         // line 3 of .gitignore. LASTFM_API_KEY env var is the CI path. Empty is a FIRST-CLASS DISABLE, the
         // same shape as HAS_FIREBASE: RadioFallback.isEnabled is false, the fallback never fires, and
         // contributor and CI builds compile and run unchanged. Rotating the key needs no code change.
-        val lastFmKey = runCatching {
-            java.util.Properties().apply {
-                rootProject.file("local.properties").takeIf { it.exists() }?.inputStream()?.use { load(it) }
-            }.getProperty("lastfm.apiKey")
-        }.getOrNull() ?: System.getenv("LASTFM_API_KEY") ?: ""
         // ⚠⚠ THIS VALUE EXISTS IN EXACTLY ONE PLACE, ON ONE MACHINE, AND IS IN NO BACKUP. local.properties
         // is git-ignored, so a fresh clone, a second machine or a CI runner builds with an EMPTY key and
         // the fallback silently disabled. SAME SHAPE AS THE DEBUG KEYSTORE (see the signingConfig note
@@ -94,7 +124,7 @@ android {
         // keyless build is distinguishable from a working one in logcat rather than being silent. That is
         // the only signal; there is deliberately no build-time warning, because contributor and CI builds
         // must stay clean.
-        buildConfigField("String", "LASTFM_API_KEY", "\"$lastFmKey\"")
+        buildConfigField("String", "LASTFM_API_KEY", "\"$lastFmApiKey\"")
     }
 
     // ── WHICH VARIANT GOES WHERE. Not derivable from this file, so it is written down. VERIFIED
