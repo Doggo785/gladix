@@ -189,6 +189,7 @@
     <string name="link">Link</string>
     <string name="link_or_code">Link or Code</string>
     <string name="list_is_empty">List is empty</string>
+    <string name="could_not_load_x">Couldn\'t load %1$s</string>
     <string name="extension_installed">%1$s (Installed)</string>
     <string name="add_extensions">Add Extensions</string>
     <string name="invalid_extension_list">Invalid extensions list</string>

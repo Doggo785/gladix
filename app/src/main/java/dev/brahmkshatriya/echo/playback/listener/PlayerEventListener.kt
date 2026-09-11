@@ -1030,8 +1030,8 @@ class PlayerEventListener(
     // causes read "GaiException android_getaddrinfo failed: EAI_NODATA" and "ErrnoException isConnected
     // failed: ECONNREFUSED" — exactly the nodes rootCause resolves to.
     // ⚠️ PATTERN: never type-check a wrapped exception against a non-chain-walking accessor.
-    private fun Throwable.anyCause(predicate: (Throwable) -> Boolean): Boolean =
-        generateSequence(this) { it.cause }.any(predicate)
+    // Moved to file level (bottom of this file) 2026-09-11 so PlayerRadio's YTM throw-bridge can classify
+    // an exception that toAppException has wrapped, instead of a second copy of the same three lines.
 
     // The ONLY way to advance the breaker: increments the counter and records this skip's cause together,
     // so they cannot drift. Called at every skip site; never at the exempt (5xx / removed-extension) sites,
@@ -1700,3 +1700,26 @@ class PlayerEventListener(
         player.play()
     }
 }
+
+// ⚠️ THIS IS THE THIRD OF THREE ERROR CLASSIFIERS AND THE THREE ARE NOT INTERCHANGEABLE:
+// ExceptionUtils.getTitle/getFinalTitle (phone snackbar, byte-for-byte frozen), ErrorCategory.classify()
+// (AA head unit, enum {Network, LoginOrAuth, Generic}, kept in lockstep with getTitle by
+// ErrorCategoryTest), and this raw predicate walk. This one exists BECAUSE classify()'s enum cannot
+// express the distinctions its callers need - DNS/connection failures must hold and never skip while
+// mid-stream socket resets retry once then skip, and PlayerRadio.throwBridge needs "parse-schema drift"
+// where classify() can only say Generic.
+// ⚠️ THAT IS AN ARGUMENT ABOUT AXIS AND COST, NOT ABOUT classify() BEING FROZEN - IT IS NOT.
+// It was extended on 2026-08-19 (ConnectException / NoRouteToHostException, previously DNS-only), with
+// getTitle changed in step and drift guards added to ErrorCategoryTest; that lockstep is the procedure for
+// extending it. The reason not to extend it for these callers is that its enum is a USER-FACING
+// presentation axis - Network / LoginOrAuth / Generic - and none of them want to tell the user anything
+// different; they want a predicate at one call site. Promoting this walk to file level is consistent with
+// that origin - one shared predicate walk, not a fourth classifier.
+//
+// ⚠⚠ THE ONE CHAIN WALKER. Used by onPlayerError's network classification above and by
+// PlayerRadio's YTM throw-bridge. File-level and internal rather than private-to-the-class precisely so
+// there is never a second copy: the whole point of the note at its former call site is that type-checking a
+// WRAPPED exception against a non-chain-walking accessor silently never matches, and two walkers that could
+// drift would reintroduce that risk by a different route.
+internal fun Throwable.anyCause(predicate: (Throwable) -> Boolean): Boolean =
+    generateSequence(this) { it.cause }.any(predicate)

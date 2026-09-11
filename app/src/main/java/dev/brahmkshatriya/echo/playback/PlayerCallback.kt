@@ -54,6 +54,7 @@ import dev.brahmkshatriya.echo.extensions.ExtensionUtils.get
 import dev.brahmkshatriya.echo.extensions.ExtensionUtils.getAs
 import dev.brahmkshatriya.echo.extensions.ExtensionUtils.getExtension
 import dev.brahmkshatriya.echo.extensions.ExtensionUtils.getExtensionOrThrow
+import dev.brahmkshatriya.echo.extensions.ExtensionUtils.isClient
 import dev.brahmkshatriya.echo.extensions.MediaState
 import dev.brahmkshatriya.echo.playback.MediaItemUtils
 import dev.brahmkshatriya.echo.playback.MediaItemUtils.extensionId
@@ -239,19 +240,28 @@ class PlayerCallback(
             resumeCommand -> resume(player)
             imageCommand -> getImage(player)
             backfillCommand -> backfillQueue(player, args)
+            // ⚠⚠ THE `as?` BELOW SWALLOWS A MISMATCH SILENTLY, AND THESE TWO ARE THE CHEAPEST
+            // "TAP DOES NOTHING" IN THE APP: seekToFull is a queue-row tap, so a null cast means the row
+            // does not play and nothing anywhere records why. The session player IS always a ShufflePlayer,
+            // which is exactly why a failure here is a PROGRAMMER ERROR worth a non-fatal rather than a user
+            // message - there is nothing the user could do about it.
             seekToFullCommand -> run {
                 // Phone queue tap: seek by FULL index on the real player. seekToFullIndex no-ops on an
                 // out-of-range (stale/racing) index, which the raw controller seekTo can't — that guard
                 // is why this stays a custom command. `play` preserves play()=true / seek()=false. AA's
                 // onSkipToQueueItem path (seekToDefaultPosition) never enters here.
-                (player as? ShufflePlayer)?.seekToFullIndex(args.getInt("index"), args.getBoolean("play"))
+                val shuffled = player as? ShufflePlayer
+                if (shuffled == null) bugAsync("seek_to_full", "player is not a ShufflePlayer")
+                else shuffled.seekToFullIndex(args.getInt("index"), args.getBoolean("play"))
                 Futures.immediateFuture(SessionResult(RESULT_SUCCESS))
             }
             syncShuffleFlagCommand -> run {
                 // Pure icon sync from a CLIENT-side in-order start-playback path (track tap / History setQueue):
                 // set the flag WITHOUT changeQueue. `original` is already correct from the preceding setMediaItems,
                 // so this is cosmetic-only and cannot reorder.
-                (player as? ShufflePlayer)?.syncShuffleFlag(args.getBoolean("enabled"))
+                val shuffled = player as? ShufflePlayer
+                if (shuffled == null) bugAsync("sync_shuffle_flag", "player is not a ShufflePlayer")
+                else shuffled.syncShuffleFlag(args.getBoolean("enabled"))
                 Futures.immediateFuture(SessionResult(RESULT_SUCCESS))
             }
             else -> super.onCustomCommand(session, controller, customCommand, args)
@@ -373,10 +383,14 @@ class PlayerCallback(
     private fun radio(player: Player, args: Bundle) = scope.future {
         userQueueSet.set(true)
         val error = SessionResult(SessionError.ERROR_UNKNOWN)
-        val extId = args.getString("extId") ?: return@future error
-        val item = args.getSerialized<EchoMediaItem>("item")?.getOrNull() ?: return@future error
+        val extId = args.getString("extId") ?: return@future bug("radio", "missing extId")
+        val itemArg = args.getSerialized<EchoMediaItem>("item")
+        val item = itemArg?.getOrNull() ?: return@future bug(
+            "radio", "item missing or undeserializable", itemArg?.exceptionOrNull()
+        )
         val itemLoaded = args.getBoolean("loaded", false)
-        val extension = extensions.music.getExtension(extId) ?: return@future error
+        val extension = extensions.music.getExtension(extId)
+            ?: return@future notFound(R.string.extension)
         val newItem = if (itemLoaded) item else loadItem(extension, item)
         // ⚠⚠ NOT FOR TRACKS. This handler clears the queue and plays the generated mix, which
         // is correct for Album / Artist / Playlist / Radio and WRONG for a Track, whose station must be
@@ -416,6 +430,25 @@ class PlayerCallback(
         )
         if (loaded == null) {
             radioFlow.value = prior
+            // ⚠⚠ A SPLIT, AND ONLY ONE HALF IS SILENT TODAY - AN UNCONDITIONAL EMIT HERE WOULD
+            // DOUBLE-REPORT. PlayerRadio.start ends in getOrThrow(throwableFlow), which converts any
+            // THROWN failure into a report plus null - and DeezerRadioClient throws "No Radio" by design
+            // on its Album/Playlist branches, reachable on an ordinary network failure. Those are already
+            // on the user's screen. The genuinely silent half is "this thing cannot have a radio at all":
+            // !isRadioSupported, or an extension that is not a RadioClient. Only that half gets a message.
+            if (!newItem.isRadioSupported || !extension.isClient<RadioClient>()) {
+                app.messageFlow.emit(
+                    Message(
+                        app.context.getString(
+                            R.string.no_x_found, app.context.getString(R.string.radio)
+                        )
+                    )
+                )
+            }
+            Log.d(
+                "GladixQueue",
+                "radio: no station ext=$extId supported=${newItem.isRadioSupported}"
+            )
             return@future error
         }
         player.with {
@@ -451,8 +484,16 @@ class PlayerCallback(
         // build the seed's MediaItem, without a seed there is nothing to play. NO generation concern (the
         // extension lookup, radio start/play) may sit in front of playback — that shape caused the "tapping
         // does nothing" regression, so generation lives in the guarded block below, after the seed is playing.
-        val extId = args.getString("extId") ?: return@future error
-        val seed = args.getSerialized<EchoMediaItem>("item")?.getOrNull() as? Track ?: return@future error
+        val extId = args.getString("extId") ?: return@future bug("track_radio", "missing extId")
+        val seedArg = args.getSerialized<EchoMediaItem>("item")
+        val seed = seedArg?.getOrNull() as? Track ?: return@future bug(
+            // ⚠️ THE HIGHEST-VALUE GUARD IN THIS PASS. It sits BEFORE any playback, so firing it
+            // means a tap that does nothing at all - the exact "tapping does nothing" regression recorded
+            // at PlayerViewModel.playTrackRadio, whose cause was a serialization discriminator. One
+            // message covers all three ways to get here (absent / undeserializable / not a Track); the
+            // cause distinguishes them when there is one.
+            "track_radio", "item missing, undeserializable, or not a Track", seedArg?.exceptionOrNull()
+        )
         // Track-radio context: drives the "<title> Radio" header and is what generation runs from — the
         // same Radio the setQueue single-track path built on phone.
         val context = Radio(
@@ -466,6 +507,20 @@ class PlayerCallback(
             app, downloadFlow.value, MediaState.Unloaded(extId, seed), context
         )
         player.with {
+            // ⚠⚠ PARKED 2026-09-11 - THIS ONE-ITEM QUEUE MAKES EVERY SINGLE-TRACK PLAY FETCH
+            // ITS RADIO TWICE, ON EVERY EXTENSION INCLUDING DEEZER. A one-item queue has no next item, so
+            // the onTimelineChanged this setMediaItems fires reaches PlayerRadio.startRadio, whose
+            // `hasNextMediaItem()` guard passes, which calls loadPlaylist -> PlayerRadio.start. Meanwhile
+            // this handler is ALREADY calling PlayerRadio.start a few lines below. Two independent
+            // generations of the same station, from one tap.
+            // SECOND CONFIRMED INSTANCE of the double-generation first seen in the 2026-09-11 artist-radio
+            // log, where a RESEED line appeared at a timestamp neither Last.fm lookup could have produced -
+            // same cause, reconstructed from timing there and read directly off the call graph here.
+            // ⚠️ THIS IS THE ONLY FINDING FROM THAT SESSION THAT COSTS THE PRIMARY EXTENSION
+            // ANYTHING: one wasted radio request per single-track play on Deezer too. Everything else was
+            // YTM-only. On YTM it is also what makes PlayerRadio.throwBridge reachable at all (see its
+            // reach note), so DO NOT "optimise" the duplicate away without covering trackRadio's own
+            // start() failure first - removing it would silently un-fix YTM radio.
             setMediaItems(listOf(seedItem), 0, seed.playedDuration ?: 0)
             (this as? ShufflePlayer)?.syncShuffleFlag(false)
             if (playbackState == Player.STATE_IDLE) prepare()
@@ -476,6 +531,10 @@ class PlayerCallback(
         //    the seed already playing. Cancellation still propagates.
         try {
             val extension = extensions.music.getExtension(extId)
+            // LEGITIMATELY SILENT, logged only. The seed is ALREADY PLAYING by the time we get here, so
+            // this is a degraded success ("seed plays, no radio"), not a dead tap - see the guard note
+            // above. A snackbar for a station the user never explicitly asked for would be noise.
+            if (extension == null) Log.d("GladixQueue", "track_radio: no extension ext=$extId")
             if (extension != null) {
                 val loaded = PlayerRadio.start(throwableFlow, extension, seed, context)
                 if (loaded != null) PlayerRadio.play(player, downloadFlow, app, radioFlow, loaded, extension)
@@ -565,12 +624,19 @@ class PlayerCallback(
     private fun playItem(player: Player, args: Bundle) = scope.future {
         userQueueSet.set(true)
         val error = SessionResult(SessionError.ERROR_UNKNOWN)
-        val extId = args.getString("extId") ?: return@future error
-        val item = args.getSerialized<EchoMediaItem>("item")?.getOrNull() ?: return@future error
+        val extId = args.getString("extId") ?: return@future bug("play", "missing extId")
+        val itemArg = args.getSerialized<EchoMediaItem>("item")
+        val item = itemArg?.getOrNull() ?: return@future bug(
+            // The cause matters: getSerialized returns a Result and ?.getOrNull() THREW IT AWAY, so a
+            // deserialization failure was indistinguishable from an absent key. Reporting the actual
+            // exception is the difference between a useful non-fatal and another dead end.
+            "play", "item missing or undeserializable", itemArg?.exceptionOrNull()
+        )
         val loaded = args.getBoolean("loaded", false)
         val shuffle = args.getBoolean("shuffle", false)
         val startTrackId = args.getString("startTrackId")
-        val extension = extensions.music.getExtension(extId) ?: return@future error
+        val extension = extensions.music.getExtension(extId)
+            ?: return@future notFound(R.string.extension)
         when (item) {
             is Track -> {
                 // P1: stamp a display-only "<track> Radio" context (LABEL_ONLY_RADIO) so the header
@@ -601,24 +667,7 @@ class PlayerCallback(
                 // whole thing, so its continuation is always null (an empty result there IS genuinely empty).
                 val result: Result<Pair<List<Track>, String?>> =
                     if (shuffle) extension.get { tracks.loadAll() }.map { it to null as String? }
-                    else runCatching {
-                        val (list, continuation) = extension.get { tracks.loadPage(null) }.getOrThrow()
-                        if (continuation != null) scope.launch {
-                            val all = extension.get { tracks.loadAll() }.getOrElse {
-                                if (it is CancellationException) throw it
-                                throwableFlow.emit(it)
-                                return@launch
-                            }.drop(list.size).map {
-                                MediaItemUtils.build(
-                                    app, downloadFlow.value, MediaState.Unloaded(extId, it), item
-                                )
-                            }
-                            // Append remaining pages at the END (robust to the first page having been
-                            // subList-trimmed to the tapped track, and to mid-load advances).
-                            player.with { addMediaItems(all) }
-                        }
-                        list to continuation
-                    }
+                    else runCatching { extension.get { tracks.loadPage(null) }.getOrThrow() }
                 val (list, continuation) = result.getOrElse {
                     if (it is CancellationException) throw it
                     throwableFlow.emit(it)
@@ -673,6 +722,70 @@ class PlayerCallback(
                     if (playbackState == Player.STATE_IDLE) prepare()
                     play()
                 }
+                // ⚠⚠ THE REMAINING-PAGES LOAD IS STARTED HERE, AFTER setMediaItems - IT USED TO
+                // BE STARTED ABOVE, INSIDE THE loadPage runCatching, AND THAT ORDER WAS WRONG TWICE OVER.
+                // This is a detached scope.launch running an UNBOUNDED loadAll() (PagedData.loadAll has no
+                // cap and no timeout), so it is the LONGEST-LIVED async append in the app and the only
+                // fire-and-forget one: its `future` returns long before it does.
+                //   1. Started above, it raced its OWN setMediaItems. A fast loadAll appended to the
+                //      PREVIOUS queue, which setMediaItems then wiped - the extra pages silently vanished.
+                //   2. It could not be epoch-gated from up there either: capturing the epoch before this
+                //      call's own setMediaItems would make every append look stale and NO long collection
+                //      would ever load past page one. Moving it below is what makes the gate correct rather
+                //      than merely present.
+                // Cost of the move: loadAll now starts a few ms later (after setMediaItems + prepare)
+                // instead of racing it. Nothing waits on it either way.
+                //
+                // ⚠️ [CORRECTED 2026-09-10] A PROJECT RECORD DESCRIBES THIS LAUNCH AS CANCELLABLE
+                // AND IT IS NOT, WHICH MATTERS BECAUSE IT WOULD ARGUE AGAINST THE GATE BELOW. It reads:
+                // "If user's playItem(albumTrack) had already called setMediaItems(albumTracks) and launched
+                // loadJob_album, that job is cancelled by resume() overwriting the queue."
+                // THE TREE: there is no loadJob_album and never was - PlayerCallback holds exactly two Job
+                // fields, timerJob and nextJob, neither queue-related; resume() cancels nothing; and
+                // `git log -S loadJob_album --all` returns ZERO commits across full history (which reaches
+                // 2023-12-31, so May is well inside it). The identifier never existed. The only loadJob in
+                // the app is StreamableMediaSource's, per-source streamable loading, unrelated to queue
+                // lifetime.
+                // BUT THE SHARPEST FRAMING IS NOT "it was removed" OR "it never existed" - IT IS THAT THE
+                // JOB EXISTS AND THE HANDLE DOES NOT. The launch below IS the job that record was naming;
+                // it simply has no name and no one keeps its Job, so there is nothing to call cancel() on.
+                // That is precisely the machinery option (a) would have had to add, and precisely why (b)
+                // was cheaper.
+                // THE CHARITABLE READING IS ALMOST CERTAINLY WHAT WAS MEANT: "cancelled" as in OVERWRITTEN -
+                // the launch's append landing in a queue that setMediaItems then wiped. That is a real
+                // effect, and it is the second latent bug described above. But overwriting is NOT
+                // cancelling: the work still runs, still spends the network, and protects nothing unless
+                // loadAll happens to finish FIRST. When it finishes second - the normal case, since
+                // loadAll is unbounded - the append lands in the new queue and stays. Either way there is
+                // no cancellation mechanism here to lean on.
+                if (continuation != null) {
+                    val epoch = player.queueEpochOrZero
+                    scope.launch {
+                        val all = extension.get { tracks.loadAll() }.getOrElse {
+                            if (it is CancellationException) throw it
+                            throwableFlow.emit(it)
+                            return@launch
+                        }.drop(list.size).map {
+                            MediaItemUtils.build(
+                                app, downloadFlow.value, MediaState.Unloaded(extId, it), item
+                            )
+                        }
+                        // Append remaining pages at the END (robust to the first page having been
+                        // subList-trimmed to the tapped track, and to mid-load advances) - but only if
+                        // this is still the queue they were loaded for.
+                        player.with {
+                            if (queueEpochOrZero != epoch) {
+                                Log.d(
+                                    "GladixQueue",
+                                    "stale_drop site=playItem_loadAll n=${all.size} " +
+                                        "started=$epoch now=$queueEpochOrZero"
+                                )
+                                return@with
+                            }
+                            addMediaItems(all)
+                        }
+                    }
+                }
             }
         }
         SessionResult(RESULT_SUCCESS)
@@ -681,6 +794,51 @@ class PlayerCallback(
     // Player receiver: for a reference ALREADY resolved on the application thread. Every caller of this
     // overload receives one as a `player: Player` parameter (getImage, resume, radio, playItem, …), so
     // the accessor has already run safely. Kept as-is.
+    // ⚠⚠ THREE DESTINATIONS, CHOSEN PER GUARD - NOT ONE BLANKET RULE. Added 2026-09-11 after a
+    // pass over every handler reached through PlayerViewModel.withBrowser, because "tap does nothing, no
+    // message, no log" is the worst failure shape in this app and these guards were unreportable BY
+    // CONSTRUCTION (withBrowser discards every SessionResult - see the note there).
+    //   bug()      PROGRAMMER ERROR. The ViewModel/handler contract is broken - a missing Bundle key, an
+    //              item that would not deserialize. No user message: there is nothing actionable to say
+    //              and "something went wrong" is silence plus a toast. Goes to throwableFlow, i.e. a
+    //              Crashlytics non-fatal naming the command and the key.
+    //   notFound() USER-VISIBLE and actionable. Mirrors FeedClickListener.notFoundSnack's wording so the
+    //              phrasing matches what the UI already says elsewhere.
+    //   (silent)   Expected, routine, or already-reported. Left alone DELIBERATELY, with the reason at the
+    //              site - the same way PlayerBitmapLoader was excluded from the futureCatching pass.
+    //
+    // THE PRECEDENT THIS FOLLOWS, verified in history rather than assumed: f8f1e0a7 (2026-07-09) split
+    // playItem's one empty-list guard into TWO destinations - messageFlow for the genuinely empty case,
+    // throwableFlow for the anomalous empty-first-page-with-continuation case - restructured the code to
+    // carry `continuation` so the two could be told apart, and wrote the rationale in the same hunk
+    // ("Expected user input, NOT a bug"). Deliberate classification, not a drive-by move.
+    //
+    // ⚠️ DELIVERY CAVEAT FOR notFound(): app.messageFlow's only subscriber is SnackBarHandler's
+    // lifecycle-gated observe() (flowWithLifecycle, STARTED) and the flow has replay = 0, so a message
+    // emitted while the Activity is stopped is DROPPED, not buffered. Every notFound() call site below is
+    // PRE-SUSPEND - it fires microseconds after the tap, while the Activity is still STARTED - so this is
+    // reliable for them. The guards that sit BEHIND a network call additionally Log.d, because those can
+    // land after the user has backgrounded the app and the snackbar would be lost. That is the parked
+    // held-state item; the logs close its "no log" half without pretending the gap is gone.
+    private suspend fun bug(command: String, detail: String, cause: Throwable? = null) =
+        SessionResult(SessionError.ERROR_UNKNOWN).also {
+            throwableFlow.emit(IllegalStateException("custom command '$command': $detail", cause))
+        }
+
+    // Non-suspend variant for the inline dispatch branches, which are not in a coroutine.
+    private fun bugAsync(command: String, detail: String) {
+        scope.launch {
+            throwableFlow.emit(IllegalStateException("custom command '$command': $detail"))
+        }
+    }
+
+    private suspend fun notFound(nameRes: Int) =
+        SessionResult(SessionError.ERROR_UNKNOWN).also {
+            app.messageFlow.emit(
+                Message(app.context.getString(R.string.no_x_found, app.context.getString(nameRes)))
+            )
+        }
+
     private suspend fun <T> Player.with(block: suspend Player.() -> T): T =
         withContext(Dispatchers.Main) { block() }
 
@@ -714,12 +872,39 @@ class PlayerCallback(
     // fast-start (which was broken for stale-token entries anyway) for a correct, always-resolving tap.
     private fun backfillQueue(player: Player, args: Bundle) = scope.future {
         val error = SessionResult(SessionError.ERROR_UNKNOWN)
-        val extId = args.getString("extId") ?: return@future error
-        val item = args.getSerialized<EchoMediaItem>("item")?.getOrNull() ?: return@future error
-        val startTrackId = args.getString("startTrackId") ?: return@future error
+        val extId = args.getString("extId") ?: return@future bug("backfill", "missing extId")
+        val itemArg = args.getSerialized<EchoMediaItem>("item")
+        val item = itemArg?.getOrNull() ?: return@future bug(
+            "backfill", "item missing or undeserializable", itemArg?.exceptionOrNull()
+        )
+        val startTrackId = args.getString("startTrackId")
+            ?: return@future bug("backfill", "missing startTrackId")
+        // ⚠⚠ THE ONLY ASYNC PATH THAT *REPLACES* THE QUEUE RATHER THAN APPENDING TO IT, WHICH
+        // MAKES A STALE ONE DESTRUCTIVE, NOT MERELY UNTIDY: freshContextUpcoming is a network fetch, and if
+        // the user starts something else while it runs, this setMediaItems WIPES the queue they are now
+        // listening to and replaces it with the History item they tapped earlier. Every other site here
+        // pollutes; this one destroys.
+        val epoch = player.queueEpochOrZero
         val upcoming = freshContextUpcoming(extId, item, startTrackId)
-        if (upcoming.isEmpty()) return@future error
+        if (upcoming.isEmpty()) {
+            // POST-NETWORK, so the snackbar can be lost if the user backgrounded the app while
+            // freshContextUpcoming was running - hence the log as well. A History tap that rebuilds to
+            // nothing is otherwise a completely dead tap, which is the shape this whole pass is about.
+            Log.d("GladixQueue", "backfill: rebuilt context empty ext=$extId")
+            app.messageFlow.emit(
+                Message(app.context.getString(R.string.could_not_load_x, item.title))
+            )
+            return@future error
+        }
         withContext(Dispatchers.Main) {
+            if (player.queueEpochOrZero != epoch) {
+                Log.d(
+                    "GladixQueue",
+                    "stale_drop site=backfill n=${upcoming.size} " +
+                        "started=$epoch now=${player.queueEpochOrZero}"
+                )
+                return@withContext
+            }
             player.setMediaItems(upcoming, 0, 0)
             // History tap: in-order current+upcoming — sync the shuffle flag/icon OFF without changeQueue.
             (player as? ShufflePlayer)?.syncShuffleFlag(false)
@@ -731,10 +916,19 @@ class PlayerCallback(
 
     private fun addToQueue(player: Player, args: Bundle) = scope.future {
         val error = SessionResult(SessionError.ERROR_UNKNOWN)
-        val extId = args.getString("extId") ?: return@future error
-        val item = args.getSerialized<EchoMediaItem>("item")?.getOrNull() ?: return@future error
+        val extId = args.getString("extId") ?: return@future bug("add_to_queue", "missing extId")
+        val itemArg = args.getSerialized<EchoMediaItem>("item")
+        val item = itemArg?.getOrNull() ?: return@future bug(
+            "add_to_queue", "item missing or undeserializable", itemArg?.exceptionOrNull()
+        )
         val loaded = args.getBoolean("loaded", false)
-        val extension = extensions.music.getExtension(extId) ?: return@future error
+        val extension = extensions.music.getExtension(extId)
+            ?: return@future notFound(R.string.extension)
+        // ⚠️ USER-INITIATED, AND DROPPING IS STILL RIGHT - the one site where that is a judgement
+        // rather than obvious. "Add to queue" means add to THE QUEUE THAT EXISTED WHEN IT WAS TAPPED; if the
+        // user has since replaced that queue outright, the later action supersedes this one. An ordinary
+        // track advance does NOT bump the epoch, so this can only drop after a real replacement.
+        val epoch = player.queueEpochOrZero
         val tracks = listTracks(extension, item, loaded).getOrElse {
             if (it is CancellationException) throw it
             throwableFlow.emit(it)
@@ -744,7 +938,14 @@ class PlayerCallback(
             throwableFlow.emit(it)
             return@future error
         }
-        if (tracks.isEmpty()) return@future error
+        if (tracks.isEmpty()) {
+            // POST-NETWORK: the snackbar is lost if the user backgrounded the app while listTracks ran,
+            // so this logs too. Same string and same meaning as playItem's genuinely-empty case - the
+            // collection really has nothing in it, which is expected user input rather than a fault.
+            Log.d("GladixQueue", "add_to_queue: nothing to add ext=$extId")
+            app.messageFlow.emit(Message(app.context.getString(R.string.list_is_empty)))
+            return@future error
+        }
         // P5: give added tracks a source label so they don't show a blank header when reached. A
         // collection (Album/Playlist/Artist/Radio) is its own source; a lone track gets the display-only
         // "<track> Radio" placeholder (stripped in PlayerRadio), consistent with a bare-track play.
@@ -758,6 +959,13 @@ class PlayerCallback(
             )
         }
         player.with {
+            if (queueEpochOrZero != epoch) {
+                Log.d(
+                    "GladixQueue",
+                    "stale_drop site=addToQueue n=${mediaItems.size} started=$epoch now=$queueEpochOrZero"
+                )
+                return@with
+            }
             addMediaItems(mediaItems)
             prepare()
         }
@@ -768,11 +976,19 @@ class PlayerCallback(
     private var nextJob: Job? = null
     private fun addToNext(player: Player, args: Bundle) = scope.future {
         val error = SessionResult(SessionError.ERROR_UNKNOWN)
-        val extId = args.getString("extId") ?: return@future error
-        val item = args.getSerialized<EchoMediaItem>("item")?.getOrNull() ?: return@future error
+        val extId = args.getString("extId") ?: return@future bug("add_to_next", "missing extId")
+        val itemArg = args.getSerialized<EchoMediaItem>("item")
+        val item = itemArg?.getOrNull() ?: return@future bug(
+            "add_to_next", "item missing or undeserializable", itemArg?.exceptionOrNull()
+        )
         val loaded = args.getBoolean("loaded", false)
-        val extension = extensions.music.getExtension(extId) ?: return@future error
+        val extension = extensions.music.getExtension(extId)
+            ?: return@future notFound(R.string.extension)
         nextJob?.cancel()
+        // ⚠️ WORSE THAN A PLAIN APPEND IF STALE: the insert position below is computed from the
+        // LIVE queue (currentMediaItemIndex + 1 + next), with `next` a running offset across recent adds, so
+        // a stale insert lands at an index that means nothing in the queue it arrives in.
+        val epoch = player.queueEpochOrZero
         val tracks = listTracks(extension, item, loaded).getOrElse {
             if (it is CancellationException) throw it
             throwableFlow.emit(it)
@@ -782,7 +998,14 @@ class PlayerCallback(
             throwableFlow.emit(it)
             return@future error
         }
-        if (tracks.isEmpty()) return@future error
+        if (tracks.isEmpty()) {
+            // POST-NETWORK: the snackbar is lost if the user backgrounded the app while listTracks ran,
+            // so this logs too. Same string and same meaning as playItem's genuinely-empty case - the
+            // collection really has nothing in it, which is expected user input rather than a fault.
+            Log.d("GladixQueue", "add_to_next: nothing to add ext=$extId")
+            app.messageFlow.emit(Message(app.context.getString(R.string.list_is_empty)))
+            return@future error
+        }
         // P5: same source-label treatment as addToQueue — collection context, else track-radio placeholder.
         val addedContext = item.takeUnless { it is Track }
         val mediaItems = tracks.map { track ->
@@ -793,13 +1016,27 @@ class PlayerCallback(
                 addedContext ?: MediaItemUtils.trackRadioPlaceholder(track)
             )
         }
+        var inserted = false
         player.with {
+            if (queueEpochOrZero != epoch) {
+                Log.d(
+                    "GladixQueue",
+                    "stale_drop site=addToNext n=${mediaItems.size} started=$epoch now=$queueEpochOrZero"
+                )
+                return@with
+            }
             if (mediaItemCount == 0) playWhenReady = true
             // Current index so "play next" inserts right after the CURRENT track.
             val fullIndex = currentMediaItemIndex
             addMediaItems(fullIndex + 1 + next, mediaItems)
             prepare()
+            inserted = true
         }
+        // Only advance the running offset if the insert actually happened - otherwise `next` drifts past a
+        // drop and the FOLLOWING add lands too far out. (It self-heals after nextJob's 5s reset, but a
+        // silently wrong position in that window is the kind of thing that gets reported as "play next put
+        // it in the wrong place".)
+        if (!inserted) return@future error
         next += mediaItems.size
         nextJob = scope.launch {
             delay(5000)

@@ -295,7 +295,7 @@ class ShufflePlayer(
         clearErrorBeforeQueueReplace()
         original = listOf(mediaItem)
         backStack.clear()
-        cancelPendingReconstitution()
+        markQueueReplaced()
         player.setMediaItem(mediaItem)
     }
 
@@ -303,7 +303,7 @@ class ShufflePlayer(
         clearErrorBeforeQueueReplace()
         original = listOf(mediaItem)
         backStack.clear()
-        cancelPendingReconstitution()
+        markQueueReplaced()
         player.setMediaItem(mediaItem, resetPosition)
     }
 
@@ -311,7 +311,7 @@ class ShufflePlayer(
         clearErrorBeforeQueueReplace()
         original = listOf(mediaItem)
         backStack.clear()
-        cancelPendingReconstitution()
+        markQueueReplaced()
         player.setMediaItem(mediaItem, startPositionMs)
     }
 
@@ -319,7 +319,7 @@ class ShufflePlayer(
         clearErrorBeforeQueueReplace()
         original = mediaItems
         backStack.clear()
-        cancelPendingReconstitution()
+        markQueueReplaced()
         player.setMediaItems(mediaItems)
     }
 
@@ -327,7 +327,7 @@ class ShufflePlayer(
         clearErrorBeforeQueueReplace()
         original = mediaItems
         backStack.clear()
-        cancelPendingReconstitution()
+        markQueueReplaced()
         player.setMediaItems(mediaItems, resetPosition)
     }
 
@@ -341,7 +341,7 @@ class ShufflePlayer(
         pendingShuffleTileOriginal = null
         original = tileOriginal ?: mediaItems
         backStack.clear()
-        cancelPendingReconstitution()
+        markQueueReplaced()
         player.setMediaItems(
             mediaItems,
             startIndex.coerceAtMost(mediaItems.size - 1),
@@ -359,14 +359,14 @@ class ShufflePlayer(
     override fun clearMediaItems() {
         original = emptyList()
         backStack.clear()
-        cancelPendingReconstitution()
+        markQueueReplaced()
         player.clearMediaItems()
     }
 
     // Teardown: drop any pending reconstitution so it can never run on a released player or bleed into a
     // cold-start restore (the deferred reconstitution is the one thing outliving this transition dispatch).
     override fun release() {
-        cancelPendingReconstitution()
+        markQueueReplaced()
         super.release()
     }
 
@@ -532,6 +532,80 @@ class ShufflePlayer(
 
     // New-context reset (setMediaItems/clear/release): cancel any pending reconstitution so it can't run
     // against the new queue or a released player. The back-stack it reads is cleared alongside each call.
+    // ⚠⚠ THE QUEUE EPOCH. Bumped ONLY where the whole queue is replaced or torn down - exactly
+    // the eight sites that already called cancelPendingReconstitution: setMediaItem x3, setMediaItems x3,
+    // clearMediaItems, release. Async work that fetches against one queue and appends when it returns
+    // compares this to decide whether its queue still exists. See PlayerRadio.appendDeduped for the defect
+    // this closes, and Player.queueEpochOrZero at the bottom of this file for how it is read.
+    //
+    // ⚠️ VERIFIED 2026-09-10 THAT THIS DOES NOT FIRE ON ORDINARY PLAYBACK - the check that had to
+    // pass before any of this was worth building, because if it failed EVERY append would drop as stale and
+    // radio top-up would stop entirely. Ordinary advance mutates the queue constantly (remove-on-advance)
+    // but never through these eight:
+    //   advanceForward -> pushAndRemove -> removeByMediaId -> removeMediaItem(idx) -> player.removeMediaItem
+    //   reconstituteFromBackStack -> addMediaItems(index, items) -> player.addMediaItems
+    //   changeQueue / shuffle apply -> player.removeMediaItems / player.addMediaItems
+    // Those reach the INNER player or the add/remove overrides; none is a seam site. And no seam re-enters
+    // another: each ends in `player.<same call>` or `super.release()`, and this file contains NO bare
+    // self-call to setMediaItem(s)/clearMediaItems - every occurrence is either `override fun` or `player.`.
+    // A SHUFFLE TOGGLE DOES NOT BUMP IT EITHER, which is correct: same content reordered, so in-flight work
+    // is still for this queue.
+    //
+    // ⚠️ IF THIS IS EVER WRONG THE SYMPTOM IS "RADIO STOPS TOPPING UP" - silent, and easily
+    // misread as an extension fault. That is why every drop logs under tag GladixQueue. Stale_drop lines
+    // appearing on ordinary transitions mean something new routes through a seam site, and the fix is
+    // THERE, not at the append.
+    @Volatile
+    var queueEpoch: Long = 0L
+        private set
+
+    // ⚠⚠ FIVE THINGS NOW TRACK QUEUE REPLACEMENT AND THEY ANSWER FIVE DIFFERENT QUESTIONS.
+    // Inventory taken 2026-09-10 because the next person adding a replacement site has to remember all of
+    // them and will remember one. They were checked for overlap and NONE can subsume another:
+    //   queueEpoch (here)        WHICH queue is this?  Monotonic identity, never consumed, never reset.
+    //                            Read by async work that fetched against one queue and appends into
+    //                            whatever exists on return.
+    //   userQueueSet             HAS the user established a queue this session?  One-way latch
+    //                            (AndroidAutoCallback), arbitrates USER-vs-COLD-RESTORE so a restore cannot
+    //                            overwrite a user queue. Carries no identity - it never goes back down.
+    //   PlayerState.resumptionApplying   IS Media3's resumption applying right now?  Mutual exclusion
+    //                            between two restore paths.
+    //   isFreshShuffle           IS the setMediaItems about to happen a fresh shuffle?  One-shot, consumed.
+    //   pendingShuffleTileOriginal  WHAT is the unshuffled order for the queue about to be applied?
+    //                            One-shot payload for the AA shuffle tile.
+    // Four of the five are TRANSIENT and about the replacement that is ABOUT TO HAPPEN, or about who gets to
+    // start a queue. Only queueEpoch is a persistent IDENTITY OF THE QUEUE THAT EXISTS. That is why it does
+    // not collapse into any of them, and why none of them can answer "is this still my queue?".
+    //
+    // ⚠️ THEIR SITE LISTS DO NOT AGREE, AND THAT IS NOT A BUG TO FIX - IT IS THE THING TO KNOW.
+    //   userQueueSet     set by radio(), trackRadio(), playItem(), AA onSetMediaItems - but NOT by
+    //                    backfillQueue, addToQueue or addToNext.
+    //   isFreshShuffle   playItem()'s shuffle branch only.
+    //   queueEpoch       every seam below, i.e. every whole-queue replacement, whoever causes it.
+    // ⚠⚠ THE ASYMMETRY THAT MATTERS: queueEpoch is the ONLY one maintained STRUCTURALLY, at the
+    // player's own overrides. A new queue-replacement path joins it automatically just by replacing the
+    // queue. Every other marker is maintained BY HAND at each caller and must be updated deliberately.
+    // So: if you add a way to replace the queue, the epoch already covers you - go check the other four.
+    // ⚠⚠ THE NON-OBVIOUS HALF OF "THE SEAM IS RIGHT": A CORRECT SEAM DOES NOT MAKE THE MOMENT
+    // CORRECT. Three times on 2026-09-10/11 a marker was hung off the right place and was still wrong,
+    // every time because of CALL ORDER at one caller rather than because the seam was mis-chosen:
+    //   1. playItem's epoch capture. Captured before its OWN setMediaItems, every append would look stale
+    //      and no collection would ever load past page one - a gate present but inverted. Fixed by moving
+    //      the launch below the queue it appends to.
+    //   2. Clearing PlayerRadio.stationSeeds on this bump. Semantically exactly right; unsafe because
+    //      PlayerCallback.radio calls start() - which records the seed - BEFORE its clearMediaItems(), so
+    //      the clear would wipe the seed microseconds before play() reads it back. Not done; the store
+    //      ages out by recency instead.
+    //   3. The Last.fm latch burning BEFORE the seed read, claiming an attempt that never happened and
+    //      locking the station out permanently.
+    // THE CHECK THAT CATCHES ALL THREE: for every caller, ask whether the marker is written before or
+    // after the thing it describes - and remember that different callers ORDER IT DIFFERENTLY. In case 2
+    // trackRadio had the safe order and radio() did not, and one counter-example is enough.
+    private fun markQueueReplaced() {
+        queueEpoch++
+        cancelPendingReconstitution()
+    }
+
     private fun cancelPendingReconstitution() {
         reconstitutionScheduled = false
         looperHandler.removeCallbacks(reconstituteRunnable)
@@ -650,3 +724,9 @@ class ShufflePlayer(
     }
 
 }
+
+// Reads the queue epoch off whatever Player is in hand. A non-ShufflePlayer always reads 0, so every
+// comparison is "equal" and behaviour degrades to exactly what it was before the epoch existed - never to
+// dropping everything. Fail-open is deliberate: a missed stale append costs a few wrong tracks, a spurious
+// drop costs the radio.
+val Player.queueEpochOrZero: Long get() = (this as? ShufflePlayer)?.queueEpoch ?: 0L

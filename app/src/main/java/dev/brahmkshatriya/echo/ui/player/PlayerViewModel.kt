@@ -175,21 +175,34 @@ class PlayerViewModel(
     // Cross-referenced deliberately, so it is a project-wide rule rather than the same judgement reinvented
     // at each site.
     //
-    // ⚠⚠ PARKED 2026-09-10, AND THE REACHABILITY IS WHAT MAKES THAT A DECISION RATHER THAN A
-    // BACKLOG ITEM: FIVE THEORETICAL GUARDS, ZERO EVER OBSERVED TO FIRE.
-    //   radio()      - 3 silent: extId null (the VM always writes it), item undeserialisable
-    //                  (putSerialized<EchoMediaItem> writes the discriminator correctly today), extension
-    //                  unknown (needs an extension disabled mid-session).
-    //   trackRadio() - 2 silent, and BOTH SIT BEFORE ANY PLAYBACK, so either firing means a tap that does
-    //                  nothing with no log and no message - the shape already documented at playTrackRadio.
-    // AND THE MOST REACHABLE FAILURE ON THIS PATH ALREADY REPORTS. radio()'s fourth return SPLITS:
-    // PlayerRadio.start ends in getOrThrow(throwableFlow), so when DeezerRadioClient throws "No Radio"
-    // (its Album/Playlist branches, reachable on an ordinary network failure or an empty tracklist) the
-    // user IS told. It is silent only for !isRadioSupported or a non-RadioClient extension.
-    // WHEN TAKEN, IT IS ONE PASS ACROSS EVERY HANDLER - eleven sendCustomCommand sites, ~eight command
-    // handlers unaudited. Doing two of eight is the reason this is parked rather than half-done: a
-    // PARTIALLY-reporting command surface is harder to reason about than a uniformly silent one, because
-    // "no message" stops being evidence of anything.
+    // ⚠⚠ DONE 2026-09-11, AS ONE PASS ACROSS EVERY HANDLER - not two of eight. It was parked on
+    // 2026-09-10 with the reachability recorded (five theoretical guards, zero ever observed to fire) and
+    // taken anyway, because "tap does nothing, no message, no log" is the worst failure shape in this app
+    // and the guards being unreachable is a property of TODAY'S CALLERS, not of the code.
+    // WHAT WAS DONE, at PlayerCallback - see the classification note above its bug()/notFound() helpers:
+    //   13 PROGRAMMER-ERROR guards  -> throwableFlow, naming the command and the missing key, and
+    //                                  carrying the deserialization CAUSE that ?.getOrNull() used to drop.
+    //    8 USER-VISIBLE guards      -> messageFlow (4x no-extension, 2x empty list, backfill's rebuilt-
+    //                                  empty, radio's no-station-possible half).
+    //    2 inline dispatch branches -> an else on the silent `as? ShufflePlayer`, which was the cheapest
+    //                                  dead tap in the app (a queue-row tap that does nothing).
+    //    4 guards LEFT SILENT ON PURPOSE, with the reason at each: the three queue-epoch stale drops
+    //                                  (explaining a decision the user just made) and trackRadio's
+    //                                  missing-extension case (the seed is already playing - degraded
+    //                                  success, not a dead tap). All four log under GladixQueue.
+    //    7 guards were ALREADY correct and were not touched.
+    // ⚠️ THE PART THAT IS NOT FIXED: the lifecycle gate. app.messageFlow's only subscriber is
+    // SnackBarHandler's flowWithLifecycle(STARTED) observe(), and the flow has replay = 0, so a message
+    // emitted while the Activity is stopped is DROPPED. Every notFound() site is PRE-SUSPEND and fires
+    // microseconds after the tap, so those are reliable; the four POST-NETWORK user-visible guards can
+    // land backgrounded and additionally Log.d for exactly that reason. That closes the "no log" half
+    // without pretending the gap is gone, and it is a second independent motivation for the parked
+    // held-state item.
+    // ⚠️ withBrowser ITSELF STILL DOES NOT CHANGE, and must not: SessionResult carries a code with
+    // no message, and the service and UI share a process, so the handler can always say more than this
+    // side could learn. If a new command handler is added, give its guards a classification HERE-style
+    // rather than returning a bare error - a partially-reporting command surface is harder to reason
+    // about than a uniformly silent one, because "no message" stops being evidence of anything.
     private fun withBrowser(block: suspend (MediaController) -> Unit) {
         viewModelScope.launch {
             val browser = browser.first { it != null }!!

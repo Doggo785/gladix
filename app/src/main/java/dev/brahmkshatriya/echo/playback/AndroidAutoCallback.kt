@@ -183,6 +183,13 @@ abstract class AndroidAutoCallback(
     open val throwableFlow: MutableSharedFlow<Throwable>? get() = null
     open val historyRepository: HistoryRepository? = null
 
+    // ⚠️ ONE OF FIVE QUEUE-REPLACEMENT MARKERS - the full inventory, what each answers, and why
+    // none subsumes another is at ShufflePlayer.markQueueReplaced. Read it before adding a sixth.
+    // THIS one is a ONE-WAY LATCH answering "has the user established a queue this session?", for
+    // USER-vs-COLD-RESTORE arbitration only. It carries no queue identity and never goes back down, so it
+    // cannot tell you whether the queue you started work against still exists - that is ShufflePlayer's
+    // queueEpoch. It is also set at a DIFFERENT set of sites (radio/trackRadio/playItem/onSetMediaItems, but
+    // not backfillQueue/addToQueue/addToNext), which is deliberate and documented there.
     internal val userQueueSet = AtomicBoolean(false)
     @Volatile private var lastSearchQuery = ""
     @Volatile protected var lastBrowsedExtId: String? = null

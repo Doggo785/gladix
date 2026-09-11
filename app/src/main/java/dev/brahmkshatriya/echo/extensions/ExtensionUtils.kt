@@ -60,6 +60,14 @@ object ExtensionUtils {
         // so genuine bugs still surface normally.
         val cause = (it as? AppException)?.cause ?: it
         if (cause is IncompatibleClassChangeError) return@getOrElse null
+        // ⚠⚠ DO NOT ADD MissingFieldException TO THE LINE ABOVE WITHOUT READING THIS.
+        // It is the obvious next candidate - YTM's radio throws it on every track because ytmkt is stale
+        // against a changed watchNext shape, and triage already mutes that family as third-party noise. But
+        // silencing it HERE removes the report while doing nothing for playback. PlayerRadio.throwBridge is
+        // what keeps the queue alive on that failure, and it is driven by the SAME exception surfacing; a
+        // mute here would be acceptable only alongside a rescue, never before one. Before the bridge landed
+        // (2026-09-11) that mute would have meant no report AND no rescue - strictly worse than today.
+        // The matching note is at PlayerRadio.throwBridge.
         throwableFlow.emit(it)
         it.printStackTrace()
         null

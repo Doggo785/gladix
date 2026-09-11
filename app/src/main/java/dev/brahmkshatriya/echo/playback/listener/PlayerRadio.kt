@@ -25,6 +25,7 @@ import dev.brahmkshatriya.echo.playback.MediaItemUtils.context
 import dev.brahmkshatriya.echo.playback.MediaItemUtils.extensionId
 import dev.brahmkshatriya.echo.playback.MediaItemUtils.track
 import dev.brahmkshatriya.echo.playback.PlayerState
+import dev.brahmkshatriya.echo.playback.queueEpochOrZero
 import dev.brahmkshatriya.echo.utils.ui.UiUtils.isTv
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
@@ -39,6 +40,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.MissingFieldException
 
 class PlayerRadio(
     private val app: App,
@@ -183,26 +185,216 @@ class PlayerRadio(
             throwableFlow: MutableSharedFlow<Throwable>,
             extension: Extension<*>,
             item: EchoMediaItem,
-            itemContext: EchoMediaItem?
+            itemContext: EchoMediaItem?,
+            // Handed the failure BEFORE getOrThrow consumes it, for callers that need to CLASSIFY it
+            // rather than merely know it happened. Optional so the four existing call sites are unchanged,
+            // and a local `var` at the caller rather than shared state - reseedFanOut runs three starts
+            // CONCURRENTLY, so a companion-scoped "last failure" would misattribute.
+            onFailure: ((Throwable) -> Unit)? = null,
         ): PlayerState.Radio.Loaded? {
             if (!item.isRadioSupported) return null
-            return extension.getIf<RadioClient, PlayerState.Radio.Loaded?> {
+            val result = extension.getIf<RadioClient, PlayerState.Radio.Loaded?> {
                 val radio = radio(item, itemContext)
+                // Recorded HERE rather than at the callers so every station-creating path is covered by
+                // construction - loadPlaylist, PlayerCallback.radio, PlayerCallback.trackRadio and
+                // reseedFanOut all funnel through start(), and a future fifth path would too.
+                recordStationSeed(radio.id, item)
                 val tracks = loadTracks(radio).pagedDataOfFirst()
                 PlayerState.Radio.Loaded(extension.id, radio, null) {
                     extension.get { tracks.loadPage(it) }.getOrThrow(throwableFlow)
                 }
-            }.getOrThrow(throwableFlow)
+            }
+            result.exceptionOrNull()?.let { onFailure?.invoke(it) }
+            return result.getOrThrow(throwableFlow)
         }
 
-        // Single-slot latch for the endless-queue fallback: at most ONE Last.fm lookup per station, ever.
-        // A thin station would otherwise re-trigger on every topUpQueue. Keyed on the station's id
-        // (loaded.context is the Radio item), single-valued so it cannot grow, and reset implicitly when a
-        // different station becomes current. Companion-scoped because play() is a companion function with
-        // five call sites and no instance to hang state on — deliberately NOT a field on
-        // PlayerState.Radio.Loaded, which is a shared model.
-        @Volatile
-        private var fallbackTriedForRadioId: String? = null
+        // ⚠⚠ ONE BRIDGE PER (STATION, SEED) - NOT PER STATION. THE KEY IS THE WHOLE FIX.
+        //
+        // ⚠️ [CORRECTED 2026-09-11] WHAT THIS USED TO BE AND WHY IT WAS WRONG. It was a single
+        // `@Volatile var fallbackTriedForRadioId: String?`, and its note read: "at most ONE Last.fm lookup
+        // per station, ever ... reset implicitly WHEN A DIFFERENT STATION BECOMES CURRENT."
+        // THAT LAST CLAUSE IS TRUE FOR TRACK STATIONS AND FALSE FOR ARTIST STATIONS, and the note was
+        // written without noticing it reasoned about only one kind:
+        //   TRACK  - loadPlaylist re-seeds from the current track, DeezerRadioClient's TRACK branch does
+        //            asTrackRadio(), and `id = item.id` - so every re-seed MINTS A NEW STATION ID and the
+        //            latch renews itself. "A different station becomes current" really does happen.
+        //   ARTIST - the ARTIST branch returns Radio(id = context.id, ...), i.e. THE ARTIST ID, ignoring
+        //            the seed track entirely. Every re-seed produces THE SAME ID FOREVER, so the latch
+        //            never renews. ONE BRIDGE PER ARTIST STATION, PERMANENTLY.
+        // DEVICE, 2026-09-11 (The Frogmen ARTIST radio): the station ran dry, got exactly one bridge, and
+        // then nothing. Eight further top-ups each regenerated the station and each declined both rescues -
+        // the fan-out because an artist station is context-determined (four seeds collapse to one), the
+        // bridge because the latch was spent. BOTH DECLINES WERE INDIVIDUALLY CORRECT. The composition was
+        // the defect, and it lived in this key.
+        //
+        // WHY (radioId, seedTrackId) IS THE RIGHT KEY - the bridge IS seeded from a track, so "have I
+        // already bridged FROM THIS SEED?" is the honest question, and it behaves correctly on both kinds:
+        //   - on an ARTIST station the seed changes as playback advances, so each dry stretch gets one
+        //     bridge per track: NATURALLY RATE-LIMITED BY PLAYBACK rather than by a counter;
+        //   - on a TRACK station it changes nothing in practice, because radioId already moves;
+        //   - it PRESERVES THE ORIGINAL PURPOSE, which was that "a thin station would otherwise re-trigger
+        //     on every topUpQueue" - it still cannot, because the seed only changes on a transition.
+        //
+        // A SET, NOT A SLOT, because one slot is defeated by an A->B->A rotation: B's claim would evict A's
+        // and A would bridge again immediately. FIFO with a cap of 8 - a rotation has to run through eight
+        // distinct (station, seed) pairs before the oldest ages out, which is far past any loop.
+        // ⚠️ AND THE CLAIM IS NOW ATOMIC, which the old `var` never was: check-then-set on a
+        // plain field let two concurrent thin play() calls both pass. They can, and on an artist station
+        // they collide on the SAME key, so the race was reachable exactly where it hurt.
+        // ⚠⚠ ONE RESCUE AT A TIME. Held across the Last.fm bridge in play() and the whole body
+        // of reseedFanOut - the two expensive, slow, network-bound rescues - and NOTHING ELSE.
+        //
+        // ⚠⚠ RESCUE-SCOPED ON PURPOSE: IT MUST NOT GUARD ORDINARY TOP-UPS. The obvious fix for
+        // the re-entrancy this closes was to widen stateFlow = Loading over the fallback, and that is
+        // WRONG, because topUpQueue and startRadio are EDGE-TRIGGERED - they run only from
+        // onMediaItemTransition and onTimelineChanged, and there is no poll. A Loading that spans a ~12s
+        // bridge does not DEFER those transitions, it DISCARDS them. If the queue drains inside the window
+        // playback reaches STATE_ENDED, and on phone nothing re-fires (onPlaybackStateChanged routes to
+        // tvDriveRadio only under isTv), so play() finishes and writes a perfectly correct Empty/Loaded
+        // that no one will ever read again.
+        // ⚠️ THAT LOST WAKEUP IS NOT A PREDICTION - THIS APP HAS ALREADY BEEN BITTEN BY IT. The AA
+        // metadata freeze: AA rides Media3's DIFFED specific-callback dispatch (updateMetadataIfChanged off
+        // onMediaItemTransition), the advance-past-hung-track SUPPRESSED that callback, AA never received
+        // the good track's metadata and stayed frozen on lastMediaId. Edge-triggered callback suppressed,
+        // nothing re-fires, state stuck. Same shape, different subsystem.
+        // The release position of stateFlow in play() is therefore LOAD-BEARING and deliberate: it keeps
+        // the queue serviceable during a long rescue. See the cannot-stall-or-spin proof at that release.
+        //
+        // ⚠️ SEPARATE MARKER, NOT A REUSED ONE - the same insistence recorded when
+        // involuntarySkipInFlight was added as a DEDICATED flag, explicitly NOT to be conflated with
+        // internalSeekInFlight (which gates the restore-seek latch), using this exact
+        // `try { flag = true; ... } finally { flag = false }` shape. This is that established pattern, and
+        // tvInFlight in this same file is the third instance: claim BEFORE the try, release in finally, so
+        // every exit - early return, throw, coroutine cancellation - unwinds through the same release.
+        // That is also why a marker is safe where stateFlow is not: stateFlow is released at a COMPUTED
+        // POINT IN THE MIDDLE of the work, so its correctness depends on call order (three separate
+        // defects this week turned on exactly that); a claim/finally pair has no computed release point.
+        //
+        // SIZE OF FIX, STATED SO IT IS NOT LATER MISTAKEN FOR A CORRECTNESS GUARD: post-queue-epoch this is
+        // WASTE, NOT CORRUPTION. Two concurrent play() calls on the SAME queue both pass the epoch check
+        // and both append, and appendDeduped dedups them. The eight RESEED lines observed on 2026-09-11
+        // were eight redundant station regenerations - cost, not damage. One small marker is the right size.
+        private val rescueInFlight = AtomicBoolean(false)
+
+        private const val FALLBACK_LATCH_CAP = 8
+        private val fallbackTried = ArrayDeque<String>()
+
+        /** Atomically claims the one bridge attempt for this (station, seed). False if already claimed. */
+        private fun claimFallback(radioId: String, seedId: String): Boolean =
+            synchronized(fallbackTried) {
+                val key = "$radioId\u0000$seedId"
+                if (fallbackTried.contains(key)) return@synchronized false
+                fallbackTried.addLast(key)
+                while (fallbackTried.size > FALLBACK_LATCH_CAP) fallbackTried.removeFirst()
+                true
+            }
+
+        // ⚠⚠ EVERY SEED A STATION HAS BEEN GENERATED FROM - A STATION MUST NEVER APPEND ITS OWN
+        // SEED. (Read the bound below before relying on "never" - the INVARIANT is unconditional, the
+        // IMPLEMENTATION is a bounded approximation of it, and the two are not the same claim.)
+        // Deliberately SEPARATE from the queue-tail rotation dedup below, which
+        // answers a different question and is allowed a different answer: that window intentionally
+        // tolerates "a station legitimately revisiting a recording an hour later". Re-appending the track
+        // the station was BUILT FROM is wrong however long ago it played.
+        //
+        // ⚠️ WHY THE APP HAS TO HOLD THIS. DeezerRadioClient filters its seed for RadioKind.TRACK
+        // only, and for ARTIST it structurally CANNOT: it compares `it.id != radio.id`, where radio.id is
+        // the ARTIST id, so it never matches a track id. Recorded as a prediction weeks ago; observed on
+        // device 2026-09-11 when "Underwater" was re-appended to The Frogmen's artist radio.
+        //
+        // ⚠⚠ AND THE APP'S OWN DEDUP COULD NOT CATCH IT EITHER - THIS IS THE SECOND DEFECT FROM
+        // ONE DURABLE WRONG PREMISE. The window below scans player.getMediaItemAt over THE LIVE TIMELINE,
+        // and its note claimed "the queue itself is the record of what was appended". IT IS NOT.
+        // ShufflePlayer.pushAndRemove REMOVES each departing track from the timeline into backStack, so the
+        // timeline is [current, upcoming...] and the window sees only UPCOMING items. Anything already
+        // played is invisible to it. The queue is FORWARD-LOOKING; the history lives in backStack and the
+        // history file.
+        // That same premise - reasoning about the live timeline as though it held history - has now
+        // produced two separate defects in this file and was corrected from the device both times. It is
+        // durable precisely because the code reads as if it were true. If a third dedup question comes up,
+        // ASK WHERE THE HISTORY ACTUALLY IS FIRST.
+        //
+        // Keyed by radioId and ACCUMULATING PER STATION, because an artist station keeps ONE id across many
+        // re-seeds and each re-seed uses a different track: "the seed" is a growing set for that kind, not
+        // one value. A single-valued store would remember only the most recent seed and let every earlier
+        // one back in, which is the defect this exists to stop.
+        //
+        // ⚠⚠ BOUNDED ON BOTH AXES, AND IT HAS TO BE BOTH - ONE CAP IS NOT ENOUGH HERE.
+        //   SEEDS PER STATION  - a dry artist station re-seeds once per track, forever, so the per-station
+        //                        set grows with listening time and nothing else would evict it.
+        //   STATIONS REMEMBERED- radioId is the map key, so a session that visits many stations accumulates
+        //                        ENTRIES indefinitely even if each is small.
+        // ⚠️ [CORRECTED 2026-09-11] THE FIRST VERSION HAD ONE GLOBAL FIFO OF 16 PAIRS. That did
+        // bound total memory, so it was not unbounded as first reported - but a GLOBAL cap is the wrong
+        // shape: two stations in rotation evict EACH OTHER'S seeds, so the protection a station gets
+        // depends on unrelated traffic. Per-station caps make each station's memory its own.
+        // Ceiling is STATION_CAP x STATION_SEED_CAP = 40 short strings, comparable to DEDUP_WINDOW's 24 and
+        // far under backStack's 1000. Bounded by construction, in the same spirit as those and as the
+        // SnackBarHandler queue that was capped at 16 for exactly this reason.
+        //
+        // ⚠️ NOTHING CLEARS THIS, AND THAT IS DELIBERATE - THE OBVIOUS PLACE TO CLEAR IT IS UNSAFE.
+        // ShufflePlayer's queue-replacement seam looks right (it marks the moment the old station stops
+        // mattering) and it is NOT, because of call ORDER: PlayerCallback.radio calls PlayerRadio.start -
+        // which records the seed - BEFORE its clearMediaItems(), so clearing on the epoch bump would wipe
+        // the seed it had just recorded, microseconds before play() reads it back. Fix 3 would silently
+        // do nothing on that path. (trackRadio has the opposite order and would be fine; radio() is the
+        // counter-example, and one is enough.) Reordering radio() to suit this is not worth it.
+        // Instead, stale stations AGE OUT BY RECENCY: recordStationSeed re-inserts the station at the end
+        // on every touch, so the map is recency-ordered and the eldest UNUSED station is evicted first. A
+        // station the user has left stops being touched and falls off on its own.
+        //
+        // ⚠️ WHAT THE BOUND COSTS, STATED RATHER THAN GLOSSED: a seed from more than
+        // STATION_SEED_CAP re-seeds ago CAN be re-appended. At one seed per track that is roughly the last
+        // eight tracks of that station. That is the same territory the rotation window below already
+        // tolerates on purpose ("a station legitimately revisiting a recording an hour later is not a
+        // loop"), so the two degrade consistently rather than one silently undercutting the other.
+        private const val STATION_SEED_CAP = 8
+
+        // ⚠⚠ DERIVED, NOT PICKED: ONE FULL FAN-OUT OF STATION CREATIONS, PLUS THE ONE BEING
+        // PLAYED. reseedFanOut is the only thing that creates stations WITHOUT replacing the queue, and it
+        // creates RESEED_SEEDS of them in a burst (the primary re-seed plus its extra seeds). A cap below
+        // that lets a single fan-out evict the seeds of the station the user is actually listening to. The
+        // +1 is the station being played, so it survives a whole burst even if it were never read.
+        private const val STATION_CAP = RESEED_SEEDS + 1
+        private val stationSeeds = LinkedHashMap<String, ArrayDeque<String>>()
+
+        private fun recordStationSeed(radioId: String, item: EchoMediaItem) {
+            val key = (item as? Track)?.dedupKey() ?: return
+            synchronized(stationSeeds) {
+                val seeds = stationSeeds.remove(radioId) ?: ArrayDeque()
+                if (!seeds.contains(key)) {
+                    seeds.addLast(key)
+                    while (seeds.size > STATION_SEED_CAP) seeds.removeFirst()
+                }
+                // Re-inserted at the END on every touch, so LinkedHashMap's insertion order IS recency
+                // order and the eviction below drops the least recently used station, not the oldest one.
+                stationSeeds[radioId] = seeds
+                while (stationSeeds.size > STATION_CAP) {
+                    stationSeeds.remove(stationSeeds.keys.first())
+                }
+            }
+        }
+
+        // ⚠⚠ READING REFRESHES RECENCY, AND THAT IS WHAT MAKES THE LRU EVICTION SAFE RATHER
+        // THAN MERELY PLAUSIBLE. The tempting argument for a small STATION_CAP is "a station you have not
+        // touched recently is not appending, so its seeds are not being consulted". That is TRUE ONLY IF
+        // CONSULTING COUNTS AS TOUCHING - and with a write-only refresh it did not, because
+        // recordStationSeed runs in start() (station CREATION) while this runs in play() (every append).
+        // A healthy long-running station calls start() ONCE and then tops up through its continuation
+        // forever, so its recency would have been frozen at creation while it was still actively
+        // appending. One reseedFanOut - which creates RESEED_SEEDS stations in a burst - could then evict
+        // the seeds of the station currently playing, and its next append would go UNFILTERED and could
+        // re-append its own seed. That is the exact defect this store exists to prevent, reintroduced
+        // through the eviction policy.
+        // Re-inserting on read closes it: a station being consulted is by definition still in use, so it
+        // stays hot, and only genuinely idle stations age out. Idle stations are not appending, so losing
+        // them costs nothing - which is the premise above, now actually true instead of assumed.
+        // A miss does NOT create an entry: absent stays absent, so a read cannot grow the map.
+        private fun seedKeysFor(radioId: String): Set<String> = synchronized(stationSeeds) {
+            val seeds = stationSeeds.remove(radioId) ?: return@synchronized emptySet()
+            stationSeeds[radioId] = seeds
+            seeds.toSet()
+        }
 
         // ⚠⚠ THE ONE PLACE THE QUEUE-TAIL DEDUP LIVES. Extracted from play() on 2026-09-10 when the
         // multi-seed re-seed became a SECOND caller that appends station tracks. Two copies of a
@@ -219,7 +411,33 @@ class PlayerRadio(
             app: App,
             entries: List<Pair<String, Track>>,
             context: EchoMediaItem,
+            // The queue this work was started against - see the ownership check below.
+            epoch: Long,
+            // Every seed this station was generated from. Excluded unconditionally, at any distance -
+            // see the note at stationSeeds for why this is NOT the same question as the window below.
+            seedKeys: Set<String> = emptySet(),
         ): Int = withContext(Dispatchers.Main) {
+            // ⚠⚠ OWNERSHIP CHECK: NEVER APPEND INTO A QUEUE THIS WORK WAS NOT STARTED AGAINST.
+            // Every caller fetches from the network and appends on return, so the queue can be REPLACED in
+            // between - switch stations mid-fetch and the tracks land in the new queue, stamped with the OLD
+            // station's context and clientId. Observed 2026-09-10: an orphaned Last.fm bridge from a wiped
+            // queue appended three tracks into the station that replaced it. Benign that time (surf into
+            // surf); the ordinary case is Sinatra-adjacent tracks arriving in a Lil Wayne queue, with no
+            // error and no indication.
+            // ⚠️ COMPARED BY EPOCH, NOT BY CONTEXT. Context identity is NOT stable across
+            // regeneration: loadPlaylist mints a new Radio on every re-seed, while asTrackRadio sets
+            // id = seed.id, so two independent generations of one seed share an id. Comparing contexts gives
+            // false matches AND false mismatches. A monotonic counter has no identity semantics.
+            // No lock needed: ShufflePlayer's seam runs on the application looper (Media3 enforces the app
+            // thread) and this block is on Main, so check-then-append cannot interleave with a bump.
+            if (player.queueEpochOrZero != epoch) {
+                Log.d(
+                    "GladixQueue",
+                    "stale_drop site=appendDeduped n=${entries.size} " +
+                        "started=$epoch now=${player.queueEpochOrZero}"
+                )
+                return@withContext 0
+            }
             // ⚠️ NEVER APPEND THE TRACK THAT IS PLAYING RIGHT NOW.
             //
             // WHY HERE AND NOT IN THE EXTENSION, which is the obvious instinct since that is where the
@@ -307,6 +525,7 @@ class PlayerRadio(
             // rescanned per append, and a station legitimately revisiting a recording an hour later is
             // not a loop.
             val existing = HashSet<String>()
+            existing.addAll(seedKeys)
             player.currentMediaItem?.track?.dedupKey()?.let { existing.add(it) }
             val windowStart = (player.mediaItemCount - DEDUP_WINDOW).coerceAtLeast(0)
             for (i in windowStart until player.mediaItemCount) {
@@ -337,6 +556,8 @@ class PlayerRadio(
             // simply does not get the fallback — rather than forcing a resolution that could be wrong.
             extension: Extension<*>? = null
         ): PlayResult {
+            // Captured BEFORE the page fetch: this is the queue this call is for.
+            val epoch = player.queueEpochOrZero
             stateFlow.value = PlayerState.Radio.Loading
             val tracks = loaded.tracks(loaded.cont) ?: run {
                 // Page load failed: extension.get caught the throwable and getOrThrow already reported it to
@@ -355,7 +576,8 @@ class PlayerRadio(
 
             val appended = appendDeduped(
                 player, downloadFlow, app,
-                tracks.data.map { loaded.clientId to it }, loaded.context
+                tracks.data.map { loaded.clientId to it }, loaded.context, epoch,
+                seedKeysFor(loaded.context.id)
             )
             // Post-fallback total, which is what loadPlaylist gates the multi-seed escalation on. The
             // `appended` val above stays the PRE-fallback page count the Last.fm gate below asks about,
@@ -387,9 +609,16 @@ class PlayerRadio(
                 // successful bridge stops the multi-seed escalation from also firing - see loadPlaylist.
                 val thin = isThin(PlayResult(appended, tracks.continuation == null))
                 val radioId = loaded.context.id
-                if (thin && extension != null && fallbackTriedForRadioId != radioId) {
+                // ⚠⚠ THE CAS COMES BEFORE claimFallback, AND THAT ORDER IS A FIX, NOT A STYLE
+                // CHOICE. claimFallback SPENDS the one attempt for this (station, seed) permanently. If the
+                // rescue marker were claimed second, a concurrent rescue would fail the CAS AFTER the seed
+                // had already been claimed - burning that seed's only attempt on a lookup that never ran,
+                // and locking it out for good. That is precisely the defect fixed on 2026-09-10 when the
+                // latch was moved below the seed read; claiming in the wrong order here would reintroduce
+                // it through a different door. Cheap, reversible check first; permanent claim second.
+                if (thin && extension != null && rescueInFlight.compareAndSet(false, true)) try {
                     val seed = withContext(Dispatchers.Main) { player.currentMediaItem?.track }
-                    if (seed != null) {
+                    if (seed != null && claimFallback(radioId, seed.id)) {
                         // ⚠⚠ THE LATCH BURNS HERE - AFTER THE SEED READ, BEFORE THE LOOKUP. BOTH HALVES
                         // OF THAT POSITION ARE A FIX FOR A DIFFERENT FAILURE; DO NOT MOVE IT EITHER WAY.
                         //
@@ -403,15 +632,25 @@ class PlayerRadio(
                         // PlayerViewModel.radio, but the latch was independently wrong and stays fixed
                         // here: any future path that reaches this with no current item must not burn it.)
                         //
-                        // AND NOT AFTER similarTracks EITHER. The point of the latch is ONE ATTEMPT PER
-                        // STATION - counting attempts, not successes. Latching on the far side would let
-                        // a lookup that throws, times out, or returns empty re-fire on every single
-                        // topUpQueue for the rest of the context: an unbounded network retry loop driven
-                        // by track transitions. Set before the call, so a thrown lookup is spent.
-                        fallbackTriedForRadioId = radioId
+                        // AND NOT AFTER similarTracks EITHER. The point of the claim is ONE ATTEMPT PER
+                        // (STATION, SEED) - counting attempts, not successes. Claiming on the far side
+                        // would let a lookup that throws, times out, or returns empty re-fire on every
+                        // single topUpQueue for the rest of the context: an unbounded network retry loop
+                        // driven by track transitions. Claimed before the call, so a thrown lookup is spent.
+                        // (claimFallback is now the test AND the set, atomically - see its note.)
                         val extra = RadioFallback.similarTracks(extension, seed)
-                        totalAppended += extra.size
-                        if (extra.isNotEmpty()) withContext(Dispatchers.Main) {
+                        // ⚠️ THE LONGEST BOUNDED WINDOW ON THIS PATH (~12s: OUTER_TIMEOUT_MS for
+                        // the Last.fm fetch plus SEARCH_BUDGET_MS for the catalogue searches) and the one
+                        // actually observed appending into a replaced queue. Same epoch as the page append
+                        // above: both belong to the queue play() started against.
+                        val stale = player.queueEpochOrZero != epoch
+                        if (stale) Log.d(
+                            "GladixQueue",
+                            "stale_drop site=lastfm n=${extra.size} " +
+                                "started=$epoch now=${player.queueEpochOrZero}"
+                        )
+                        totalAppended += if (stale) 0 else extra.size
+                        if (!stale && extra.isNotEmpty()) withContext(Dispatchers.Main) {
                             // ⚠️ STAMP FROM THE SEARCH RESULT'S EXTENSION, NEVER THE STATION'S. This is the
                             // FOURTH extension_id failure of this family in one week — after the radio
                             // non-fatal (fixed by ResumptionUtils.restamped), loadTrack's missing stamp
@@ -436,6 +675,8 @@ class PlayerRadio(
                             if (player.playbackState == Player.STATE_IDLE) player.prepare()
                         }
                     }
+                } finally {
+                    rescueInFlight.set(false)
                 }
             }
             return PlayResult(totalAppended, tracks.continuation == null)
@@ -477,8 +718,17 @@ class PlayerRadio(
             stateFlow.value = prior
             return
         }
-        val loaded = start(throwFlow, extension, item, itemContext)
+        // startFailure is a LOCAL, not shared state: see the onFailure note at start().
+        var startFailure: Throwable? = null
+        val loaded = start(
+            throwFlow, extension, item, itemContext, onFailure = { startFailure = it }
+        )
         stateFlow.value = loaded ?: PlayerState.Radio.Empty
+        if (loaded == null) {
+            // Attached AFTER getOrThrow has already emitted, so the extension's own report is never
+            // suppressed and no second one is added - one report before this change, one after.
+            startFailure?.let { throwBridge(extension, item, it, itemContext) }
+        }
         if (loaded != null) {
             radioQueueActive = true
             // ⚠⚠ ESCALATION GATE - ONE SEED FIRST, THEN THE OTHER THREE ONLY IF THAT FAILED.
@@ -509,6 +759,172 @@ class PlayerRadio(
     // carries - independently sourced, not drawn from the station that just died.
     // An empty artist name means "cannot compare" and the track is KEPT, matching dedupKey's rule: a false
     // merge silently costs a seed, a false split costs nothing.
+    // ⚠⚠ THE THROW BRIDGE - FOR A STATION THAT NEVER EXISTS, NOT ONE THAT RUNS DRY.
+    // Every other rescue in this file triggers on "the append was empty or thin after filtering". YouTube
+    // Music never reaches that: ytmkt THROWS on every track, because YouTube changed the watchNext shape
+    // and the library still requires a field tab 2 no longer has -
+    //   MissingFieldException: Field 'musicQueueRenderer' is required for
+    //   ...YoutubeiNextResponse.Content, missing at $...watchNextTabbedResultsRenderer.tabs[2]...
+    // start() therefore returns null, loadPlaylist parks at Empty, and the queue simply ends.
+    //
+    // ⚠⚠ REACH, STATED PLAINLY SO NOBODY READS THIS AS GENERAL - IT HAS TWO HALVES AND THEY
+    // POINT OPPOSITE WAYS.
+    // ZERO FOR DEEZER, STRUCTURALLY. Deezer has NO @Serializable classes and decodes to a raw JsonObject,
+    // so MissingFieldException cannot arise there at all. This buys nothing on the primary extension and
+    // is dead weight if YTM goes away.
+    // BUT ON YTM IT IS NOT LIMITED TO AN EXPLICIT RADIO TAP - it fires on ORDINARY LISTENING. Every
+    // end-of-queue reaches here, which includes every one-track play from search, i.e. the common case.
+    // An earlier version of this note implied it only helped someone who asked for a radio; that was wrong
+    // and materially understated the value.
+    // ⚠️ WITH ONE HONEST QUALIFIER: "every end-of-queue WHEN NO STALE STATION IS LOADED". If
+    // radioFlow still holds a Loaded from a previous station, startRadio continues THAT station instead of
+    // calling loadPlaylist, and this bridge is never reached. See the parked note at startRadio's Loaded
+    // branch. So: not an unconditional every.
+    //
+    // ⚠⚠ WHY IT COVERS A ONE-TRACK PLAY IS FRAGILE, AND MUST BE READ AS FRAGILE. Playing a
+    // single track from search calls getSongRadio TWICE:
+    //   CALLER 1  PlayerCallback.trackRadio's own PlayerRadio.start(). NOT covered - it is in
+    //             PlayerCallback and has no bridge.
+    //   CALLER 2  startRadio -> loadPlaylist -> start(), because onTimelineChanged fires on the ONE-ITEM
+    //             queue trackRadio just created and hasNextMediaItem() is false. COVERED - this is it.
+    // (That is also why the two crash reports show different JSON paths for the same endpoint: two
+    // invocations, not two endpoints.)
+    // So the bridge covers the case NOT because trackRadio is covered, but because startRadio independently
+    // fires on the queue trackRadio created. THAT IS AN ACCIDENT OF QUEUE SHAPE, NOT A DESIGNED PATH:
+    //   - if trackRadio ever queued MORE THAN ONE item, hasNextMediaItem() becomes true and caller 2
+    //     never fires;
+    //   - if autoStartRadio is off, startRadio returns immediately and caller 2 never fires.
+    // In either case the bridge is silently not reached. Covering PlayerCallback.trackRadio directly is
+    // what would make this robust, and is the parked follow-up below.
+    //
+    // ⚠⚠ MissingFieldException ONLY - NOT THE SerializationException FAMILY. This was scoped as
+    // "parse-family" and that would have been ACTIVELY HARMFUL. SerializationException IS reachable from
+    // Deezer: decodeJson/decodeJsonStream pre-empt the empty-body case with an explicit retryable
+    // IOException, so what gets past that guard and still fails to parse is a NON-EMPTY body that is not
+    // JSON - a WAF challenge, an HTML error page, a truncated response - which throws JsonDecodingException,
+    // a SerializationException. Bridging there would silently route around a LIVE TRANSPORT OR AUTH PROBLEM
+    // and convert a surfaced, retryable condition into a quiet substitution.
+    // MissingFieldException is safe STRUCTURALLY rather than heuristically: it can only be thrown by a
+    // @Serializable decode whose declared schema disagrees with the payload. That IS "stale library against
+    // a moving API", and it is not something a raw-tree parser can produce.
+    // ⚠️ THE CONDITION THAT INVALIDATES THAT ARGUMENT, recorded because it cannot be reasoned
+    // about now: IF A @Serializable DECODE IS EVER ADDED INSIDE THE RADIO PATH IN APP CODE, this classifier
+    // silently starts routing around OUR OWN BUG instead of the extension's. Today there is none - common's
+    // models are decoded in Serializer, not inside RadioClient.radio - so a MissingFieldException arriving
+    // through an extension call is by construction the extension's. Re-check that before widening this.
+    //
+    // anyCause, NEVER rootCause, and the ONE walker in PlayerEventListener.kt rather than a second copy:
+    // getIf -> get -> toAppException WRAPS the original, so the MissingFieldException is never the top node.
+    // See that walker's own note - "never type-check a wrapped exception against a non-chain-walking
+    // accessor" - which is the same mistake in a different subsystem.
+    //
+    // ⚠️ COUPLED TO ExtensionUtils.getOrThrow, WHICH ALREADY SILENTLY DEGRADES ONE FAMILY
+    // (IncompatibleClassChangeError returns null with NO emit). Muting MissingFieldException there would be
+    // acceptable ONLY AFTER this rescue exists; doing it before would have left no report AND no rescue -
+    // strictly worse than doing nothing. The matching note is at getOrThrow.
+    //
+    // NOT COVERED, DELIBERATELY, PENDING THIS BEING OBSERVED TO WORK: PlayerCallback.trackRadio and
+    // PlayerCallback.radio have the same null-station outcome and no bridge. For YTM a long-press -> Radio
+    // routes to trackRadio, which plays the seed and stops. Whether they get the same treatment is a
+    // separate decision once this one is seen working on device.
+    // ⚠️ WHY NOT classify() - THERE ARE THREE ERROR CLASSIFIERS IN THIS APP AND THEY ARE NOT
+    // INTERCHANGEABLE. Someone unifying "the two" will find three and pick the wrong one, so:
+    //   ExceptionUtils.getTitle/getFinalTitle  phone snackbar text. Must stay byte-for-byte unchanged.
+    //   ErrorCategory.classify()               AA head-unit mapping. Enum is {Network, LoginOrAuth,
+    //                                          Generic} and it MIRRORS ONLY getTitle's network and
+    //                                          login/auth matches, kept in lockstep by ErrorCategoryTest.
+    //   Throwable.anyCause(predicate)          this, and PlayerEventListener's network handling.
+    // As it stands, classify() cannot express what this site needs: a MissingFieldException lands in
+    // Generic, which is also where every unrelated failure lands.
+    // ⚠️ [CORRECTED] BUT classify() IS NOT FROZEN, AND AN EARLIER VERSION OF THIS NOTE IMPLIED IT
+    // WAS. It said a new member "would either fail ErrorCategoryTest or force a change to the phone
+    // snackbar path", which reads as a prohibition. IT IS NOT ONE - EXTENDING IT HAS PRECEDENT. On
+    // 2026-08-19 ConnectException and NoRouteToHostException were added (it had been DNS-only), getTitle
+    // was changed in step, and ErrorCategoryTest gained drift guards including a deliberate NON-match for
+    // plain SocketException. The lockstep is the PROCEDURE for extending it, not a barrier to it.
+    // SO THE REAL REASON IS COST AND AXIS, NOT PERMISSION:
+    //   - THE AXIS IS WRONG. That enum answers "what should the user be told / how should AA present
+    //     this" - Network, LoginOrAuth, Generic. "The extension's parser is stale against a moving API"
+    //     has no user-facing category; the honest answer for the user REMAINS Generic. Extending it would
+    //     not give this site a distinction, only a new name for one it cannot act on.
+    //   - THE COST IS REAL. The procedure means changing getTitle in lockstep, i.e. touching the phone
+    //     snackbar path another session deliberately left byte-for-byte untouched, and the only new string
+    //     it could justify is one the user can do nothing about - the same argument that made the
+    //     programmer-error guards in PlayerCallback report to throwableFlow and say nothing on screen.
+    //   - AND THIS SITE DOES NOT WANT A CATEGORY AT ALL. It wants one boolean predicate at one call site,
+    //     which is exactly what anyCause is.
+    // That is also why anyCause was introduced originally rather than extending classify(): its enum could
+    // not express DNS-hold-never-skip vs socket-reset-retry-once. Same shape of answer, same reasoning.
+    private suspend fun throwBridge(
+        extension: Extension<*>,
+        seed: Track,
+        failure: Throwable,
+        // The context loadPlaylist was generating FROM. Needed for the stamp - see the note at `context`
+        // below; passing it is what keeps a live station's identity from being overwritten.
+        itemContext: EchoMediaItem?,
+    ) {
+        if (!failure.anyCause { it is MissingFieldException }) return
+        // Cheap reversible check FIRST, permanent claim second - the ordering trap hit on 2026-09-11 in
+        // play(): claiming the (extension, seed) latch before the rescue marker would spend that seed's one
+        // attempt on a bridge that never ran, and lock it out for good.
+        if (!rescueInFlight.compareAndSet(false, true)) {
+            Log.d("GladixRadio", "THROWBRIDGE reason=rescue_in_flight ext=${extension.id}")
+            return
+        }
+        try {
+            // Synthetic key: there is no station at all here, so no radio id exists. Keying on the
+            // extension preserves the one-attempt-per-seed property the real latch has.
+            if (!claimFallback("throw:${extension.id}", seed.id)) return
+            val epoch = player.queueEpochOrZero
+            val extra = RadioFallback.similarTracks(extension, seed)
+            if (extra.isEmpty()) {
+                Log.d("GladixRadio", "THROWBRIDGE reason=no_matches ext=${extension.id}")
+                return
+            }
+            withContext(Dispatchers.Main) {
+                if (player.queueEpochOrZero != epoch) {
+                    Log.d(
+                        "GladixQueue",
+                        "stale_drop site=throwbridge n=${extra.size} " +
+                            "started=$epoch now=${player.queueEpochOrZero}"
+                    )
+                    return@withContext
+                }
+                // A LABEL_ONLY_RADIO placeholder is exactly right here: there IS no real station, and that
+                // marker means "a label standing in for no context", so the header reads "<seed> Radio"
+                // while loadPlaylist keeps generating off a null context. See MediaItemUtils.
+                // ⚠⚠ A REAL Radio CONTEXT PASSES THROUGH; THE PLACEHOLDER IS ONLY FOR WHEN
+                // THERE IS GENUINELY NO STATION. Replacing a real context with trackRadioPlaceholder is a
+                // defect that was fixed in September - "the real Radio context PASSES THROUGH rather than
+                // being replaced by trackRadioPlaceholder", because Deezer's Track branch preserves
+                // identity per kind (ARTIST keeps id/title/cover, PLAYLIST/ALBUM return the context as-is,
+                // FLOW copies with a "... Flow" title, TRACK re-seeds on the newly tapped track).
+                // ⚠️ AND IT IS NOT UNREACHABLE HERE, WHICH IS WHY THIS IS A CHECK AND NOT A
+                // COMMENT. An unconditional placeholder was the first version of this bridge and it was
+                // wrong: loadPlaylist reaches `loaded == null` with itemContext STILL SET whenever a live
+                // station's own generation throws - a YTM artist radio going Empty, say - and stamping a
+                // placeholder there would overwrite the station the user is actually in.
+                // `as? Radio` rather than a bare elvis, deliberately: a Radio context means "you are in a
+                // station" and these tracks continue it, but an Album/Playlist/Artist context means the
+                // bridge tracks would be claiming membership of a collection they are not part of. For
+                // those, the placeholder's "<seed> Radio" is the HONEST label - it is what the auto-radio
+                // would have been called had it not thrown.
+                val context = (itemContext as? Radio) ?: MediaItemUtils.trackRadioPlaceholder(seed)
+                player.addMediaItems(
+                    extra.map {
+                        MediaItemUtils.build(
+                            app, downloadFlow.value, MediaState.Unloaded(extension.id, it), context
+                        )
+                    }
+                )
+                if (player.playbackState == Player.STATE_IDLE) player.prepare()
+                Log.d("GladixRadio", "THROWBRIDGE reason=ok appended=${extra.size} ext=${extension.id}")
+            }
+        } finally {
+            rescueInFlight.set(false)
+        }
+    }
+
     private suspend fun collectSeeds(max: Int): List<Pair<String, Track>> =
         withContext(Dispatchers.Main) {
             val out = ArrayList<Pair<String, Track>>()
@@ -620,6 +1036,22 @@ class PlayerRadio(
                 return
             }
         }
+        // Claimed AFTER the seed-determined gate above, which is pure logic plus a log and costs nothing,
+        // so that gate still reports on every attempt. Only the expensive half is serialised.
+        if (!rescueInFlight.compareAndSet(false, true)) {
+            Log.d("GladixRadio", "RESEED reason=rescue_in_flight")
+            return
+        }
+        try {
+            reseedFanOutLocked()
+        } finally {
+            rescueInFlight.set(false)
+        }
+    }
+
+    // Split out purely so the claim above can wrap the whole body in try/finally without reindenting it.
+    // Everything here runs under rescueInFlight.
+    private suspend fun reseedFanOutLocked() {
         // Seed 1 is the currently playing track - loadPlaylist already tried it, that is what came back
         // thin. Only the remainder are new work.
         val seeds = collectSeeds(RESEED_SEEDS)
@@ -630,12 +1062,31 @@ class PlayerRadio(
             return
         }
 
-        // ⚠⚠ Loading BEFORE THE FAN-OUT, NOT AFTER THE FIRST RESULT. play() has already left
-        // stateFlow at Empty or Loaded by now, and topUpQueue's only re-entrancy guard is
+        // ⚠️ [CORRECTED 2026-09-11] THE CLAIM THAT USED TO STAND HERE, kept because it reads as obviously
+        // right and is the trap: "Loading BEFORE THE FAN-OUT, NOT AFTER THE FIRST RESULT. play() has
+        // already left stateFlow at Empty or Loaded by now, and topUpQueue's only re-entrancy guard is
         // `stateFlow.value is Loading`. Without this line a track transition during the fan-out re-enters
-        // loadPlaylist and starts a SECOND concurrent fan-out against the same queue.
-        val prior = stateFlow.value
-        stateFlow.value = PlayerState.Radio.Loading
+        // loadPlaylist and starts a SECOND concurrent fan-out against the same queue."
+        // The DIAGNOSIS was right - a second concurrent fan-out is exactly the hazard. The REMEDY was
+        // wrong: stateFlow is not a mutex, and using it as one discards the transitions it blocks instead
+        // of deferring them. rescueInFlight provides the same exclusion without touching the state machine.
+        // ⚠️ THIS USED TO SET stateFlow = Loading HERE AND HOLD IT ACROSS
+        // THE FAN-OUT. The build report that shipped it called that "correct" and said it "handles risk 3"
+        // (stateFlow re-entrancy). IT WAS NOT CORRECT, and it was the WORSE of the two instances of this
+        // mistake in the file:
+        //   - it held Loading across THREE CONCURRENT STATION FETCHES bounded by the extension's 25s
+        //     callTimeout - a LONGER window than the ~12s Last.fm bridge it was written alongside;
+        //   - with NO finally, so any throw - coroutineScope rethrows CancellationException, appendDeduped
+        //     can throw - pinned Loading permanently and stranded the whole radio subsystem. Only the
+        //     stations.isEmpty() path restored it.
+        //   - and it carried the same lost-wakeup exposure as widening Loading in play(): edge-triggered
+        //     transitions inside the window are discarded, not deferred.
+        // Loading is now DROPPED here entirely rather than moved into the try/finally. Dropping REMOVES the
+        // lost-wakeup exposure; moving it would only have bounded the pinning half. rescueInFlight already
+        // provides the mutual exclusion Loading was being misused for, and one mechanism doing one job
+        // beats two with overlapping ones.
+        // Four concurrent station fetches then one merged append - the same replace-in-between window.
+        val epoch = player.queueEpochOrZero
 
         val stations = coroutineScope {
             extra.map { (clientId, seed) ->
@@ -667,7 +1118,8 @@ class PlayerRadio(
         }.filterNotNull()
 
         if (stations.isEmpty()) {
-            stateFlow.value = prior
+            // No restore needed now that Loading is not set: stateFlow still holds whatever play() left,
+            // which is Empty on the thin path - exactly "the next transition regenerates".
             Log.d(
                 "GladixRadio",
                 "RESEED reason=all_seeds_failed seeds=${extra.size} " +
@@ -708,7 +1160,10 @@ class PlayerRadio(
             depth++
         }
 
-        val appended = appendDeduped(player, downloadFlow, app, merged, retained.first.context)
+        val appended = appendDeduped(
+            player, downloadFlow, app, merged, retained.first.context, epoch,
+            seedKeysFor(retained.first.context.id)
+        )
         stateFlow.value =
             if (retained.second.continuation != null)
                 retained.first.copy(cont = retained.second.continuation)
@@ -767,6 +1222,21 @@ class PlayerRadio(
         when (val state = stateFlow.value) {
             is PlayerState.Radio.Loading -> {}
             is PlayerState.Radio.Empty -> loadPlaylist()
+            // ⚠⚠ PARKED 2026-09-11 - A STALE Loaded MAKES THIS CONTINUE THE WRONG STATION.
+            // NOTHING RESETS radioFlow WHEN A NEW QUEUE IS SET. PlayerCallback.trackRadio and playItem do
+            // not touch it, and the only reset to Empty in this file is onMediaItemTransition's
+            // `mediaItemCount == 0` branch. So a Loaded left over from a PREVIOUS station survives into a
+            // new queue, and this branch then extends that old station instead of generating one for what
+            // is actually playing - appending the previous extension's tracks to the current queue.
+            // The queue epoch does NOT catch it: the replacement bumps the epoch BEFORE play() captures it,
+            // so the append is "for" the new queue by that test and lands.
+            // Concretely on YTM: the queue survives, but with the wrong extension's tracks - which also
+            // means the throwBridge above is never reached, because loadPlaylist is never called. That is
+            // the "when no stale station is loaded" qualifier on its reach statement.
+            // PRE-EXISTING and SEPARATE from tonight's work - recorded here rather than fixed, because the
+            // fix (reset radioFlow at the queue-replacement seam) has exactly the call-ORDER hazard
+            // documented at ShufflePlayer.markQueueReplaced and wants its own pass.
+            //
             // No `extension` argument, so the endless-queue fallback does NOT run on TV. Deliberate for
             // this pass: TV owns its own end-of-queue path (tvDriveRadio) and reach beyond the motivating
             // extension is explicitly not a goal here. Wiring it is one argument, the same as topUpQueue's Loaded branch.
