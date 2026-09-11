@@ -667,7 +667,15 @@ class PlayerCallback(
                 // whole thing, so its continuation is always null (an empty result there IS genuinely empty).
                 val result: Result<Pair<List<Track>, String?>> =
                     if (shuffle) extension.get { tracks.loadAll() }.map { it to null as String? }
-                    else runCatching { extension.get { tracks.loadPage(null) }.getOrThrow() }
+                    // loadPage returns Page<Track>; `result` is a Pair because the shuffle branch above
+                    // produces one from loadAll(). The conversion is NOT incidental - it is the only thing
+                    // reconciling the two branches, and it was lost on 2026-09-10 when the loadAll
+                    // continuation was lifted out of this block (it had been the block's trailing
+                    // expression, one line below the launch that was being moved).
+                    else runCatching {
+                        val (list, continuation) = extension.get { tracks.loadPage(null) }.getOrThrow()
+                        list to continuation
+                    }
                 val (list, continuation) = result.getOrElse {
                     if (it is CancellationException) throw it
                     throwableFlow.emit(it)
