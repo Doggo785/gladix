@@ -93,6 +93,17 @@ object CoroutineUtils {
      * playback path and deserves its own pass with a device check, not a drive-by on someone else's fix.
      * Before building it, enumerate the callers — a consumer that treats cancellation and failure alike
      * gains nothing, and one that special-cases isCancelled is the reason to do it.
+     *
+     * ⚠️ [CORRECTED 2026-09-10] A PROJECT RECORD DESCRIBES THIS FUNCTION AS SOMETHING IT HAS NEVER BEEN,
+     * and the description is plausible enough to be acted on. It reads: "futureCatching now accepts onError
+     * lambda wired to throwableFlow at all call sites". THERE IS NO onError PARAMETER — the signature is
+     * (context, block) and the body only ever calls future.set / future.setException.
+     * THE SUBSTANCE OF THAT CHANGE DID SHIP, BY A DIFFERENT MECHANISM: throwableFlow is threaded into the
+     * OPERATION rather than into this wrapper — AndroidAutoCallback's getList/getFeed take it as a
+     * parameter and report from inside the work. The distinction is not pedantic: it decides WHERE a future
+     * "make failures visible" fix belongs, and the answer is the code that knows about the failure, not the
+     * future that happens to carry it. See PlayerViewModel.withBrowser, which was nearly aimed at the
+     * wrapper layer for exactly this reason, and CALLED vs LAUNCHED at App.exceptionHandler for the rule.
      */
     fun <T> CoroutineScope.futureCatching(
         context: CoroutineContext = Dispatchers.IO, block: suspend () -> T

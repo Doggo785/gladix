@@ -378,11 +378,46 @@ class PlayerCallback(
         val itemLoaded = args.getBoolean("loaded", false)
         val extension = extensions.music.getExtension(extId) ?: return@future error
         val newItem = if (itemLoaded) item else loadItem(extension, item)
+        // ⚠⚠ NOT FOR TRACKS. This handler clears the queue and plays the generated mix, which
+        // is correct for Album / Artist / Playlist / Radio and WRONG for a Track, whose station must be
+        // seed-first. Tracks are routed to trackRadio at PlayerViewModel.radio - see the note there for the
+        // three device-confirmed defects this produced, and DeezerRadioClient's TRACK branch for why the
+        // seed vanishes silently rather than loudly.
+        //
+        // ⚠⚠ `prior` EXISTS BECAUSE A PINNED Loading STRANDS THE WHOLE RADIO SUBSYSTEM, NOT
+        // JUST THIS REQUEST. Loading has to be set BEFORE start() - it is what stops topUpQueue racing the
+        // load - but until 2026-09-10 the `loaded == null` return below left it set forever. Per the note
+        // in PlayerRadio.play, a pinned Loading makes topUpQueue() AND startRadio() no-op for the REST OF
+        // THE CONTEXT, so auto-radio and every queue top-up stop for the session. Restoring `prior` rather
+        // than Empty is the correct undo: clearMediaItems() has not run yet at this point, so the previous
+        // station is still the queue's station and nothing has changed.
+        // THIS IS THE ONLY RETURN THAT NEEDS IT. The extId / item / extension returns and loadItem() all sit
+        // ABOVE the Loading assignment, so they cannot strand it. No try/finally is needed either:
+        // ExtensionUtils.getOrThrow(throwableFlow) rethrows ONLY CancellationException and converts every
+        // other throwable into a reported null, so start() cannot throw past this point except when the
+        // scope is already dying.
+        //
+        // ⚠️ [CORRECTED 2026-09-10] HOW THIS IS REACHED, because the first record of it named the
+        // wrong route. It originally read: "reachable whenever start() returns null, INCLUDING
+        // !item.isRadioSupported, which the smarttracklist work sets false on purpose". THAT ROUTE IS NOW
+        // GONE - tracks route to trackRadio (see PlayerViewModel.radio), and isRadioSupported defaults to
+        // true on Album/Artist/Playlist, so it will not fire on what still arrives here.
+        // The hole did NOT become rare, it became INCIDENTAL rather than deterministic. start() also returns
+        // null for any throwable, and DeezerRadioClient THROWS BY DESIGN on this path: its Album and
+        // Playlist branches do `seeds.firstOrNull() ?: error("No Radio")`, and the context `when` ends in
+        // `else -> error("No Radio")`. An album whose tracklist fetch fails or returns empty - an ordinary
+        // network failure - lands on exactly the return below. Keeping the wrong route recorded because the
+        // reasoning that produced it is the instructive part: a deliberate, easily-named cause was found
+        // first and the far more common accidental one was nearly missed behind it.
+        val prior = radioFlow.value
         radioFlow.value = PlayerState.Radio.Loading
         val loaded = PlayerRadio.start(
             throwableFlow, extension, newItem, null
         )
-        if (loaded == null) return@future error
+        if (loaded == null) {
+            radioFlow.value = prior
+            return@future error
+        }
         player.with {
             clearMediaItems()
             shuffleModeEnabled = false
@@ -396,8 +431,18 @@ class PlayerCallback(
     // Mirrors PHONE exactly: queue + play the SEED first (like setQueue's single-track path), THEN APPEND
     // the generated radio (mirroring PlayerRadio.loadPlaylist's start+play) — instead of relying on
     // auto-radio to append, which doesn't fire on TV (so the seed looped and loadTracks never ran).
-    // The seed is NOT filtered: it's the index-0 queued item; only the appended mix has it filtered
-    // (Deezer start_with_input_track=false), identical to phone.
+    // ⚠⚠ THE SEED IS NOT FILTERED HERE, AND THAT IS ONE HALF OF A TWO-SIDED CONTRACT.
+    // This side queues the seed at index 0 unfiltered; the EXTENSION side strips the seed out of the
+    // generated mix - see DeezerRadioClient's `if (kind == RadioKind.TRACK)` branch, which carries the
+    // matching note. Neither half is correct alone: strip without queueing and the tapped track never
+    // plays; queue without stripping and it plays twice back to back.
+    // ⚠️ radio() ABOVE HONOURS NEITHER HALF. It clears the queue and plays the mix, so a Track
+    // sent there loses its seed entirely. That is what long-press -> Radio did until 2026-09-10; tracks are
+    // now routed here at PlayerViewModel.radio. THIS IS THE PATH A TRACK STATION MUST TAKE.
+    // ⚠️ AND IT MUST STAY ONE COMMAND. Queueing the seed from the UI and then sending
+    // radioCommand is NOT equivalent: as two separate async commands the append can read a STALE
+    // currentMediaItem between them. That is why trackRadioCommand exists at all rather than being
+    // composed at the call site.
     @OptIn(UnstableApi::class)
     private fun trackRadio(player: Player, args: Bundle) = scope.future {
         userQueueSet.set(true)

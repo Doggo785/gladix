@@ -100,6 +100,23 @@ class DeezerRadioClient(private val api: DeezerApi, private val parser: DeezerPa
 
                 track.copy(extras = track.extras + mapOf("NEXT" to nextId) + addlExtras)
             }.filterNotNull().let { tracks ->
+                // ⚠⚠ THIS STRIP ASSUMES THE CALLER ALREADY QUEUED THE SEED AT INDEX 0. THAT IS
+                // HALF OF A CONTRACT AND THE OTHER HALF LIVES IN THE APP - READ BOTH BEFORE CHANGING EITHER.
+                // Deezer's api.mix is called with start_with_input_track=false, so the seed is absent or
+                // near-duplicated in the results; stripping it here is right ONLY because a track station
+                // is supposed to be seed-first, with the tapped track played from index 0 and this mix
+                // appended behind it. PlayerCallback.trackRadio is the app side that honours that, and its
+                // comment states the same contract from the other direction.
+                // ⚠️ PlayerCallback.radio HONOURS NEITHER HALF - it clears the queue and plays the
+                // mix directly. Pointed at a Track it produced three defects on 2026-09-10 (wrong first
+                // track, total silence, and a dead endless-queue fallback); the fix routes tracks away from
+                // it at PlayerViewModel.radio. Anything that sends a Track to PlayerCallback.radio again
+                // re-opens all three, and this filter is what makes them silent rather than noisy.
+                // ⚠️ THE STRIP CAN REMOVE EVERYTHING. "Underwater" by The Frogmen is served under
+                // two album ids, i.e. two track ids, and the title+artist test removes BOTH - a legitimately
+                // empty result that is indistinguishable from an exhausted station. The app treats that case
+                // at PlayerRadio.play's `thin` predicate; do not "fix" it here by weakening the test, because
+                // the two-track loop it prevents is worse than the empty page it produces.
                 if (kind == RadioKind.TRACK) {
                     val seedArtist = radio.extras["seed_artist_name"].orEmpty()
                     val seedTitle = radio.extras["seed_title"].orEmpty().stripVersionSuffix()

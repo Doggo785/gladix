@@ -90,13 +90,37 @@ object RadioFallback {
 
     // How many similar tracks to ask for, and how many catalogue matches to append. Kept small: the point
     // is to keep the queue alive, not to build a station. Each candidate costs one extension search.
-    private const val SIMILAR_LIMIT = 12
+    // Candidates REQUESTED from Last.fm. 12 -> 25 on 2026-09-11, together with the shuffle below.
+    //
+    // WHY: a station that is dead stays dead, so the same exhausted track is re-bridged with the SAME
+    // candidates every time. At 12 requested and ~6 matching Deezer, the loop consumed effectively all of
+    // them, so the bridge was not merely similar between plays — it was IDENTICAL, same tracks in the same
+    // order. A bigger pool plus a shuffle makes it vary.
+    // ⚠️ THIS DOES NOT RAISE THE EXPECTED SEARCH COUNT, which is what makes it cheap: the loop still stops
+    // at MAX_APPEND matches, so at a given hit-rate it issues the same number of searches whether it is
+    // drawing from 12 candidates or 25. It raises the POOL, not the work. The worst case is unchanged too,
+    // because MAX_SEARCHES (15) bounds attempts, not candidates.
+    //
+    // ⚠️ 25 IS NOT DOCUMENTED AS AVAILABLE, AND NEITHER IS ANY CEILING. Last.fm's track.getSimilar page
+    // describes `limit` only as "Maximum number of similar tracks to return" — no stated default, no stated
+    // maximum. So this is an empirical question, and the LASTFM log line answers it directly: `similar=`
+    // reports what actually came back. If it still reads 12 for a given track, that is Last.fm's supply for
+    // that track and the larger request is inert for it.
+    // ⚠️ AND THAT IS THE CASE WHERE THE SHUFFLE BUYS NOTHING — worth knowing before reading a flat result
+    // as a bug. If a track's supply is 12 and 6 of them exist in Deezer, every candidate is searched
+    // regardless of order, so shuffling changes WHICH ORDER the same six arrive in, not WHICH six. The
+    // shuffle only produces a different SET once the supply exceeds what the loop consumes. Obscure tracks
+    // — exactly the ones this fallback exists for — are the likeliest to have a thin supply, so a
+    // persisting `similar=12` means this pass helped least where it was aimed.
+    private const val SIMILAR_LIMIT = 25
     private const val MAX_APPEND = 6
 
     // Hard ceiling on EXTENSION SEARCHES per exhausted station. Each search is a network round trip AND —
     // until the non-gesture search signal lands — a write into the user's server-side search history, so
-    // this is the number that bounds the pollution, not MAX_APPEND. 15 sits above SIMILAR_LIMIT (12) so it
-    // does not bite on today's candidate count; it is the backstop if SIMILAR_LIMIT is ever raised.
+    // this is the number that bounds the pollution, not MAX_APPEND. Since 2026-09-11 SIMILAR_LIMIT is 25,
+    // so this DOES bite: at most 15 of the 25 shuffled candidates are ever searched, which is precisely
+    // what keeps the bigger pool free — more to draw from, no more work done. It is also what bounds the
+    // timeout worst case: 15 x ~300ms lands under SEARCH_BUDGET_MS with room for one slow outlier.
     private const val MAX_SEARCHES = 15
 
     // Wall clock for the SEARCH LOOP ONLY — deliberately not wrapping the Last.fm fetch, which carries its
@@ -213,7 +237,32 @@ object RadioFallback {
         var searched = 0
         var noSearchClient = false
         val completed = withTimeoutOrNull(SEARCH_BUDGET_MS) {
-            for (candidate in similar.take(MAX_SEARCHES)) {
+            // shuffled(), so a repeatedly-exhausted station does not rebuild the identical bridge each
+            // time. Applied BEFORE take(MAX_SEARCHES) so the cap selects a different 15 of the 25 on every
+            // run rather than always the same prefix — that ordering is the whole point, do not swap them.
+            //
+            // ⚠️ THIS IS THE ESTABLISHED PATTERN IN THIS CODEBASE, NOT A FRESH PREFERENCE — AND THE
+            // PRECEDENT IS A POOL, SAMPLED, WHICH IS EXACTLY THIS SHAPE. DeezerRadioClient.loadTracks does
+            // it for PLAYLIST and ALBUM stations: randomTracksFromSongs(parser, 8) draws EIGHT random
+            // tracks (its body is literally `songs.shuffled()`), stores them as extras seed_ids /
+            // seed_artists, and then fires api.radio(tId, aId) PER SEED concurrently and merges the
+            // results. Not "one random pick instead of a fixed one" — a sampled pool feeding parallel
+            // queries, which is structurally what this loop does with Last.fm candidates.
+            // ⚠️ AND IT RE-SAMPLES ON EVERY LOAD, not once at station creation: loadTracks re-fetches the
+            // source and calls randomTracksFromSongs AGAIN, falling back to the stored seed_ids only if
+            // that fetch fails. So re-opening the same album radio gives different seeds — the same
+            // property this shuffle gives a re-bridged station. The symptom it fixed was that "the radio
+            // always generated music similar to the same one track regardless of what was in the
+            // playlist/album"; the singular randomTrackFromSongs it replaced has since been deleted as
+            // dead code, so this pool-and-sample version IS the current pattern, not a step toward it.
+            // If you are inclined to make either deterministic again for reproducibility, that is the bug
+            // both changes fixed.
+            //
+            // Last.fm returns its candidates in similarity order, so shuffling deliberately DISCARDS that
+            // ranking. Accepted: past the first few, Last.fm's ordering is not meaningfully better than
+            // random for this purpose, and variety between plays is worth more than a ranking the user
+            // cannot see. If a "best match first" property is ever wanted, this is the line that traded it.
+            for (candidate in similar.shuffled().take(MAX_SEARCHES)) {
                 if (matched.size >= MAX_APPEND) break
                 searched++
                 val found = extension.getIf<SearchFeedClient, List<Track>> {

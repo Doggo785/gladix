@@ -97,6 +97,15 @@ data class App(
     // limited dispatcher inside an ordinary scope, and the extension is a third-party APK nobody here can
     // read. So: THE FIX COVERS THE CLASS; WHETHER IT COVERS THAT EXACT CRASH IS UNKNOWABLE. Do not record
     // it as closed-by-verification; it is closed by the class being guarded and 94 builds of silence.
+    //
+    // ⚠️ THE GENERAL RULE UNDERNEATH THIS, cross-referenced so it does not read as a local
+    // judgement made twice: THE CODE THAT KNOWS ABOUT THE FAILURE REPORTS IT. That is exactly why CALLED
+    // works and LAUNCHED does not - the call site holds the Result, the scope holds nothing.
+    // The same rule decides a question one subsystem over, in the service-to-UI direction: a custom
+    // command's SessionResult is discarded by its caller (see PlayerViewModel.withBrowser), and the fix
+    // belongs in the PlayerCallback HANDLER - which knows what failed and can emit to app.messageFlow or
+    // throwFlow, as playItem already does - NOT in the dispatch helper, which could only ever learn an
+    // error code with no message. That note was nearly aimed at the helper before this rule was applied.
     private val exceptionHandler: CoroutineExceptionHandler = CoroutineExceptionHandler { _, throwable ->
         if (throwable is CancellationException) return@CoroutineExceptionHandler
         runCatching { scope.launch { throwFlow.emit(throwable) } }

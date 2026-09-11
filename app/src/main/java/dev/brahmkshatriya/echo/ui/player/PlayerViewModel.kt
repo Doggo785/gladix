@@ -142,6 +142,54 @@ class PlayerViewModel(
         }
     }
 
+    // ⚠⚠ EVERY SessionResult FROM HERE IS DISCARDED - AND THE FIX IS NOT HERE. `block` returns
+    // Unit and the ListenableFuture that sendCustomCommand hands back is never awaited or inspected, so a
+    // handler that fails is INVISIBLE BY CONSTRUCTION - not unreported by oversight, but unreportable
+    // through this call shape. Eleven sendCustomCommand sites dispatch through this function.
+    //
+    // ⚠️ [CORRECTED 2026-09-10] THIS DID NOT CAUSE THE "a message, then nothing" REPORT, THOUGH
+    // THIS NOTE ASSERTED THAT IT DID. The claim was: PlayerViewModel.radio emits its snackbar before
+    // dispatching, so the user gets the optimistic half and never the failure half. Re-derived against
+    // source: on the Frogmen station start() SUCCEEDED (asTrackRadio is local construction off fields the
+    // Track already carries, and cannot fail), play() appended zero after DeezerRadioClient's TRACK filter
+    // stripped both copies of the recording, and radio() returned RESULT_SUCCESS. NO return@future error
+    // EVER RAN. The silence was an empty append treated as success plus play() no-opping on an emptied
+    // queue, fixed by the seed routing at PlayerViewModel.radio.
+    // Kept rather than deleted because of HOW it got believed: a plausible, real, but UNEXERCISED mechanism
+    // sitting next to a real symptom was written down as the cause while the actual bug was still being
+    // traced, and was then quoted back as established before anyone re-derived it.
+    //
+    // ⚠️ [RETARGETED 2026-09-10] THE FIX IS IN THE HANDLERS, NOT HERE. This note previously
+    // proposed having block return the SessionResult and emitting on a non-success code. Wrong layer:
+    //   - SessionResult carries an ERROR CODE AND NO MESSAGE, so the most this side could ever say is
+    //     "something failed" - strictly less than the handler already knows.
+    //   - The service and the UI SHARE A PROCESS, and app.messageFlow already crosses that boundary, so
+    //     the SessionResult round trip is redundant as a channel, not merely lossy.
+    //   - The precedent is already in PlayerCallback: playItem emits app.messageFlow / throwableFlow FROM
+    //     INSIDE THE HANDLER (its list_is_empty guard), and trackRadio's catch does the same for its
+    //     generation phase. Neither touches SessionResult.
+    // So withBrowser SHOULD NOT CHANGE. The work is one emit per silent guard, inside PlayerCallback.
+    // ⚠️ SAME RULE, ONE SUBSYSTEM OVER: see CALLED vs LAUNCHED at App.exceptionHandler. THE CODE
+    // THAT KNOWS ABOUT THE FAILURE REPORTS IT - there it is why a CALLED extension method is attributed and
+    // a LAUNCHED coroutine is not; here it is why the handler reports and the dispatch helper cannot.
+    // Cross-referenced deliberately, so it is a project-wide rule rather than the same judgement reinvented
+    // at each site.
+    //
+    // ⚠⚠ PARKED 2026-09-10, AND THE REACHABILITY IS WHAT MAKES THAT A DECISION RATHER THAN A
+    // BACKLOG ITEM: FIVE THEORETICAL GUARDS, ZERO EVER OBSERVED TO FIRE.
+    //   radio()      - 3 silent: extId null (the VM always writes it), item undeserialisable
+    //                  (putSerialized<EchoMediaItem> writes the discriminator correctly today), extension
+    //                  unknown (needs an extension disabled mid-session).
+    //   trackRadio() - 2 silent, and BOTH SIT BEFORE ANY PLAYBACK, so either firing means a tap that does
+    //                  nothing with no log and no message - the shape already documented at playTrackRadio.
+    // AND THE MOST REACHABLE FAILURE ON THIS PATH ALREADY REPORTS. radio()'s fourth return SPLITS:
+    // PlayerRadio.start ends in getOrThrow(throwableFlow), so when DeezerRadioClient throws "No Radio"
+    // (its Album/Playlist branches, reachable on an ordinary network failure or an empty tracklist) the
+    // user IS told. It is silent only for !isRadioSupported or a non-RadioClient extension.
+    // WHEN TAKEN, IT IS ONE PASS ACROSS EVERY HANDLER - eleven sendCustomCommand sites, ~eight command
+    // handlers unaudited. Doing two of eight is the reason this is parked rather than half-done: a
+    // PARTIALLY-reporting command surface is harder to reason about than a uniformly silent one, because
+    // "no message" stops being evidence of anything.
     private fun withBrowser(block: suspend (MediaController) -> Unit) {
         viewModelScope.launch {
             val browser = browser.first { it != null }!!
@@ -426,7 +474,72 @@ class PlayerViewModel(
         }
     }
 
+    // ⚠⚠ TRACKS DO NOT GO THROUGH radioCommand. THE SPLIT IS BY ITEM TYPE AND IT IS LOAD-BEARING.
+    // A Track IS a radio seed by nature, so a track station must be SEED-FIRST: the tapped track queued at
+    // index 0 and played, then the generated mix appended behind it. Everything else (Album, Artist,
+    // Playlist, Radio) has no seed to preserve - PlayerCallback.radio clears the queue and plays the mix,
+    // which is CORRECT for those and only for those.
+    //
+    // ⚠️ WHAT THIS FIXES, MEASURED ON DEVICE 2026-09-10. Long-press -> Radio on a search result reached
+    // PlayerCallback.radio, whose clearMediaItems() runs with no seed queued. THREE SYMPTOMS, ONE CAUSE:
+    //   1. "Worst That Could Happen" (The Brooklyn Bridge) - ~100 tracks queued, playback started on the
+    //      wrong one, because the tapped track was never at index 0 and DeezerRadioClient's TRACK branch
+    //      had stripped it from the mix (see the coupling note there).
+    //   2. "Underwater" (The Frogmen) - Deezer serves that recording under two album ids, the TRACK branch
+    //      stripped BOTH, the append was empty, and play() ran on an emptied queue. Total silence.
+    //   3. The endless-queue fallback never fired: PlayerRadio.play reads its seed from
+    //      player.currentMediaItem, which is null once the queue is cleared and nothing is appended.
+    //      Confirmed by an EMPTY `adb logcat -s GladixRadio` across both attempts - RadioFallback logs on
+    //      every outcome, so zero lines means it never ran.
+    //
+    // ⚠️ DO NOT "FIX" THIS BY QUEUEING THE SEED HERE AND THEN CALLING radioCommand. ATOMIC PACKAGING IS
+    // WHY trackRadio EXISTS: as two separate async commands the append can read a STALE currentMediaItem
+    // between them. trackRadio does both halves inside one command, on one thread, in order.
+    //
+    // THE CHOICE LIVES HERE, AT THE CALLER, DELIBERATELY. Both UI entry points - MediaMoreBottomSheet's
+    // radio button and MediaHeaderAdapter's onRadioClicked - funnel through this one function, so one
+    // branch covers both and PlayerCallback.radio stays untouched and correct for its remaining callers.
+    // Branching INSIDE PlayerCallback.radio was rejected: it would make the service handler mean two
+    // different things depending on payload type, and the service is the harder place to see it from.
+    //
+    // ⚠⚠ THIS REROUTE POINTS THE MENU AT A HANDLER BUILT FOR TILE TAPS, AND THAT EXACT SHAPE
+    // HAS REGRESSED BEFORE. A previous reroute of the single-track branch was believed TV-only, was relayed
+    // as "phone unchanged" when the truth was "phone reaches the same result through DIFFERENT CODE", and
+    // phone single-track tiles and search results then played NOTHING. Different code is different failure
+    // modes. So the inputs were compared rather than assumed - checked 2026-09-10:
+    //   extId        - tile tap passes the feed item's extensionId, the menu passes the sheet's. Both
+    //                  non-null String; trackRadio only needs it to stamp MediaState.Unloaded.
+    //   item         - both go through putSerialized<EchoMediaItem>(...) on THIS function, so the
+    //                  polymorphic discriminator trackRadio's getSerialized<EchoMediaItem> needs is written
+    //                  by construction. (Serialising as the concrete Track omits it - that is the
+    //                  "tapping does nothing" regression recorded at playTrackRadio.)
+    //   context      - NOT a difference: trackRadio builds its own "<title> Radio" Radio from the seed and
+    //                  ignores whatever the caller had. SearchFragment's override passes null for exactly
+    //                  this reason; the menu never supplied one at all.
+    //   loaded       - THE ONE REAL DIFFERENCE. Tile taps pass an UNLOADED feed track; the menu passes a
+    //                  LOADED one. trackRadio wraps either in MediaState.Unloaded and lets the normal
+    //                  pipeline resolve it, so both work - the loaded track just carries more extras
+    //                  through the Binder. The old menu path called loadItem() first; dropping that is not
+    //                  a loss, because the menu already passed loaded=true so it was a no-op there.
+    // ⚠️ ONE BEHAVIOUR DIFFERENCE AT THE EXTENSION, VERIFIED FOR DEEZER AND ONLY DEEZER. The old
+    // path called RadioClient.radio(item, null); trackRadio calls it with the Radio it just built. In
+    // DeezerRadioClient the Track branch sends BOTH to the same place - `null -> item.asTrackRadio()` and
+    // `is Radio -> RadioKind.TRACK -> item.asTrackRadio()` - so the generated station is IDENTICAL. That
+    // equivalence is NOT guaranteed for other extensions: any RadioClient that treats a non-null Radio
+    // context differently from null will now see a context where it used to see null. If a non-Deezer
+    // track radio behaves oddly after this change, that is the first place to look.
+    //
+    // NOTE ON `loaded`: intentionally unused on the Track path. trackRadio builds the seed as
+    // MediaState.Unloaded and lets the normal resolution pipeline load it, which is what the already-shipped
+    // tile path (FeedClickListener -> playTrackRadio) does with unloaded feed tracks.
     fun radio(id: String, item: EchoMediaItem, loaded: Boolean) = viewModelScope.launch {
+        if (item is Track) {
+            // No snackbar on this path: the seed starts playing immediately, so "Loading radio for X"
+            // followed by instant audio reads as a stutter. The message below exists because the non-seed
+            // path genuinely has nothing to show until the whole mix resolves.
+            playTrackRadio(id, item)
+            return@launch
+        }
         app.messageFlow.emit(
             Message(app.context.getString(R.string.loading_radio_for_x, item.title))
         )
