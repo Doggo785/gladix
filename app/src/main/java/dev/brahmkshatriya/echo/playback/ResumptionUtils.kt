@@ -123,6 +123,22 @@ object ResumptionUtils {
     // single-process, so nothing can change these files without passing through here first. Deliberately
     // NOT File.lastModified(): that is second-granular on some filesystems, and scheduleSaveQueue is
     // debounced at 300ms, so two saves inside one second would collide and serve a stale cache.
+    // ⚠⚠ ONE OF TWO MONOTONIC QUEUE COUNTERS, AND THEY ANSWER DIFFERENT QUESTIONS. DO NOT
+    // UNIFY THEM - checked 2026-09-11, they diverge in BOTH directions:
+    //   queueGeneration (here)      "HAS THE PERSISTED QUEUE CHANGED?" Bumped in saveToQueue and
+    //                               clearQueue, i.e. on WRITES TO DISK. Consumer: PlayerState.restoreCache,
+    //                               which is keyed on it so a cached restore is discarded once the saved
+    //                               queue moves on.
+    //   ShufflePlayer.queueEpoch    "HAS THE LIVE QUEUE BEEN REPLACED?" Bumped at the eight replacement
+    //                               seams (setMediaItem x3, setMediaItems x3, clearMediaItems, release),
+    //                               verified NOT to fire on ordinary advance. Consumers: appendDeduped's
+    //                               ownership check, the Last.fm latch key, and PlayerState.Radio.Loaded's
+    //                               epoch.
+    // THEY DIVERGE BOTH WAYS, so neither can serve for the other:
+    //   - an ordinary debounced save during playback bumps THIS and not the epoch (no replacement);
+    //   - a setMediaItems bumps the EPOCH immediately while the save is still 300ms away.
+    // Related but not identical, which is the same trap as the five queue-replacement markers inventoried
+    // at ShufflePlayer.markQueueReplaced: names that sound interchangeable, semantics that are not.
     @Volatile
     var queueGeneration: Long = 0L
         private set

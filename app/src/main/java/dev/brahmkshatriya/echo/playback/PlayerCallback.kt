@@ -476,6 +476,20 @@ class PlayerCallback(
     // radioCommand is NOT equivalent: as two separate async commands the append can read a STALE
     // currentMediaItem between them. That is why trackRadioCommand exists at all rather than being
     // composed at the call site.
+    // ⚠⚠ THAT CLAUSE IS ABOUT COMMAND SPLITTING, NOT ABOUT DURATION - READ IT THAT WAY BEFORE
+    // CONCLUDING THE BRIDGE BELOW CONTRADICTS IT. The bridge runs a ~12s Last.fm lookup INSIDE this same
+    // coroutine and this same command, so nothing is split; the hazard the clause names cannot occur.
+    // It is in fact SAFER than play()'s bridge on the clause's own terms: PlayerRadio.throwBridge takes
+    // the seed as a PARAMETER and never reads player.currentMediaItem, so the stale read is structurally
+    // impossible rather than merely unlikely.
+    // ⚠️ AND THE MITIGATION IT IMPLIED IS SUPERSEDED, TWICE OVER. "Keep the window short" was
+    // the original defence; the queue epoch replaced it with an actual test - appendDeduped drops and logs
+    // any append whose queue was replaced mid-flight, which is the real guarantee the clause wanted.
+    // Beyond that, the design this clause describes is itself the FIRST version of that fix, which was
+    // then reworked twice before shipping: once "TV-scoped behind isTv" after the first reroute turned out
+    // not to be TV-only and regressed phone, and finally to "reuse the proven generate-and-append
+    // (startRadio/topUpQueue bodies untouched)". So it is a historically superseded note that is still
+    // worth keeping for the command-splitting rule, not a live constraint on how long this command runs.
     @OptIn(UnstableApi::class)
     private fun trackRadio(player: Player, args: Bundle) = scope.future {
         userQueueSet.set(true)
@@ -506,43 +520,80 @@ class PlayerCallback(
         val seedItem = MediaItemUtils.build(
             app, downloadFlow.value, MediaState.Unloaded(extId, seed), context
         )
-        player.with {
-            // ⚠⚠ PARKED 2026-09-11 - THIS ONE-ITEM QUEUE MAKES EVERY SINGLE-TRACK PLAY FETCH
-            // ITS RADIO TWICE, ON EVERY EXTENSION INCLUDING DEEZER. A one-item queue has no next item, so
-            // the onTimelineChanged this setMediaItems fires reaches PlayerRadio.startRadio, whose
-            // `hasNextMediaItem()` guard passes, which calls loadPlaylist -> PlayerRadio.start. Meanwhile
-            // this handler is ALREADY calling PlayerRadio.start a few lines below. Two independent
-            // generations of the same station, from one tap.
-            // SECOND CONFIRMED INSTANCE of the double-generation first seen in the 2026-09-11 artist-radio
-            // log, where a RESEED line appeared at a timestamp neither Last.fm lookup could have produced -
-            // same cause, reconstructed from timing there and read directly off the call graph here.
-            // ⚠️ THIS IS THE ONLY FINDING FROM THAT SESSION THAT COSTS THE PRIMARY EXTENSION
-            // ANYTHING: one wasted radio request per single-track play on Deezer too. Everything else was
-            // YTM-only. On YTM it is also what makes PlayerRadio.throwBridge reachable at all (see its
-            // reach note), so DO NOT "optimise" the duplicate away without covering trackRadio's own
-            // start() failure first - removing it would silently un-fix YTM radio.
-            setMediaItems(listOf(seedItem), 0, seed.playedDuration ?: 0)
-            (this as? ShufflePlayer)?.syncShuffleFlag(false)
-            if (playbackState == Player.STATE_IDLE) prepare()
-            playWhenReady = true
-        }
-        // 2) Generate the radio and append it after the seed (mirrors PlayerRadio.loadPlaylist: start +
-        //    play). Fully guarded: a missing extension or any generation error is reported but cannot abort
-        //    the seed already playing. Cancellation still propagates.
+        // ⚠⚠ CLAIMED BEFORE setMediaItems, AND THE ORDER IS FORCED - Media3 publishes the timeline
+        // event SYNCHRONOUSLY INSIDE setMediaItems, so onTimelineChanged has already scheduled its
+        // startRadio coroutine before the call returns. See the note at PlayerRadio.trackRadioGenerating
+        // for the source citation, for why the queue epoch cannot serve here, and for why stateFlow is
+        // not usable as the marker.
+        // ⚠️ THIS REMOVAL IS SAFE ONLY BECAUSE trackRadio NOW BRIDGES ITS OWN start() FAILURE. Until
+        // that landed, the incidental generation was the ONLY thing rescuing a YTM track radio, and
+        // removing it would have silently un-fixed it.
+        // ⚠️ AND THAT BRIDGE ALREADY CLOSED A LIVE GAP NOBODY HAD REPORTED: with autoStartRadio OFF,
+        // startRadio returns on its first line, so TODAY a YTM track radio gets NO rescue at all in that
+        // configuration. The accident only ever worked with the setting on. So this removal rests on a
+        // fix that was doing more than unblocking it.
+        PlayerRadio.markTrackRadioGenerating(true)
         try {
+            player.with {
+                // ⚠⚠ [FIXED 2026-09-11] THIS ONE-ITEM QUEUE USED TO MAKE EVERY SINGLE-TRACK PLAY FETCH ITS
+                // RADIO TWICE, ON EVERY EXTENSION INCLUDING DEEZER. A one-item queue has no next item, so the
+                // onTimelineChanged this setMediaItems fires reached PlayerRadio.startRadio, whose
+                // hasNextMediaItem() guard passed, which called loadPlaylist -> PlayerRadio.start - while this
+                // handler was already calling PlayerRadio.start a few lines below. Two independent generations
+                // from one tap, and one wasted network round trip per play.
+                // It was the SECOND confirmed instance of the double-generation first seen in the 2026-09-11
+                // artist-radio log, where a RESEED line appeared at a timestamp neither Last.fm lookup could
+                // have produced - reconstructed from timing there, read straight off the call graph here.
+                // Now suppressed by the markTrackRadioGenerating claim above, checked in loadPlaylist (NOT in
+                // startRadio - topUpQueue reaches it too; see the note there).
+                // ⚠️ IT WAS ALSO THE ONLY FINDING OF THAT STRETCH THAT COST THE PRIMARY EXTENSION ANYTHING:
+                // everything else was YTM-only. Kept recorded rather than deleted because the ORDERING was the
+                // hard part - it could not be removed until trackRadio bridged its own start() failure, since
+                // until then the duplicate was the only thing making the YTM rescue reachable.
+                setMediaItems(listOf(seedItem), 0, seed.playedDuration ?: 0)
+                (this as? ShufflePlayer)?.syncShuffleFlag(false)
+                if (playbackState == Player.STATE_IDLE) prepare()
+                playWhenReady = true
+            }
+            // 2) Generate the radio and append it after the seed (mirrors PlayerRadio.loadPlaylist: start +
+            //    play). Fully guarded: a missing extension or any generation error is reported but cannot abort
+            //    the seed already playing. Cancellation still propagates.
             val extension = extensions.music.getExtension(extId)
             // LEGITIMATELY SILENT, logged only. The seed is ALREADY PLAYING by the time we get here, so
             // this is a degraded success ("seed plays, no radio"), not a dead tap - see the guard note
             // above. A snackbar for a station the user never explicitly asked for would be noise.
             if (extension == null) Log.d("GladixQueue", "track_radio: no extension ext=$extId")
             if (extension != null) {
-                val loaded = PlayerRadio.start(throwableFlow, extension, seed, context)
+                var startFailure: Throwable? = null
+                val loaded = PlayerRadio.start(
+                    throwableFlow, extension, seed, context, onFailure = { startFailure = it }
+                )
                 if (loaded != null) PlayerRadio.play(player, downloadFlow, app, radioFlow, loaded, extension)
+                // ⚠⚠ THE SAME NULL-STATION FAILURE loadPlaylist BRIDGES, AND UNTIL 2026-09-11
+                // THIS PATH HAD NO BRIDGE AT ALL. On YTM the rescue still happened, but only BY ACCIDENT:
+                // the one-item queue set above has no next item, so onTimelineChanged reaches
+                // PlayerRadio.startRadio, which calls loadPlaylist, which IS bridged. Turn autoStartRadio
+                // off, or ever queue more than one item here, and the rescue silently disappeared.
+                // This removes that dependency - and it is what has to land BEFORE the duplicate
+                // getSongRadio call is removed, because that duplicate is currently the only thing making
+                // the accident work. See the parked note at setMediaItems above.
+                // ⚠️ THE CONTEXT STAMP IS `context`, THE REAL Radio BUILT ABOVE - not a
+                // placeholder. Third distinct case for the same expression in throwBridge
+                // (`(itemContext as? Radio) ?: trackRadioPlaceholder`): no station, live station, and now
+                // an app-built track station. It passes the September rule unchanged - a real Radio
+                // context passes through - and keeps the seed and its bridge tracks under one header.
+                else startFailure?.let {
+                    PlayerRadio.throwBridge(player, downloadFlow, app, extension, seed, it, context)
+                }
             }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
             throwableFlow.emit(e)
+        } finally {
+            // Covers setMediaItems AND the generation, so neither a throw nor a cancellation can leave the
+            // marker stuck and stop this queue ever generating.
+            PlayerRadio.markTrackRadioGenerating(false)
         }
         SessionResult(RESULT_SUCCESS)
     }

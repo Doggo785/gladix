@@ -125,6 +125,38 @@ data class PlayerState(
             val clientId: String,
             val context: EchoMediaItem,
             val cont: String?,
+            // ⚠⚠ WHICH LIVE QUEUE THIS STATION WAS BUILT FOR - ShufflePlayer.queueEpoch at the
+            // moment it was PUBLISHED. A Loaded whose epoch no longer matches belongs to a queue that has
+            // since been replaced, and PlayerRadio treats it as Empty rather than continuing it.
+            //
+            // ⚠️ THE DEFECT THIS CLOSES, OBSERVED 2026-09-11: nothing reset this flow when a new
+            // queue was set, so a Loaded from a previous station survived into the next queue and
+            // startRadio extended THAT station - appending the previous extension's tracks. In composition
+            // with a second silent defect it produced a station that stopped with a completely empty log.
+            //
+            // ⚠️ THE PATTERN IS ALREADY IN THIS FILE, WHICH IS WHY IT LIVES ON THE MODEL RATHER
+            // THAN BESIDE IT: restoreCache is `Pair<Long, RestoreData?>` keyed on
+            // ResumptionUtils.queueGeneration for exactly the same reason - "which queue generation was
+            // this built for". Carrying the key WITH the value is what makes it impossible to desync; a
+            // parallel var next to the flow would have to be kept in step by hand at four publication
+            // sites, which is the class of pairing this codebase keeps getting bitten by.
+            // ⚠️ THOSE TWO COUNTERS ARE NOT THE SAME AND MUST NOT BE UNIFIED - see the note at
+            // ResumptionUtils.queueGeneration.
+            //
+            // ⚠️ DEFAULT -1L, NOT 0L, DELIBERATELY. queueEpoch starts at 0, so a 0L default would
+            // make an UNSTAMPED Loaded match a never-replaced queue. -1L can never match, so anything that
+            // reaches a consumer unstamped reads as stale and is regenerated - FAIL-SAFE BY CONSTRUCTION
+            // rather than by argument. The asymmetry justifies it: a spurious regeneration costs one radio
+            // request and is invisible (see below), a missed one is the defect above.
+            //
+            // ⚠⚠ THIS ONLY WORKS BECAUSE state.radio HAS NO UI CONSUMER. Checked 2026-09-11:
+            // there is no collect() on it anywhere - the only references are PlayerCallback (which writes
+            // it and hands it to PlayerRadio) and PlayerService's PlayerRadio construction. Its consumers
+            // ask one question, "is this station still the one to continue", which is an IDENTITY question
+            // and exactly what an epoch answers. Had anything been rendering station state, an epoch could
+            // not have supplied it and this would have needed a real reset instead. That is why the answer
+            // here differs from what it would be for PlayerState.current.
+            val epoch: Long = -1L,
             val tracks: suspend (String?) -> Page<Track>?
         ) : Radio()
     }

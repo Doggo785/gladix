@@ -555,6 +555,10 @@ class ShufflePlayer(
     // misread as an extension fault. That is why every drop logs under tag GladixQueue. Stale_drop lines
     // appearing on ordinary transitions mean something new routes through a seam site, and the fix is
     // THERE, not at the append.
+    // ⚠️ NOT THE SAME COUNTER AS ResumptionUtils.queueGeneration, which is also monotonic and
+    // also "about the queue". That one tracks the PERSISTED queue (bumped on saveToQueue / clearQueue);
+    // this one tracks the LIVE queue being REPLACED. A debounced save bumps that and not this; a
+    // setMediaItems bumps this 300ms before that. See its note for the full comparison.
     @Volatile
     var queueEpoch: Long = 0L
         private set
