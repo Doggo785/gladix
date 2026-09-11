@@ -365,8 +365,8 @@ class PlayerRadio(
                 // append had the identical filter gap, and inherits the epoch check along with it.
                 val added = appendDeduped(
                     player, downloadFlow, app,
-                    extra.map { extension.id to it }, context, epoch, "throwbridge",
-                    seedKeysFor(context.id)
+                    extra.map { extension.id to it }, context, epoch,
+                    source = "throwbridge", seedKeys = seedKeysFor(context.id)
                 )
                 Log.d(
                     "GladixRadio",
@@ -691,10 +691,12 @@ class PlayerRadio(
             // Which append site this is, for the log line at the bottom. Required, not defaulted: a new
             // caller must name itself, because an untagged append is exactly what made the 2026-09-11
             // duplicate hunt undecidable.
-            source: String,
-            // Which append site this is, for the log line at the bottom. Required, not defaulted: a new
-            // caller must name itself, because an untagged append is exactly what made the 2026-09-11
-            // duplicate hunt undecidable.
+            // ⚠⚠ THE LAST TWO ARE PASSED BY NAME AT ALL FOUR CALL SITES, DELIBERATELY. This
+            // function takes six leading positional parameters, and on 2026-09-11 adding `source`
+            // between epoch and seedKeys silently slid every caller's seedKeys argument into the
+            // source slot - four identical "Set<String> where String expected" errors that said
+            // nothing about the actual cause. Naming the trailing arguments makes a future insertion
+            // here a compile error at the DECLARATION rather than a shifted meaning at the callers.
             source: String,
             // Every seed this station was generated from. Excluded unconditionally, at any distance -
             // see the note at stationSeeds for why this is NOT the same question as the window below.
@@ -869,8 +871,8 @@ class PlayerRadio(
 
             val appended = appendDeduped(
                 player, downloadFlow, app,
-                tracks.data.map { loaded.clientId to it }, loaded.context, epoch, "station_page",
-                seedKeysFor(loaded.context.id)
+                tracks.data.map { loaded.clientId to it }, loaded.context, epoch,
+                source = "station_page", seedKeys = seedKeysFor(loaded.context.id)
             )
             // Post-fallback total, which is what loadPlaylist gates the multi-seed escalation on. The
             // `appended` val above stays the PRE-fallback page count the Last.fm gate below asks about,
@@ -976,8 +978,8 @@ class PlayerRadio(
                         // extension.id (the searched extension) is the correct value.
                         totalAppended += appendDeduped(
                             player, downloadFlow, app,
-                            extra.map { extension.id to it }, loaded.context, epoch, "lastfm",
-                            seedKeysFor(loaded.context.id)
+                            extra.map { extension.id to it }, loaded.context, epoch,
+                            source = "lastfm", seedKeys = seedKeysFor(loaded.context.id)
                         )
                     }
                 } finally {
@@ -1328,8 +1330,8 @@ class PlayerRadio(
         }
 
         val appended = appendDeduped(
-            player, downloadFlow, app, merged, retained.first.context, epoch, "fanout",
-            seedKeysFor(retained.first.context.id)
+            player, downloadFlow, app, merged, retained.first.context, epoch,
+            source = "fanout", seedKeys = seedKeysFor(retained.first.context.id)
         )
         stateFlow.value =
             if (retained.second.continuation != null)
