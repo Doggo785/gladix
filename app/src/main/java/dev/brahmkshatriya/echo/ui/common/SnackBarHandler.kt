@@ -5,7 +5,9 @@ import android.view.ViewGroup
 import androidx.core.view.updateLayoutParams
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import com.google.android.material.snackbar.Snackbar
 import dev.brahmkshatriya.echo.MainActivity
 import dev.brahmkshatriya.echo.common.models.Message
@@ -25,7 +27,65 @@ class SnackBarHandler(
     // Pending snackbars, drained one at a time: create() only emits when nothing is showing, and remove()
     // emits the next on dismissal. Deliberately on the Koin SINGLETON so queued messages survive activity
     // recreation - do not move it to the Activity or clear it on recreate.
-    private val messages = mutableListOf<Message>()
+    private val messages = mutableListOf<Queued>()
+
+    // ⚠⚠ THE TIMESTAMP LIVES ON THE QUEUE ENTRY, NEVER ON Message. Message is in :common, i.e.
+    // the extension ABI - adding a field there carries the version-skew hazard documented at
+    // SearchFeedClient (an extension built against one shape, running against another). A private wrapper
+    // costs nothing and keeps the ABI untouched.
+    private data class Queued(val at: Long, val message: Message)
+
+    // ⚠⚠ ACCUMULATE UNGATED, RENDER GATED. THIS IS THE WHOLE FIX, AND THE SPLIT IS THE POINT.
+    //
+    // ⚠⚠ THE RULE, WHICH IS THE DURABLE PART: UNGATE A COLLECTOR THAT UPDATES STATE, NEVER ONE
+    // THAT PRESENTS A TRANSIENT VIEW.
+    // PlayerFragment's queueFlow collector was correctly made ungated - it calls submit(), which updates a
+    // data structure, is idempotent, and renders correctly whenever the view next becomes visible. So the
+    // obvious next step is "ungate setupSnackBar's observe() too". THAT IS WRONG AND STRICTLY WORSE THAN
+    // TODAY, and someone will propose it again, so here is the mechanism:
+    //   an ungated collector runs while STOPPED (lifecycleScope is cancelled only at DESTROYED);
+    //   Snackbar.show() would add the view to a hierarchy nobody is looking at;
+    //   its LENGTH_LONG timeout elapses invisibly;
+    //   onDismissed fires with event != DISMISS_EVENT_MANUAL;
+    //   which calls remove(message, dismissed = true) and DELETES IT FROM THIS QUEUE.
+    // The message is silently CONSUMED without ever being seen. Today it at least stays queued. Ungating
+    // converts a delivery failure into a DESTRUCTIVE one.
+    // A snackbar is an event WITH A DURATION; running it while invisible spends the duration and destroys
+    // the event. A state update has no duration and cannot be spent.
+    //
+    // So the accumulate step - which is pure state work - is ungated here on app.scope, and the RENDER step
+    // stays lifecycle-gated in setupSnackBar. That also means every emitter is captured with ZERO call-site
+    // changes: there are 32 direct app.messageFlow.emit callers across the app (Download, Login, AppUpdater,
+    // PlayerViewModel, PlayerCallback, SaveToPlaylist, MediaDetails and more), and only a handful ever
+    // reached create(). Routing them by hand would have been the bulk of the work and a standing trap for
+    // every emitter added later.
+    //
+    // ⚠️ SYNCHRONIZED, WHICH THE ORIGINAL DID NOT NEED. create()/remove() were both called from
+    // lifecycleScope, i.e. Main only. This collector runs on app.scope (IO), so `messages` is now genuinely
+    // touched from two threads.
+    // ⚠️ maxQueuedMessages and messageTtlMs are declared BELOW this block and read by enqueue().
+    // Safe because launch() only SCHEDULES the collector - the lambda body runs after construction
+    // completes, by which point every property is initialized. It would NOT be safe if this were ever
+    // changed to collect synchronously here.
+    init {
+        app.scope.launch { messageFlow.collect { enqueue(it) } }
+    }
+
+    private fun enqueue(message: Message) = synchronized(messages) {
+        val now = System.currentTimeMillis()
+        messages.removeAll { now - it.at > messageTtlMs }
+        if (messages.none { it.message.dedupeKey() == message.dedupeKey() }) {
+            messages.add(Queued(now, message))
+            while (messages.size > maxQueuedMessages) messages.removeAt(0)
+        }
+    }
+
+    /** The oldest message still worth showing, or null. Prunes expired entries as a side effect. */
+    fun pending(): Message? = synchronized(messages) {
+        val now = System.currentTimeMillis()
+        messages.removeAll { now - it.at > messageTtlMs }
+        messages.firstOrNull()?.message
+    }
 
     // Dedupe by VALUE, not by Message identity. `messages.contains(message)` compared whole Messages, and
     // Message.action holds a LAMBDA - lambdas have no structural equality, so two identical actionable
@@ -45,17 +105,49 @@ class SnackBarHandler(
     // Drop OLDEST: a queue this deep is stale, and the newest message describes the current state.
     private val maxQueuedMessages = 16
 
-    suspend fun create(message: Message) {
-        if (messages.isEmpty()) messageFlow.emit(message)
-        if (messages.none { it.dedupeKey() == message.dedupeKey() }) {
-            messages.add(message)
-            while (messages.size > maxQueuedMessages) messages.removeAt(0)
-        }
-    }
+    // ⚠⚠ 60s, AND IT DOES TWO JOBS - THE SECOND ONE IS NOT OBVIOUS AND IS EASY TO BREAK.
+    // JOB 1, STALENESS: a message queued while the Activity was stopped and shown on the next launch can be
+    // worse than dropping it - "Playing X" an hour later is noise. The driver for the VALUE is the
+    // motivating case, returning from the system "install unknown apps" screen (AppUpdater), which is
+    // seconds to tens of seconds. 60s covers a realistic detour and discards anything from a previous
+    // session. (restoreCache's 90s answers a DIFFERENT question - whether a cached computation is still
+    // valid - so it is not a precedent for this number, only for having one.)
+    // ⚠️ JOB 2, ROUTING: because the accumulator above is indiscriminate, THIS TTL IS NOW THE
+    // ENTIRE MECHANISM by which background-originated messages fail to surface on a later phone launch.
+    // Three are AA- or playback-originated and can fire with no Activity at all:
+    //     AndroidAutoCallback:1027   some_tracks_couldnt_be_restored
+    //     PlayerEventListener:1298   server_error_skipping
+    //     PlayerEventListener:1569   removed_extension_playback_stopped
+    // "List is empty" surfacing on a phone launch for something that happened in the car is worse than
+    // dropping it, and only the TTL prevents that. SO CHANGING THIS VALUE SILENTLY CHANGES ROUTING
+    // BEHAVIOUR, not just freshness. If 60s proves too generous, those three are the opt-out candidates -
+    // but note an exclusion mechanism would need a marker ON Message, which is ABI-frozen, so the honest
+    // alternatives are a shorter TTL or a second flow, not a flag.
+    private val messageTtlMs = 60_000L
+
+    // ⚠⚠ [FIXED] THIS USED TO WEDGE, AND THE WEDGE - NOT THE LOST MESSAGE - IS THE STRONGEST
+    // REASON THIS WORK EXISTS. It read:
+    //     if (messages.isEmpty()) messageFlow.emit(message)
+    //     if (messages.none { ... }) { messages.add(message); ... }
+    // so it emitted ONLY when the queue was empty. If that one emission was lost - e.g. the Activity was
+    // stopped, since messageFlow is replay = 0 with a single lifecycle-gated subscriber - the message was
+    // still ADDED, and from then on the queue was non-empty, so NOTHING EMITTED AGAIN. The only other
+    // emitter is remove(), which needs a snackbar to be dismissed, which needs one to have been shown.
+    // Net: the queue could hold up to 16 undelivered messages INDEFINITELY with no trigger to show them.
+    // That is a wedge, not a dropped message, and it is independent of the lifecycle gate.
+    // Now: create() only emits. The accumulator above queues every emission, and setupSnackBar renders the
+    // head on STARTED, so a lost emission is recovered on the next visible frame rather than stranding the
+    // queue behind it.
+    suspend fun create(message: Message) = messageFlow.emit(message)
 
     suspend fun remove(message: Message, dismissed: Boolean) {
-        if (dismissed) messages.remove(message)
-        if (messages.isNotEmpty()) messageFlow.emit(messages.first())
+        val next = synchronized(messages) {
+            if (dismissed) messages.removeAll { it.message === message }
+            messages.firstOrNull()?.message
+        }
+        // Re-entering the accumulator is harmless: dedupeKey already matches the entry still in the queue,
+        // so it is not added twice.
+        if (next != null) messageFlow.emit(next)
     }
 
     companion object {
@@ -94,6 +186,18 @@ class SnackBarHandler(
 
             observe(handler.messageFlow) { message ->
                 createSnackBar(message)
+            }
+            // ⚠⚠ RENDER DIRECTLY, DO NOT RE-EMIT. Re-emitting into messageFlow to "replay" the
+            // pending head would reintroduce the EXACT race being fixed: if the replay beat
+            // flowWithLifecycle's resubscription, it would be dropped the same way the original was.
+            // Calling createSnackBar straight has no subscriber to lose and therefore no ordering hazard -
+            // which matters, because call order has decided six separate designs this week.
+            // Guarded on snackBars being empty so this cannot double-show a message the observer above is
+            // already displaying when a new one arrives as we reach STARTED.
+            lifecycleScope.launch {
+                repeatOnLifecycle(Lifecycle.State.STARTED) {
+                    if (snackBars.isEmpty()) handler.pending()?.let { createSnackBar(it) }
+                }
             }
             observe(uiViewModel.combined) { _ ->
                 snackBars.values.forEach { updateInsets(it) }

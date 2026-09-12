@@ -158,7 +158,10 @@ open class FeedClickListener(
         extensionId: String?,
         context: EchoMediaItem?,
         tracks: List<Track>?,
-        pos: Int
+        pos: Int,
+        // Whether these tracks came from an ORDERED collection. Defaulted true so any caller or override
+        // that does not pass it keeps today's queueing behaviour, which is the safe direction.
+        ordered: Boolean = true,
     ): Boolean {
         if (extensionId == null) return notFoundSnack(R.string.extension)
         if (tracks.isNullOrEmpty()) return notFoundSnack(R.string.tracks)
@@ -168,9 +171,30 @@ open class FeedClickListener(
         // the seed and APPENDS the generated radio server-side — mirroring phone's setQueue+auto-radio, but
         // explicit so it works on TV where auto-radio never fires (the seed used to loop). Videos are
         // excluded (a "<title> Radio" label doesn't fit video). Multi-track / in-context taps queue normally.
+        // ⚠⚠ THIS PREDICATE MUST KEY ON `ordered` ALONE, PLUS THE VIDEO EXCLUSION. IT MUST NOT
+        // REGAIN A `tracks.size == 1` TERM. THAT IS THE MOST IMPORTANT LINE IN THIS FILE.
+        // It used to read `context == null && tracks.size == 1 && ...`, and search worked ONLY because
+        // SearchFragment overrode this method to MANUFACTURE a 1-element list. Search results are
+        // Shelf.Lists.Items, so with that override gone the list is the full run and a size term would
+        // silently stop radioing on the one screen that already worked - no crash, no log, just a tap that
+        // queues instead of starting a radio.
+        // ⚠️ THAT IS THE 2026 LESSON IN A NEW COSTUME. The earlier reroute of this same branch
+        // was believed TV-only, regressed phone, and the lesson recorded was "different code = new failure
+        // modes; prove phone paths untouched, not just same-outcome". A size term left in by habit is
+        // exactly that: same intent, different path, silent regression.
+        //
+        // ⚠️ `context` IS GONE FROM THE TEST DELIBERATELY, NOT DROPPED BY ACCIDENT. It is
+        // FEED-WIDE, not per-shelf - toFeedType threads one value (FeedData's state.item, i.e. what the
+        // FEED is about) into every row - so it cannot distinguish two shelves on the same screen. A
+        // discrete "related tracks" row on an album page has context = that Album and should still radio.
+        //
+        // ⚠⚠ AND "JUST MOVE SearchFragment'S OVERRIDE INTO getFeedListener" IS WRONG, which is
+        // worth stating because it is the obvious-looking fix. That override works by flattening the list
+        // to one element, which DESTROYS THE SURROUNDING RUN - generalising it would turn every album and
+        // playlist tap into a radio on that one track. The shelf kind is the real signal; list size was
+        // only ever a proxy for it.
         val single = tracks.getOrNull(pos)?.takeIf {
-            context == null && tracks.size == 1 &&
-                it.type != Track.Type.Video && it.type != Track.Type.HorizontalVideo
+            !ordered && it.type != Track.Type.Video && it.type != Track.Type.HorizontalVideo
         }
         val vm by fragment.activityViewModels<PlayerViewModel>()
         if (single != null) {

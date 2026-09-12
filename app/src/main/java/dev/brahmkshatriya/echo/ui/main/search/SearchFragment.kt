@@ -20,12 +20,10 @@ import com.google.android.material.transition.MaterialSharedAxis
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import dev.brahmkshatriya.echo.R
 import dev.brahmkshatriya.echo.common.clients.SearchFeedClient
-import dev.brahmkshatriya.echo.common.models.EchoMediaItem
 import dev.brahmkshatriya.echo.common.models.Feed
 import dev.brahmkshatriya.echo.common.models.Feed.Buttons.Companion.EMPTY
 import dev.brahmkshatriya.echo.common.models.QuickSearchItem
 import dev.brahmkshatriya.echo.common.models.Shelf
-import dev.brahmkshatriya.echo.common.models.Track
 import dev.brahmkshatriya.echo.databinding.FragmentSearchBinding
 import dev.brahmkshatriya.echo.extensions.ExtensionUtils.getAs
 import dev.brahmkshatriya.echo.extensions.ExtensionUtils.getExtension
@@ -106,19 +104,15 @@ class SearchFragment : Fragment(R.layout.fragment_search) {
 
     private val listener by lazy {
         val nav = if (argId == null) requireParentFragment() else this
-        object : FeedClickListener(this@SearchFragment, nav.parentFragmentManager, nav.id) {
-            override fun onTracksClicked(
-                view: View?, extensionId: String?, context: EchoMediaItem?,
-                tracks: List<Track>?, pos: Int
-            ): Boolean {
-                // Search "radio": play the tapped track as a single seed with NO context, so the base
-                // handler's single-track branch routes to playTrackRadio (seed first, then appended radio).
-                // The "<title> Radio" header/context is built there. Previously wrapped it in a placeholder
-                // Radio context + setQueue, which relied on auto-radio (which never fires on TV).
-                val track = tracks?.getOrNull(pos)
-                return super.onTracksClicked(view, extensionId, null, track?.let { listOf(it) }, 0)
-            }
-        }
+        // ⚠⚠ THE onTracksClicked OVERRIDE THAT USED TO LIVE HERE IS GONE, AND ITS ABSENCE IS
+        // THE POINT. It forced context = null and flattened tracks to a 1-element list so the base
+        // single-track branch would route to playTrackRadio. That made the rule TRUE ON THIS SCREEN
+        // ONLY, by manufacturing the inputs the branch tested for.
+        // The branch now keys on FeedType.orderedList instead, which is derived from the shelf kind at
+        // toFeedType. Deezer search returns Shelf.Lists.Items, so its track rows are discrete and
+        // still radio - SAME BEHAVIOUR, DIFFERENT MECHANISM. Do not reintroduce this override: it
+        // would discard the surrounding run, which is exactly what the new rule exists to preserve.
+        FeedClickListener(this@SearchFragment, nav.parentFragmentManager, nav.id)
     }
 
     private val feedAdapter by lazy {

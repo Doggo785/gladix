@@ -455,7 +455,7 @@ class PlayerCallback(
             clearMediaItems()
             shuffleModeEnabled = false
         }
-        PlayerRadio.play(player, downloadFlow, app, radioFlow, loaded, extension)
+        PlayerRadio.play(player, downloadFlow, app, radioFlow, loaded, extension, source = "radioCmd")
         player.with { play() }
         SessionResult(RESULT_SUCCESS)
     }
@@ -532,6 +532,17 @@ class PlayerCallback(
         // startRadio returns on its first line, so TODAY a YTM track radio gets NO rescue at all in that
         // configuration. The accident only ever worked with the setting on. So this removal rests on a
         // fix that was doing more than unblocking it.
+        // ⚠⚠ TAGGED GladixQueue, NOT GladixRadio, DELIBERATELY - THIS IS A DIAGNOSTIC AND THE
+        // CAPTURE FILTER IS PART OF WHAT IT HAS TO SURVIVE. Two device captures on 2026-09-11 showed a
+        // single GladixQueue line and no GladixRadio lines at all, and with a healthy station the ONLY
+        // GladixRadio line either run should have produced was the suppression itself - so "trackRadio
+        // never ran" and "GladixRadio was not in the filter" are indistinguishable from those captures.
+        // Logging entry under the tag that is demonstrably being captured removes that ambiguity whichever
+        // way it turns out.
+        // ⚠️ THIS LINE IS TIME-BOXED, like STALE_STATION: remove it once a capture shows
+        // TRACKRADIO and LOADPLAYLIST reason=track_radio_generating together, which is the pair that proves
+        // the duplicate suppression works end to end.
+        Log.d("GladixQueue", "TRACKRADIO ext=$extId seed=${seed.title}")
         PlayerRadio.markTrackRadioGenerating(true)
         try {
             player.with {
@@ -568,7 +579,9 @@ class PlayerCallback(
                 val loaded = PlayerRadio.start(
                     throwableFlow, extension, seed, context, onFailure = { startFailure = it }
                 )
-                if (loaded != null) PlayerRadio.play(player, downloadFlow, app, radioFlow, loaded, extension)
+                if (loaded != null) PlayerRadio.play(
+                    player, downloadFlow, app, radioFlow, loaded, extension, source = "trackRadio"
+                )
                 // ⚠⚠ THE SAME NULL-STATION FAILURE loadPlaylist BRIDGES, AND UNTIL 2026-09-11
                 // THIS PATH HAD NO BRIDGE AT ALL. On YTM the rescue still happened, but only BY ACCIDENT:
                 // the one-item queue set above has no next item, so onTimelineChanged reaches

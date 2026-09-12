@@ -19,8 +19,13 @@ class EditPlaylistSearchClickListener(fragment: Fragment) : FeedClickListener(
         parentFragment.viewModels<EditPlaylistSearchViewModel>().value
     }
 
+    // ⚠️ `ordered` is declared but UNUSED here, and must be: Kotlin requires an override to
+    // repeat the full parameter list (without the default). This listener adds the tapped track to a
+    // playlist and never reaches the base branch, so the ordered/discrete distinction is irrelevant
+    // to it - but the parameter has to exist or this stops compiling.
     override fun onTracksClicked(
-        view: View?, extensionId: String?, context: EchoMediaItem?, tracks: List<Track>?, pos: Int
+        view: View?, extensionId: String?, context: EchoMediaItem?, tracks: List<Track>?, pos: Int,
+        ordered: Boolean
     ): Boolean {
         val track = tracks?.getOrNull(pos) ?: return notFoundSnack(R.string.track)
         viewModel.addTrack(track)

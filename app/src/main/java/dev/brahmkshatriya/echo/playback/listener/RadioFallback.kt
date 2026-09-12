@@ -168,7 +168,12 @@ object RadioFallback {
         // reason carries the TERMINAL CAUSE and the counts carry the shape; neither alone is enough.
         fun log(reason: String, similar: Int = 0, searched: Int = 0, matched: Int = 0) = Log.d(
             "GladixRadio",
-            "LASTFM q=\"$q\" reason=$reason similar=$similar searched=$searched matched=$matched " +
+            // ⚠️ artist= IS BROKEN OUT OF q DELIBERATELY. q reads as one opaque string and a
+            // placeholder artist hides inside it - "Unknown - Doug The Jitterbug" looked like a
+            // Last.fm coverage problem for an hour when it was a metadata TIMING problem. A separate
+            // field is skimmable; a composite is not.
+            "LASTFM q=\"$q\" artist=\"$artist\" reason=$reason similar=$similar " +
+                "searched=$searched matched=$matched " +
                 "ms=${System.currentTimeMillis() - started}"
         )
 

@@ -34,7 +34,10 @@ class MediaGridViewHolder(
                         return@setOnClickListener
                     }
                     val (tracks, pos) = getAllTracks(feed!!)
-                    listener.onTracksClicked(it, feed?.extensionId, feed?.context, tracks, pos)
+                    listener.onTracksClicked(
+                        it, feed?.extensionId, feed?.context, tracks, pos,
+                        ordered = feed?.orderedList ?: true
+                    )
                 }
 
                 else -> listener.onMediaClicked(it, feed?.extensionId, item, feed?.context)
