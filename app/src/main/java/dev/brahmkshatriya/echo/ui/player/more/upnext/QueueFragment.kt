@@ -45,6 +45,25 @@ class QueueFragment : Fragment() {
     // pendingList across would have been the faithful-looking choice and the worse one.
     private var submitSuppressed = false
 
+    // ⚠⚠ PERMANENT, KEEP WHEN THE PROBE BELOW IS DELETED: ItemTouchHelper CAPTURES
+    // mSelectedStartY ONCE AND NEVER RE-CAPTURES IT. Read from recyclerview 1.4.0:
+    //   :687  mSelectedStartY = selected.itemView.getTop();     <- only assignment, inside select()
+    //   :774  int curY = (int) (mSelectedStartY + mDy);         <- the auto-scroll trigger's position term
+    //   :801  mRecyclerView.scrollBy(scrollX, scrollY);         <- moves EVERY child, including this one
+    // So the moment drag auto-scroll fires once, every child shifts while mSelectedStartY stays at the
+    // value it had at pickup. curY then over-states how far out of bounds the tile is by the WHOLE
+    // accumulated scroll, which feeds straight back into the next frame's scroll amount.
+    // moveIfNecessary's row swaps move it too, with the same absence of a re-capture.
+    // ⚠️ CONSEQUENCE, AND IT IS NOT SCREEN-SPECIFIC: any drag auto-scroll on ANY screen
+    // accelerates FASTER than Callback.interpolateOutOfBoundsScroll's 2s ramp alone implies, because the
+    // out-of-bounds magnitude it is fed is itself growing. Two compounding terms, only one of them
+    // documented. Recorded because it reads as a per-screen quirk and is a library-wide one.
+    // It explains RUNAWAY, NOT ONSET - the first frame's curY is not yet corrupted, which is exactly why
+    // the probe below logs only that frame.
+    private var dragStartTop: Int? = null
+    private var dragItemView: android.view.View? = null
+    private var oobRun = 0
+
     override fun onCreateView(
         inflater: LayoutInflater,
         container: ViewGroup?,
@@ -57,6 +76,7 @@ class QueueFragment : Fragment() {
     private val queueAdapter: QueueAdapter by lazy {
         QueueAdapter(object : QueueAdapter.Listener() {
             override fun onDragHandleTouched(viewHolder: RecyclerView.ViewHolder) {
+                android.util.Log.d("GladixQueue", "QUEUEDRAG handleTouched -> startDrag")
                 touchHelper.startDrag(viewHolder)
             }
 
@@ -92,6 +112,7 @@ class QueueFragment : Fragment() {
                     viewModel.queue.indexOfFirst { it.mediaId == c.mediaItem.mediaId }
                 } ?: -1
                 if (currentPos != -1 && toPos <= currentPos) return false
+                android.util.Log.d("GladixQueue", "QUEUEDRAG onMove $fromPos->$toPos")
                 viewModel.moveQueueItems(fromPos, toPos)
                 return true
             }
@@ -102,7 +123,16 @@ class QueueFragment : Fragment() {
                 viewHolder: RecyclerView.ViewHolder?, actionState: Int
             ) {
                 super.onSelectedChanged(viewHolder, actionState)
-                if (actionState == ItemTouchHelper.ACTION_STATE_DRAG) isDragging = true
+                if (actionState == ItemTouchHelper.ACTION_STATE_DRAG) {
+                    isDragging = true
+                    // Captured at the same instant, and from the same expression, as ItemTouchHelper's own
+                    // mSelectedStartY (:687) - so the log can show whether that value has gone stale.
+                    dragStartTop = viewHolder?.itemView?.top
+                    dragItemView = viewHolder?.itemView
+                }
+                android.util.Log.d(
+                    "GladixQueue", "QUEUEDRAG selected state=$actionState armed=$isDragging"
+                )
             }
 
             // ⚠⚠ REACHABILITY IS TOTAL; THE TIMING IS DELIBERATELY NOT IMMEDIATE - READ BOTH
@@ -119,7 +149,13 @@ class QueueFragment : Fragment() {
                 recyclerView: RecyclerView, viewHolder: RecyclerView.ViewHolder
             ) {
                 super.clearView(recyclerView, viewHolder)
+                android.util.Log.d(
+                    "GladixQueue", "QUEUEDRAG clearView suppressed=$submitSuppressed"
+                )
                 isDragging = false
+                dragStartTop = null
+                dragItemView = null
+                oobRun = 0
                 if (!submitSuppressed) return
                 submitSuppressed = false
                 // ⚠⚠ NO SCROLL ON THE CATCH-UP, AND THE RECORD IS WHY. The
@@ -134,6 +170,48 @@ class QueueFragment : Fragment() {
                 // is exactly where it was, dragging the viewport away from the drop the user is looking at
                 // at the worst possible moment - the instant they lift.
                 submit(scroll = false)
+            }
+
+            // ⚠⚠ TEMPORARY PROBE - REMOVE THIS WHOLE OVERRIDE ONCE ONE CAPTURE IS READ.
+            // THE QUESTION IT ANSWERS: why does drag auto-scroll fire with the tile MID-LIST, when
+            // topDiff = curY - mTmpRect.top - getPaddingTop() should be comfortably positive there? All
+            // three terms were checked against source and none explains it - paddingTop is 4dp from
+            // fragment_player_queue.xml (PlayerMoreFragment's inset lands on the SHEET's root, not this
+            // list), mTmpRect.top is 0 because this screen adds no ItemDecoration, and mSelectedStartY is
+            // in the RecyclerView's own space, matching getPaddingTop(). The expression should not fire.
+            // ONLY THE FIRST FRAME OF EACH SCROLL RUN IS LOGGED, and that is the point rather than tidiness:
+            // ItemTouchHelper sets mDragScrollStartTimeInMs AFTER calling this (:798-800), so
+            // msSinceStartScroll == 0 marks the frame BEFORE any scrollBy has happened - the only frame
+            // whose curY is not already corrupted by the stale-mSelectedStartY drift noted above. Every
+            // later frame describes the runaway, not the onset.
+            // `viewSizeOutOfBounds` IS topDiff (negative, upward) or bottomDiff (positive, downward) - the
+            // exact quantity that should not be crossing zero here.
+            // CANNOT FIRE OUTSIDE A DRAG ON THIS SCREEN BY CONSTRUCTION: the library calls this only from
+            // scrollIfNecessary, which returns early unless mSelected != null (:746), and this override
+            // exists only on QueueFragment's callback.
+            // REMOVAL CONDITION: delete once the first line has been read once. Either topDiff arrives
+            // negative mid-list - and the four numbers say which term is not what source says - or this
+            // never prints, which means the scroll is not scrollIfNecessary's and the identification is
+            // wrong. Both outcomes end the probe.
+            override fun interpolateOutOfBoundsScroll(
+                recyclerView: RecyclerView,
+                viewSize: Int,
+                viewSizeOutOfBounds: Int,
+                totalSize: Int,
+                msSinceStartScroll: Long
+            ): Int {
+                if (msSinceStartScroll == 0L) {
+                    oobRun++
+                    android.util.Log.d(
+                        "GladixQueue",
+                        "QUEUEDRAG oob#$oobRun outOfBounds=$viewSizeOutOfBounds tileH=$viewSize " +
+                            "rvH=$totalSize padTop=${recyclerView.paddingTop} " +
+                            "startTop=$dragStartTop nowTop=${dragItemView?.top}"
+                    )
+                }
+                return super.interpolateOutOfBoundsScroll(
+                    recyclerView, viewSize, viewSizeOutOfBounds, totalSize, msSinceStartScroll
+                )
             }
 
             override fun onSwiped(viewHolder: RecyclerView.ViewHolder, direction: Int) {
@@ -159,6 +237,7 @@ class QueueFragment : Fragment() {
     }
 
     private fun submitOrDefer() {
+        android.util.Log.d("GladixQueue", "QUEUEDRAG submitOrDefer dragging=$isDragging")
         if (isDragging) {
             submitSuppressed = true
             return
@@ -182,6 +261,9 @@ class QueueFragment : Fragment() {
         }
         queueAdapter.submitList(it) {
             if (!scroll || fullCurrentIndex < 0) return@submitList
+            android.util.Log.d(
+                "GladixQueue", "QUEUEDRAG scrollToPosition idx=$fullCurrentIndex dragging=$isDragging"
+            )
             binding?.root?.scrollToPosition(fullCurrentIndex)
         }
     }
@@ -207,6 +289,34 @@ class QueueFragment : Fragment() {
 
         // BOTH observers defer: a track transition during a drag would scroll just as disruptively as a
         // queue mutation, and playerState.current fires on every play/pause too.
+        // ⚠⚠ TEMPORARY DISCRIMINATOR - REMOVE THE WHOLE QUEUEDRAG SET ONCE ONE CAPTURE READS.
+        // THE TWO MECHANISMS THIS SEPARATES, and they predict OPPOSITE log shapes:
+        //  (A) A RESUBMIT SCROLLS THE LIST. Then exactly ONE `QUEUEDRAG scrollToPosition idx=<n>` line
+        //      appears at the moment of the jump, with `dragging=false` next to it, followed by ONE large
+        //      `scrolled dy=`. That is the mechanism the isDragging guard was built for, and a
+        //      `dragging=false` there means the guard is INERT rather than wrong.
+        //  (B) ItemTouchHelper's OWN AUTO-SCROLL. Then NO scrollToPosition line appears at all, and
+        //      instead a STREAM of `scrolled dy=-N` lines runs for seconds with |dy| STARTING SMALL AND
+        //      GROWING. That growth is the signature: Callback.interpolateOutOfBoundsScroll
+        //      (ItemTouchHelper.java:2175-2190, recyclerview 1.4.0) multiplies speed by
+        //      msSinceStartScroll / DRAG_SCROLL_ACCELERATION_LIMIT_TIME_MS (:1429, = 2000), i.e. a linear
+        //      ramp from zero to full over the first two seconds. A 3-4 SECOND CREEP ENDING AT THE TOP IS
+        //      THE SHAPE OF THAT RAMP, and nothing in our own code has a 3-4s cadence - the timers in this
+        //      path are 50ms (emitFullQueue), 300ms (ResumptionUtils, PlayerEventListener) and a bare
+        //      `post` (ShufflePlayer reconstitution). THE ABSENCE OF A MATCHING TIMER IS ITSELF EVIDENCE.
+        //  (C) `QUEUEDRAG selected` never appears -> onSelectedChanged is not firing on the live callback
+        //      and the guard never armed. Rules on question 3 outright.
+        // Scroll logging is gated on isDragging so ordinary browsing does not flood the capture.
+        binding!!.root.addOnScrollListener(object : RecyclerView.OnScrollListener() {
+            override fun onScrolled(rv: RecyclerView, dx: Int, dy: Int) {
+                // ⚠⚠ UNGATED ON PURPOSE - THE FIRST VERSION OF THIS LINE GATED ON isDragging
+                // AND THAT MADE IT BLIND TO THE LEADING HYPOTHESIS. If the flag never arms, a gated log
+                // prints nothing, and "nothing scrolled" is then indistinguishable from "scrolled while
+                // the guard was inert" - the two outcomes the capture exists to separate. `dragging=` on
+                // every line carries the flag state instead.
+                android.util.Log.d("GladixQueue", "QUEUEDRAG scrolled dy=$dy dragging=$isDragging")
+            }
+        })
         observe(viewModel.playerState.current) { submitOrDefer() }
         observe(viewModel.queueFlow) { submitOrDefer() }
 

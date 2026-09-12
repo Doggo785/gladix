@@ -82,7 +82,28 @@ data class PlayerState(
     // consumed at the FIRST STATE_READY in PlayerEventListener, which re-seeks now that the real timeline
     // exists. mediaId-guarded so a track the user plays during the restore's buffering window can't be seeked
     // to the stale position. Main-only (same application-looper invariant as resumptionApplying above).
-    var pendingRestoreSeek: Pair<String, Long>? = null
+    // ⚠⚠ [FIXED 2026-09-12] EPOCH-KEYED. THE MECHANISM, WHICH IS A CLASS AND NOT AN INSTANCE:
+    // ARMED AT COLD START, CONSUMED BY AN UNRELATED EVENT. There are three writes to this latch in the
+    // whole tree - two arms (applyRestoreIfCold, onPlaybackResumption) and ONE clear, inside
+    // consumeRestoreSeek. NOTHING clears it on a user action, a queue replacement, or a timeout. So if the
+    // restored queue never reaches STATE_READY - a cold start where the user does not press play, which is
+    // exactly the reproduction - the latch simply waits, and THE FIRST STATE_READY OF THE SESSION BELONGS
+    // TO WHATEVER THE USER TAPS NEXT. Reported symptom: tapping a track in search results after a cold
+    // start starts it mid-song; without a cold start the same tap correctly restarts.
+    // ⚠⚠ AND BOTH EXISTING GUARDS ARE SATISFIED BY THE THING THEY WERE MEANT TO EXCLUDE - THE
+    // GUARD'S SUCCESS CONDITION IS THE BUG'S PRECONDITION. The mediaId check was written so "a track the
+    // user plays during the restore's buffering window can't be seeked to the stale position": it rejects a
+    // DIFFERENT track and permits the SAME one. Tapping the already-restored track satisfies it BY BEING
+    // IDENTICAL. The RESTORE_SEEK_BELT_MS belt passes too, because a freshly tapped track sits at 0 - the
+    // belt was meant to detect "the user already seeked", and a fresh start looks exactly like "untouched".
+    // Fourth marker this session whose check looks like a guard and answers a different question; see also
+    // DeezerTrackClient's TRACK_TOKEN self-heal gate, which reads as availability and answers provenance.
+    // ⚠️ THE EPOCH IS NULLABLE, AND null IS A REAL STATE - "THIS ARM COULD NOT CAPTURE A VALID
+    // EPOCH", NOT "UNKNOWN". Read the note at each arming site before changing either. A nullable field
+    // rather than a magic number precisely so nobody later reads a sentinel as a real epoch.
+    data class RestoreSeek(val mediaId: String, val positionMs: Long, val epoch: Long?)
+
+    var pendingRestoreSeek: RestoreSeek? = null
 
     // Route-state gate for the BT/car/AA "phantom PLAY" fix. True when there is NO external audio route
     // AND Android Auto is not connected — i.e. we are "post-disconnect". Written by PlayerService from

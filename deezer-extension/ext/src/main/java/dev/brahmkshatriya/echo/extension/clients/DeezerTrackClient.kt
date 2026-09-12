@@ -220,6 +220,19 @@ class DeezerTrackClient(private val deezerExtension: DeezerExtension, private va
         // failure, readable cause.
         // The fourth call site, DeezerRadioClient's seed fetch, is runCatching{}.getOrNull() - absorbed
         // like this one.
+        // ⚠⚠ THIS GATE FIRES ON PROVENANCE, NOT ON AVAILABILITY - AND IT READS LIKE THE
+        // OPPOSITE, WHICH IS WHY IT IS WRITTEN DOWN. An empty TRACK_TOKEN means the track LOST ITS EXTRAS
+        // somewhere - restored from a saved queue, recovered from history, or slimmed - because
+        // HistoryEntity.toSlim does `extras = emptyMap()` wholesale. It says NOTHING about whether the
+        // track can play. Re-fetching in that case is correct and this gate is right; what is wrong is
+        // reading the emptiness as a property of the track.
+        // ⚠️ MEASURED THE WRONG WAY ONCE, COST TWO CAPTURES: on 2026-09-12 an unplayable-track
+        // investigation observed this gate opening 12 times out of 12 on tracks that would not play, and
+        // took empty-token as an availability signal. The next capture refuted it outright - the record it
+        // caught was an unplayable track WITH a token and every FILESIZE variant at zero, and the
+        // no-token slot never fired at all. The correlation was real and the causation was backwards:
+        // both the refusals and the empty tokens follow from how those tracks REACHED the player.
+        // Do not reuse this condition as an availability test. See the pattern note at HistoryEntity.toSlim.
         val track = if (original.extras["TRACK_TOKEN"].isNullOrEmpty()) {
             val fresh = runCatching {
                 api.track(original.id, "loadTrack.selfheal")["results"]?.jsonObject?.let { results ->

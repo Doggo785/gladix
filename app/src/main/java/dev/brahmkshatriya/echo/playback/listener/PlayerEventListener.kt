@@ -38,6 +38,8 @@ import dev.brahmkshatriya.echo.playback.MediaItemUtils
 import dev.brahmkshatriya.echo.playback.MediaItemUtils.extensionId
 import dev.brahmkshatriya.echo.playback.MediaItemUtils.isLoaded
 import dev.brahmkshatriya.echo.playback.MediaItemUtils.retries
+import dev.brahmkshatriya.echo.playback.PlayerState
+import dev.brahmkshatriya.echo.playback.queueEpochOrZero
 import dev.brahmkshatriya.echo.playback.PlayerCommands.getLikeButton
 import dev.brahmkshatriya.echo.playback.PlayerCommands.getRepeatButton
 import dev.brahmkshatriya.echo.playback.PlayerCommands.getShuffleButton
@@ -92,7 +94,7 @@ class PlayerEventListener(
     // Returns-and-clears PlayerState.pendingRestoreSeek (the cold-start re-seek latch). Wired from
     // PlayerService like onQueueApplied; this listener is not given PlayerState directly. Returns null once
     // consumed, so it fires at most once per cold restore.
-    private val consumeRestoreSeek: () -> Pair<String, Long>? = { null },
+    private val consumeRestoreSeek: () -> PlayerState.RestoreSeek? = { null },
     // Non-consuming PEEK at PlayerState.pendingRestoreSeek — true iff the cold-start re-seek latch is armed.
     // Never clears it (unlike consumeRestoreSeek), so it can gate the saveCurrentPos 0-write below WITHOUT
     // stealing the latch the STATE_READY re-seek depends on. Wired from PlayerService like the others; fires
@@ -455,11 +457,37 @@ class PlayerEventListener(
             // windowed-index seeks). Guarded so it fires exactly once and loses to a user action: mediaId must
             // still be the restored track (not one the user tapped mid-buffer), and currentPosition must still
             // be at the start (a user seek before this READY moves it past the belt and we leave it alone).
-            consumeRestoreSeek()?.let { (id, pos) ->
-                if (player.currentMediaItem?.mediaId == id
+            consumeRestoreSeek()?.let { seek ->
+                // ⚠⚠ EPOCH FIRST, BEFORE THE TWO OLD GUARDS - THEY CANNOT DECIDE THIS. Read the
+                // mechanism note at PlayerState.pendingRestoreSeek: the latch has no timeout and nothing
+                // clears it on a user action, so after a cold start where the user never pressed play, THIS
+                // STATE_READY can belong to a track the user just tapped. mediaId and the belt are both
+                // SATISFIED by that case - same track, position 0 - because they were written to catch a
+                // DIFFERENT track during the restore's own buffering window.
+                // The epoch is the only term that separates "the queue this position was saved for" from
+                // "a queue the user built afterwards": any user tap replaces the queue, which bumps
+                // queueEpoch structurally at ShufflePlayer's own overrides.
+                // ⚠️ null MEANS UNKEYED AND IS NOT A FAILURE - the onPlaybackResumption arm
+                // cannot read a valid epoch (Media3 applies the queue after that function returns), so it
+                // arms unkeyed and keeps today's behaviour. See the residual note at that site.
+                val staleQueue = seek.epoch != null && seek.epoch != player.queueEpochOrZero
+                if (staleQueue) Log.d(
+                    "GladixPlayback",
+                    "RESTORE_SEEK dropped=${seek.mediaId} builtFor=${seek.epoch} now=${player.queueEpochOrZero}"
+                )
+                if (!staleQueue
+                    && player.currentMediaItem?.mediaId == seek.mediaId
                     && player.currentPosition < RESTORE_SEEK_BELT_MS
-                ) player.seekTo(pos)
+                ) player.seekTo(seek.positionMs)
             }
+            // ⚠️ TIME-BOXED PROOF, REMOVE WITH THE trackRadio COUNTERPART. Pairs with the
+            // `prepare pos=` line in PlayerCallback.trackRadio: zero there and NON-zero here on a
+            // cold-start search tap is the mechanism demonstrated rather than inferred. Remove BOTH once
+            // one capture shows it, or once a capture shows the drop line above firing instead.
+            Log.d(
+                "GladixPlayback",
+                "READY pos=${player.currentPosition} id=${player.currentMediaItem?.mediaId}"
+            )
         }
     }
 

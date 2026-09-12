@@ -23,6 +23,23 @@ data class HistoryEntity(
 // artist names + covers, cover, duration) and — for the more-sheet's "Go to Album"/artist nav — a
 // slimmed album + slimmed artists. Everything heavy (streamables, extras, description, banners,
 // nested album artists) is dropped so a row stays well under the CursorWindow limit that getAll hit.
+// ⚠⚠ PATTERN, NOT THREE SEPARATE BUGS: ANY SIGNAL READ FROM `extras` ON A TRACK THAT MAY
+// HAVE BEEN SLIMMED IS UNRELIABLE BY CONSTRUCTION. `extras = emptyMap()` below is wholesale - it does not
+// know which keys carry identity, capability or availability, so a slimmed track is INDISTINGUISHABLE
+// from a track whose extension never set those keys. Every consumer that reads extras and infers
+// something about the TRACK is really inferring something about the track's PROVENANCE.
+// THREE INSTANCES, ALL FOUND SEPARATELY, ALL THE SAME SHAPE:
+//   1. extension_id destroyed -> radio generation broke, loadTrack's failure was masked behind
+//      Cached.loadMedia's fallback, and Unified tracking died silently for six weeks.
+//   2. TRACK_TOKEN destroyed -> DeezerTrackClient.loadTrack's self-heal gate reads an empty token as
+//      "needs re-fetch", which is correct, but a 2026-09-12 investigation then read the SAME emptiness
+//      as "this track cannot play". It measured 12/12 against unplayable tracks and was refuted two
+//      captures later. See the note at that gate.
+//   3. (the general case) any future extras key used as a capability or availability signal.
+// ⚠️ AND SELECTIVE SLIMMING ALREADY EXISTS - toSlimContext below keeps Radio extras precisely
+// because the radio work depends on them, and is the single source of truth for that. So the precedent is
+// PRESERVE WHAT MATTERS, not empty the map; there is no argument that wholesale stripping is required.
+// Before adding a fourth consumer of an extras key, ask whether the track could have come through here.
 fun Track.toSlim(): Track = copy(
     streamables = emptyList(),
     extras = emptyMap(),

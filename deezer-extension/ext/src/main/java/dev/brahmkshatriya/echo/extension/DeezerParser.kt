@@ -49,8 +49,14 @@ import kotlinx.serialization.json.jsonObject
 // REMOVAL CONDITION: delete this function, its two flags and the call in toTrack once the key set has
 // been read once. It answers a one-time structural question; leaving it in would dump a record on every
 // cold start forever.
-private var dumpedUnplayable = false
-private var dumpedPlayable = false
+private var dumpedZeroSize = false
+private var dumpedHasSize = false
+
+// ⚠⚠ FULL VALUES FOR THESE FOUR, NOT THE 160-CHAR TRUNCATION. If any of them states
+// unavailability EXPLICITLY it is a better axis than filesize, because it sidesteps the absent-vs-zero
+// hazard recorded at the FILESIZE_MP3_MISC put below entirely. AVAILABLE_COUNTRIES came back as a bare
+// "{" last run - a structured value cut by the truncation, not an empty one.
+private val FULL_VALUE_KEYS = setOf("RIGHTS", "SNG_STATUS", "STATUS", "AVAILABLE_COUNTRIES")
 
 private val CONSUMED_KEYS = setOf(
     "ALB_ID", "ALB_PICTURE", "ALB_TITLE", "ARTISTS", "AUTHOR", "DIGITAL_RELEASE_DATE", "DISK_NUMBER",
@@ -65,20 +71,38 @@ private fun JsonElement?.probeStr(): String? =
     (this as? JsonPrimitive)?.takeIf { it !is JsonNull }?.content
 
 private fun dumpRawRecordOnce(data: JsonObject) {
-    val tokenEmpty = data["TRACK_TOKEN"].probeStr().isNullOrEmpty()
-    if (tokenEmpty && dumpedUnplayable) return
-    if (!tokenEmpty && dumpedPlayable) return
-    if (tokenEmpty) dumpedUnplayable = true else dumpedPlayable = true
+    // ⚠⚠ RE-KEYED ON FILESIZE, NOT ON TRACK_TOKEN. The token axis is REFUTED: the 2026-09-12
+    // capture fired only the HAS-TOKEN slot, and the record it caught was an UNPLAYABLE track WITH a
+    // token and every FILESIZE variant at 0. See the toSlim note in HistoryEntity for why an empty token
+    // means "this track lost its extras", not "this track cannot play". Keying on the refuted axis is
+    // also why the side-by-side never happened - both slots wanted the same kind of record.
+    // Zero when EVERY FILESIZE* key present is "0" or blank; `sizeKeys` is printed so "all zero" and
+    // "no such keys" stay distinguishable, because those are different findings.
+    val sizeKeys = data.keys.filter { it.startsWith("FILESIZE") }
+    val allZero = sizeKeys.all { (data[it].probeStr() ?: "0").trim().let { v -> v.isEmpty() || v == "0" } }
+    if (allZero && dumpedZeroSize) return
+    if (!allZero && dumpedHasSize) return
+    if (allZero) dumpedZeroSize = true else dumpedHasSize = true
 
-    val label = if (tokenEmpty) "NO-TOKEN" else "HAS-TOKEN"
+    val label = if (allZero) "ZERO-SIZE" else "HAS-SIZE"
     val id = data["SNG_ID"].probeStr().orEmpty()
     val title = data["SNG_TITLE"].probeStr().orEmpty()
     val discarded = data.keys.filter { it !in CONSUMED_KEYS }.sorted()
-    println("GladixDeezer RAWTRACK[$label] id=$id title=${title.take(60)}")
+    println("GladixDeezer RAWTRACK[$label] id=$id title=${title.take(60)} sizeKeys=${sizeKeys.size}")
     println("GladixDeezer RAWTRACK[$label] allKeys=${data.keys.sorted().joinToString(",")}")
+    // ⚠️ EVERY FILESIZE* KEY, CONSUMED OR NOT - THE PROBE'S OWN LESSON, FIXED HERE.
+    // The consumed/discarded split below suppressed FILESIZE_MP3_MISC's VALUE last run, because we
+    // already read that key - and it was the single field the question turned on. A probe that filters
+    // by "do we already use this?" can hide the answer to "what should we use?". The split still looks
+    // obviously right, which is why this line exists rather than a wider rule.
+    sizeKeys.sorted().forEach { k ->
+        println("GladixDeezer RAWTRACK[$label] $k=${data[k].probeStr() ?: data[k].toString()}")
+    }
+    println("GladixDeezer RAWTRACK[$label] TRACK_TOKEN_EMPTY=${data["TRACK_TOKEN"].probeStr().isNullOrEmpty()}")
     discarded.forEach { k ->
         val v = data[k].probeStr() ?: data[k].toString()
-        println("GladixDeezer RAWTRACK[$label] $k=${v.take(160)}")
+        val cap = if (k in FULL_VALUE_KEYS) 2000 else 160
+        println("GladixDeezer RAWTRACK[$label] $k=${v.take(cap)}")
     }
     // FALLBACK is in the consumed set but only its SNG_ID is kept, so its own shape is still unread.
     (data["FALLBACK"] as? JsonObject)?.let {
@@ -714,6 +738,18 @@ class DeezerParser(private val session: DeezerSession) {
                 dumpRawRecordOnce(data)
                 put("FALLBACK_ID", data["FALLBACK"]?.jsonObject?.str("SNG_ID").orEmpty())
                 put("TRACK_TOKEN", data.str("TRACK_TOKEN").orEmpty())
+                // ⚠⚠ `?: "0"` COLLAPSES "KEY MISSING" AND "VALUE ZERO" INTO ONE STRING, AND
+                // WHOEVER BUILDS isPlayable MUST READ THIS BEFORE CHOOSING FILESIZE AS THE AXIS.
+                // Today's only consumer is DeezerTrackClient's `isMp3Misc = extras[...] != "0"`, whose
+                // failure mode on a missing key is BENIGN - it picks the quality ladder instead of the
+                // MP3-only streamable, and streaming still works.
+                // ⚠️ isPlayable WOULD MAKE THE SAME AMBIGUITY USER-VISIBLE: a record that simply
+                // does not carry the key would read as zero and GREY OUT A PLAYABLE TRACK. Same expression,
+                // same defect, far worse consequence - which is the whole reason to distinguish
+                // absent from zero HERE rather than at the consumer.
+                // If filesize does become the axis, this needs a null-vs-"0" distinction (a nullable String,
+                // or a separate "key present" flag) and the RIGHTS/SNG_STATUS/STATUS route should be ruled
+                // out first - an explicit status field sidesteps the ambiguity entirely.
                 put("FILESIZE_MP3_MISC", data.str("FILESIZE_MP3_MISC") ?: "0")
                 put("TYPE", "cover")
                 put("GAIN", data.str("GAIN") ?: "0")

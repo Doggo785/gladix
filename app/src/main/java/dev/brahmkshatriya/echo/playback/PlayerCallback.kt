@@ -335,8 +335,15 @@ class PlayerCallback(
             player.repeatMode = data.repeat
             player.setMediaItems(data.items.toMutableList(), data.index, data.pos)
             // Arm the cold-start re-seek: the startPositionMs above is lost at prepare() (see PlayerState).
+            // ⚠⚠ THE EPOCH IS READ HERE, AFTER setMediaItems, AND THAT ORDER IS THE WHOLE POINT.
+            // setMediaItems bumps queueEpoch via markQueueReplaced, so reading it on the line BEFORE would
+            // capture the outgoing queue's value and every consume would then look stale - a gate present
+            // but inverted, which is the playItem defect recorded at ShufflePlayer.markQueueReplaced in a
+            // different costume. This site can read it validly; the resumption site below cannot.
             if (data.pos > 0)
-                state.pendingRestoreSeek = data.items.getOrNull(data.index)?.mediaId?.let { it to data.pos }
+                state.pendingRestoreSeek = data.items.getOrNull(data.index)?.mediaId?.let {
+                    PlayerState.RestoreSeek(it, data.pos, player.queueEpochOrZero)
+                }
         }
     }
 
@@ -565,6 +572,15 @@ class PlayerCallback(
                 (this as? ShufflePlayer)?.syncShuffleFlag(false)
                 if (playbackState == Player.STATE_IDLE) prepare()
                 playWhenReady = true
+                // ⚠️ TIME-BOXED PROOF, REMOVE WITH THE `READY pos=` LINE IN PlayerEventListener.
+                // playedDuration is podcast-only (DeezerParser sets it from Deezer's bookmark on the
+                // EPISODE branch), so a music seed starts at 0 and this should print pos=0. If the paired
+                // READY line then prints a non-zero pos for the same mediaId, something seeked in between
+                // and the restore latch is it. Zero then non-zero is the whole proof.
+                Log.d(
+                    "GladixPlayback",
+                    "TRACKRADIO prepare pos=$currentPosition id=${currentMediaItem?.mediaId}"
+                )
             }
             // 2) Generate the radio and append it after the seed (mirrors PlayerRadio.loadPlaylist: start +
             //    play). Fully guarded: a missing extension or any generation error is reported but cannot abort
@@ -1239,9 +1255,27 @@ class PlayerCallback(
                     mediaSession.player.repeatMode = data.repeat
                     // Arm the cold-start re-seek: Media3 applies startPositionMs below via the same 3-arg
                     // setMediaItems and loses it at prepare() identically (see PlayerState).
+                    // ⚠⚠ ARMED WITH epoch = null DELIBERATELY - THIS SITE CANNOT READ A VALID
+                    // EPOCH AND MUST NOT PRETEND TO. We return MediaItemsWithStartPosition and MEDIA3
+                    // applies the queue afterwards, so the bump happens outside this function: a read here
+                    // captures the PREVIOUS queue's value, and keying on it would make every consume look
+                    // stale and disable the re-seek this latch exists for. There is no later point inside
+                    // this function to move the arm to - the application is the caller's, not ours.
+                    // ⚠️ "+1 FROM HERE" WAS CONSIDERED AND REJECTED: it would be arithmetic about
+                    // a library's internal sequencing, correct only while nothing else replaces the queue
+                    // in between, and it would fail SILENTLY when that stopped holding.
+                    // ⚠️ RESIDUAL, STATED RATHER THAN PAPERED OVER: this path keeps TODAY'S
+                    // behaviour - mediaId + belt only - so the defect above remains reachable HERE, through
+                    // a much narrower window. onPlaybackResumption runs because the system asked to resume,
+                    // and Media3 applies-and-plays immediately, so the arm-to-consume gap is short and has
+                    // no user tap in it by construction. Not zero: a tap on the SAME track inside that
+                    // buffering window would still be seeked. Closing it needs an arm that fires after the
+                    // application - a Player.Listener-side re-arm - which is a structural change, not this one.
                     if (data.pos > 0)
                         state.pendingRestoreSeek =
-                            data.items.getOrNull(data.index)?.mediaId?.let { it to data.pos }
+                            data.items.getOrNull(data.index)?.mediaId?.let {
+                                PlayerState.RestoreSeek(it, data.pos, null)
+                            }
                 }
                 Log.d("GladixPlayback", "onPlaybackResumption: items=${data.items.size}")
                 MediaItemsWithStartPosition(data.items.map { withUnloaded(it) }, data.index, data.pos)

@@ -192,126 +192,6 @@ class DeezerHomeFeedClient(
         // that answers the standing prediction - that a MODULE endpoint returns one module's contents
         // rather than a page of sections, with the payload under some key other than `sections`. If that is
         // right, `sections` is absent or empty here and some sibling key is an array of about 32.
-        /**
-         * ⚠️ TEMPORARY — DELETE WITH THE REST OF THIS PROBE BLOCK.
-         *
-         * Dumps the page for ONE smarttracklist, to settle why api.page("smarttracklist/<id>") comes back
-         * with sections=0 while DeezerPlaylistClient.smartTracklistTracks assumes results.sections[].items[].
-         * That traversal was marked INFERRED at the time; this is the capture that confirms or replaces it.
-         *
-         * ⚠️ THE ID IS DISCOVERED FROM THE HOME PAYLOAD, NOT HARDCODED. Smarttracklist ids are daily-mix
-         * slots and Deezer rotates its editorial labels under stable module ids (46b377f1 was "Summer in
-         * slow-mo", now "Hello, sunshine"), so a literal captured days ago is the least reliable thing to
-         * key on. Taking the first one Home actually returned means the dump is always of a live id.
-         *
-         * WHAT TO READ IN THE OUTPUT: if resultsShapes names some array other than `sections` — `data`,
-         * `items`, `songs` — that key is the real payload and smartTracklistTracks' traversal is wrong.
-         * If `sections` is present but empty, the id resolves and the page is genuinely sectionless, and
-         * the tracks are somewhere else in results. If `error` is populated, the id is not addressable
-         * this way at all and the whole page.get route for smarttracklists is the wrong idea.
-         */
-        private suspend fun probeSmartTracklist(api: DeezerApi, home: JsonObject) {
-            runCatching {
-                val sections = home["results"]?.jsonObject?.get("sections") as? JsonArray
-                val id = sections?.filterIsInstance<JsonObject>()
-                    ?.flatMap { it["items"]?.jsonArray?.filterIsInstance<JsonObject>().orEmpty() }
-                    ?.firstOrNull { it["type"].prim() == "smarttracklist" }
-                    ?.let { (it["data"] as? JsonObject)?.get("SMARTTRACKLIST_ID").prim() }
-                if (id == null) {
-                    println("GladixDeezer PROBE stl=<none-in-home> (no outer type=smarttracklist item)")
-                    return@runCatching
-                }
-                // == STEP 1 OF THE SMARTTRACKLIST WORK: WHICH ID DOES THE GRAPHQL API USE? ==========
-                // (!) DELETE WITH DeezerApi.probeMadeForMe. Three lines out, one line in.
-                // Our Home item carries TWO candidate ids and they are different KINDS of thing:
-                //   data.SMARTTRACKLIST_ID = "inspired-by-1"  — identical to data.CONFIGURATION_ID, so it
-                //                                               reads as a SLOT/config name, not an instance
-                //   data.ID = "6563868601.1.1125.2179.2707.20260829" — reads as an INSTANCE: it embeds what
-                //                                               looks like a user id and a date, matching
-                //                                               these regenerating daily (EXPIRATION_DATE)
-                // DeezerParser.toSmartTracklist currently stores the SLOT form. If madeForMe returns the
-                // instance form, that line changes too — do not assume the current choice is right.
-                // The match= line below is the whole point: it is the gate on every later step.
-                // No `?.` on `sections`: the `if (id == null) return@runCatching` above already proves it
-                // non-null (K2 propagates nullability back through the safe-call chain `id` was built
-                // from), so a safe call here would be a check that cannot fire. If that early return is
-                // ever moved or removed, this stops COMPILING rather than silently changing — which is the
-                // outcome we want.
-                val stlItem = sections.filterIsInstance<JsonObject>()
-                    .flatMap { it["items"]?.jsonArray?.filterIsInstance<JsonObject>().orEmpty() }
-                    .firstOrNull { it["type"].prim() == "smarttracklist" }
-                    ?.let { it["data"] as? JsonObject }
-                val homeDataId = stlItem?.get("ID").prim()
-                val homeConfigId = stlItem?.get("CONFIGURATION_ID").prim()
-                println(
-                    "GladixDeezer STL-ID home stl=$id dataId=${homeDataId ?: "-"} " +
-                        "configId=${homeConfigId ?: "-"}"
-                )
-                runCatching { api.probeMadeForMe() }
-                    .onFailure { println("GladixDeezer STL-ID madeForMe FAILED: ${it.message}") }
-                    .onSuccess { gql ->
-                        val errors = gql["errors"]?.toString()?.take(300)
-                        val edges = gql["data"]?.jsonObject?.get("me")?.jsonObject
-                            ?.get("madeForMe")?.jsonObject?.get("edges") as? JsonArray
-                        val nodes = edges?.filterIsInstance<JsonObject>()
-                            ?.mapNotNull { it["node"] as? JsonObject }.orEmpty()
-                        val ids = nodes.map { it["id"].prim() ?: "-" }
-                        println(
-                            "GladixDeezer STL-ID madeForMe n=${nodes.size} " +
-                                "types=${nodes.map { it["__typename"].prim() ?: "-" }} ids=$ids " +
-                                "errors=${errors ?: "-"}"
-                        )
-                        // The gate. `slot` -> toSmartTracklist already stores the right id and step 2 can
-                        // proceed unchanged. `instance` -> it stores the wrong one and must change first.
-                        // `none` -> the GraphQL API does not address our items by either id we hold; STOP,
-                        // and revert the two-line outer-type fallback in DeezerParser.toEchoMediaItem
-                        // rather than start guessing at id shapes.
-                        val match = when {
-                            // `id` is non-null from here down — same early return as above. Only
-                            // homeDataId still needs a null check; it has no such guard.
-                            ids.contains(id) -> "slot"
-                            homeDataId != null && ids.contains(homeDataId) -> "instance"
-                            // A PREFIXED VARIANT IS THE AMBIGUOUS CASE AND MUST NOT REPORT AS "none".
-                            // The repo's fixtures use "smart:daily_mix_1", so a real id may well be
-                            // "smart:inspired-by-1" or similar. Exact equality would call that a miss and
-                            // send us to revert, wrongly. If this fires, read the ids= line above and use
-                            // the FULL returned string in step 2 — do not reconstruct the prefix.
-                            ids.any { it.endsWith(id) || it.contains(id) } -> "slot-prefixed"
-                            homeDataId != null &&
-                                ids.any { it.endsWith(homeDataId) || it.contains(homeDataId) } ->
-                                "instance-prefixed"
-                            // Zero nodes or a GraphQL error is INCONCLUSIVE, not a miss. Only a populated
-                            // response with no relationship to either id is grounds to revert.
-                            nodes.isEmpty() -> "inconclusive-empty"
-                            else -> "none"
-                        }
-                        println("GladixDeezer STL-ID match=$match")
-                    }
-                val page = api.page("smarttracklist/$id")
-                println("GladixDeezer PROBE stl=$id rootKeys=${page.keys}")
-                val results = page["results"] as? JsonObject
-                println(
-                    "GladixDeezer PROBE stl resultsKeys=${results?.keys ?: "<no-results>"} " +
-                        "error=${page["error"]?.toString()?.take(300) ?: "-"}"
-                )
-                println(
-                    "GladixDeezer PROBE stl resultsShapes=" +
-                        results?.entries?.joinToString { "${it.key}=${shapeOf(it.value)}" }
-                )
-                // Dump the WHOLE page, not `results ?: page`: the 2026-09-07 capture returned a
-                // PRESENT-BUT-EMPTY `results`, so the elvis took that branch and printed `{}` while the
-                // top-level `error` and an unexamined `payload` key went unseen. rootKeys was
-                // [error, results, payload]; only `payload` is still uncharacterised.
-                val raw = page.toString()
-                val chunks = raw.chunked(PROBE_LOG_CAP)
-                chunks.take(PROBE_MAX_CHUNKS).forEachIndexed { i, chunk ->
-                    println("GladixDeezer PROBE stl raw[${i + 1}/${chunks.size}] $chunk")
-                }
-            }.onFailure {
-                println("GladixDeezer PROBE stl FAILED ${it::class.simpleName}: ${it.message?.take(300)}")
-            }
-        }
-
         private fun shapeOf(element: JsonElement?): String = when (element) {
             is JsonArray -> "array[" + element.size + "]"
             is JsonObject -> "object{" + element.size + "}"
@@ -321,7 +201,6 @@ class DeezerHomeFeedClient(
 
         private suspend fun probeOnce(api: DeezerApi, parser: DeezerParser, home: JsonObject) {
             if (!channelModuleProbed.compareAndSet(false, true)) return
-            probeSmartTracklist(api, home)
             runCatching {
                 val page = api.page(PROBE_TARGET)
                 // Top level first: page.get wraps everything in `results`, and a REQUEST that was rejected

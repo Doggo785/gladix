@@ -266,9 +266,24 @@ object AppUpdater {
         //   1. queueFlow — a replay-0 emission dropped while the observer was stopped.
         //   2. awaitInstallation — a replay-0 future that then never completes.
         //   3. messageFlow — this one.
-        // Each was diagnosed independently, each carries its own local note, and NONE of the three is
-        // fixable at its own site: a bigger buffer does not help (buffers do not retain for an absent
-        // subscriber), and neither does a different emit shape. One mechanism, three sites, one fix.
+        // Each was diagnosed independently, each carries its own local note, and none is fixable by a
+        // bigger buffer (buffers do not retain for an ABSENT subscriber) or a different emit shape.
+        //
+        // ⚠⚠ [CORRECTED 2026-09-12] THIS USED TO END "One mechanism, three sites, one fix."
+        // THE MECHANISM IS SHARED; THE FIX IS NOT, AND (2) IS THE ODD ONE OUT. Sites 1 and 3 lose a
+        // PRESENTATION - a queue row, a snackbar - to a subscriber that no longer exists, and the held-state
+        // remedy fits them: accumulate ungated, render gated, drain on STARTED.
+        // Site 2 loses a COMPLETION to a subscriber that IS STILL THERE. awaitInstallation runs in
+        // viewModelScope, which survives the config change along with installedFlow; only the COLLECTOR
+        // dies. So there is nothing to accumulate FOR - the awaiting coroutine never went away.
+        // ⚠️ AND THE OBVIOUS FIX IS UNAVAILABLE RATHER THAN UNNECESSARY, WHICH IS THE PART WORTH
+        // STATING: "just ungate the collector" cannot be done there, because installApp needs a
+        // FragmentActivity to launch the installer intent. That is a real constraint of the Android
+        // installer API, not an oversight, and it is why site 2 cannot follow sites 1 and 3 to app scope.
+        // Site 2 was CLOSED 2026-09-12 on its own terms: its substantial case is already covered by the
+        // onDestroy observer in configureExtensionsUpdater, and what remains is a millisecond race on a
+        // path that has never executed. See the corrected note at awaitInstallation.
+        // So: ONE MECHANISM, THREE SITES, TWO FIXES AND A CLOSURE.
         //
         // ⚠️ THE 2026-09-10 STAGE-KEY RENAME DOES NOT REDUCE THE CASE FOR THE HELD-STATE FIX. It removed a
         // false claim from the key; it changed nothing about delivery. The real fix is still the mechanism

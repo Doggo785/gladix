@@ -102,6 +102,26 @@ class DeezerSearchClient(private val deezerExtension: DeezerExtension, private v
             if (id == GO_BEYOND_STREAMING_MODULE_ID) return@mapNotNull null
             val layout = section.jsonObject["layout"]?.jsonPrimitive?.contentOrNull.orEmpty()
             val title = section.jsonObject["title"]?.jsonPrimitive?.content.orEmpty()
+            // ⚠⚠ THE `title == "?"` CLAUSE IS UNRESOLVED - NOT PROVEN DEAD, NOT PROVEN
+            // LOAD-BEARING - AND THE LOG CANNOT SETTLE IT BY CONSTRUCTION. logSections renders an ABSENT
+            // field, a JSON-null field and a literal "?" ALL AS `?`, because it reads via contentOrNull
+            // and falls back to `?: "?"`. So a `?` in a captured sections line is three payloads, not one.
+            // ⚠️ AND `?` IN THE OTHER FIELDS IS THE SAME PLACEHOLDER, which is worth stating
+            // because it looks like evidence and is not: layout/module_id/target all use `?: "?"` too, so
+            // a line like `Explore all/grid/<id>/?` means TARGET WAS ABSENT - it is NOT proof that the
+            // string "?" occurs anywhere in Deezer's payload.
+            // WHAT THE 2026-09-12 CAPTURE DID NARROW: explore-tab returned SIX sections and yielded FIVE
+            // shelves, so the `?`-titled section WAS dropped here. That rules out JSON null, because a
+            // JSON-null title takes `.content` == the string "null" below - neither blank nor "?" - and
+            // would have SURVIVED, rendering a shelf titled "null". Two cases remain and they map exactly
+            // one-to-one onto the two clauses: ABSENT (caught by isBlank, so "?" is dead) or a LITERAL "?"
+            // (caught by this clause, so it is load-bearing). The capture cannot separate them.
+            // ⚠️ LATENT HAZARD, RECORDED THOUGH IT DID NOT FIRE: a JSON-null title still slips
+            // through both clauses and renders a shelf named "null". `.content` on JsonNull is "null",
+            // and `.orEmpty()` only covers the key being ABSENT.
+            // ONE LINE WOULD SETTLE ALL OF IT - change logSections' `?: "?"` to a distinguishable
+            // placeholder such as `?: "<absent>"`. Not done: the clause is harmless either way and this
+            // is recorded rather than chased.
             if (title.isBlank() || title == "?") return@mapNotNull null
             when {
                 id == EXPLORE_MODULE_ID || layout == "grid" -> {
@@ -161,34 +181,29 @@ class DeezerSearchClient(private val deezerExtension: DeezerExtension, private v
             searchHomePipe.await() to exploreTab.await()
         }
 
-        // ⚠⚠ THE ONE LINE THAT DECIDES WHETHER channels/search-home-pipe STAYS. logSections
-        // above already reports the sections each endpoint RETURNED; this reports what survived
-        // toBrowseShelves, and the gap between the two is real - that function drops
-        // GO_BEYOND_STREAMING_MODULE_ID, drops blank/"?" titles, drops grid sections whose category list
-        // comes back empty (takeIf), and drops non-grid sections that do not cast to Shelf.Lists.Items.
-        // So a healthy `sections:` line does NOT prove a non-empty shelf list, which is exactly the
-        // question the parked item asks.
-        // PREDICTION, STATED BEFORE THE CAPTURE so the number cannot be read after the fact:
-        //   search-home-pipe >= 2  -> it is carrying the Genres/Categories grid the June work switched to
-        //                             it for. IT STAYS. Parked item closes as "load-bearing".
-        //   search-home-pipe == 0  -> dead weight on every Search-tab open. The endpoint, its async block
-        //                             and searchHomePipeShelves can all go, leaving explore-tab alone.
-        //   search-home-pipe == 1  -> partial; read the sections line above to see WHICH of Genres or
-        //                             Categories is being dropped, and by which of the four filters.
-        // A zero here with a NON-EMPTY sections line above means the endpoint works and toBrowseShelves
-        // is rejecting it - a different bug, and do not delete the endpoint on that reading.
-        // REMOVE THIS LINE once the parked item is closed either way; the logSections pair above is
-        // permanent instrumentation, this one is not.
-        println(
-            "GladixDeezer BROWSE shelves: search-home-pipe=${searchHomePipeShelves.size} " +
-                "explore-tab=${exploreTabShelves.size}"
-        )
-
+        // ⚠⚠ CLOSED 2026-09-12 AS LOAD-BEARING - channels/search-home-pipe STAYS, AND THE
+        // "if it proves reliably empty, it can go too" NOTE IS RETIRED RATHER THAN LEFT STANDING.
+        // MEASURED, one Search-tab open:
+        //     BROWSE shelves: search-home-pipe=2 explore-tab=5
+        // Two shelves is not merely non-zero, it is the RIGHT two. The sections line for the same fetch:
+        //     PAGE[search-home-pipe] sections: Go beyond streaming/grid, Genres/grid, Categories/grid
+        // THREE sections arrive, toBrowseShelves drops GO_BEYOND_STREAMING_MODULE_ID, Genres and
+        // Categories survive - 3 -> 2 exactly as designed. So the survivors are precisely the two shelves
+        // this endpoint was switched in FOR (the official Search tab's genre/category grid), which is a
+        // stronger result than a count alone: it shows the FILTER is right, not just the arithmetic.
+        // The temporary BROWSE probe that produced this has been removed, its removal condition met.
         // ⚠️ CLOSED 2026-09-12, DO NOT RE-OPEN: channels/explore/explore-tab IS NOT UNTESTED.
         // It was investigated twice with temporary logging and DELIBERATELY DEMOTED. Confirmed then: it
         // returns personalized content ("Dig deeper", "Evening chill") rather than the Genres/Categories
-        // grid of Deezer's official Search tab, and returns exactly 5 sections - the personalized ones plus
-        // EXPLORE_MODULE_ID ("Explore all"). It is CORRECT PER ITS OWN CONTRACT; it is simply a personalized
+        // grid of Deezer's official Search tab, plus EXPLORE_MODULE_ID ("Explore all").
+        // ⚠⚠ [CORRECTED 2026-09-12] THAT SESSION RECORDED "EXACTLY 5 SECTIONS". IT NOW RETURNS
+        // SIX (?-titled, Celine Dion slideshow, Albums of the week, This week's freshest releases, Feeling
+        // French?, Explore all) yielding five shelves. Not a defect - a personalized feed's section count
+        // is Deezer's to change - but it is the SECOND count from that era to have moved, so
+        // DO NOT KEY ANY REASONING ON A SECTION COUNT FROM THE RECORD; re-measure it. An inference built
+        // on the stale 5 was made and corrected in the same exchange, which is how this was noticed.
+        // The endpoint's CHARACTER - personalized rather than a genre grid - is what has held up, and that
+        // is the part the demotion rests on. It is CORRECT PER ITS OWN CONTRACT; it is simply a personalized
         // browse feed rather than a genre grid. That is why channels/search-home-pipe became the primary
         // source and this one is appended BELOW it rather than removed. Ordering in the sum below is that
         // decision, not an accident - do not reorder it, and do not re-investigate this endpoint as though

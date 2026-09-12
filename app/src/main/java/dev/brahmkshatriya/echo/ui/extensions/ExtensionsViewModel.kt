@@ -178,8 +178,15 @@ class ExtensionsViewModel(
     // subscribe second. Both flows are replay-0 MutableSharedFlows, and a replay-0 emission with no
     // subscriber is DISCARDED, not deferred. So any path where the collector finishes installing before
     // this coroutine gets as far as subscribing loses the result permanently, and `first { }` then waits
-    // forever: no message, no failure, and the caller has already written last_update_check, so nothing
-    // retries for 24h. A silent strand, on the app-update path that has never once executed.
+    // forever: no message and no failure. A silent strand, on the app-update path that has never once
+    // executed.
+    // ⚠️ [CORRECTED 2026-09-12] THIS USED TO ADD "and the caller has already written
+    // last_update_check, so nothing retries for 24h". THAT NO LONGER HOLDS, and the reason is worth
+    // keeping: the reset above is now `0L` rather than `0`, so it writes to the folder
+    // shouldCheckForExtensionUpdates actually reads (saveToCache picks its folder from
+    // T::class.java.simpleName). While it was `0` the reset silently went to the `int` folder and the 24h
+    // lockout really did apply. It does not now - a strand leaves last_update_check at 0, so the NEXT
+    // launch re-checks. The strand is still a hang; it is no longer also a 24-hour one.
     //
     // The window is normally closed by luck rather than by design: configureExtensionsUpdater's collector
     // calls installApp, which suspends almost immediately at waitForResult (launching the installer), and
@@ -193,11 +200,21 @@ class ExtensionsViewModel(
     // ends. Same replay-0 mechanism as the Aug/Sep queueFlow defect, opposite direction — that one lost an
     // emission because the SUBSCRIBER was gone, this one because the subscriber had not arrived yet.
     //
-    // (!) THIS DOES NOT COVER the other half: if the ACTIVITY is destroyed (a config change) while an
-    // install is in flight, installFileFlow's emit reaches no collector at all and is dropped the same way.
-    // That one is deliberately left open — buffering does not fix it (a buffer holds values for existing
-    // slow subscribers; it does not retain them for a future one), and replay does, but replay changes what
-    // a LATE subscriber sees at subscribe time, which is what caused the cold-start hang. See the report.
+    // ⚠⚠ [CORRECTED 2026-09-12] THIS USED TO SAY THE CONFIG-CHANGE HALF WAS "DELIBERATELY LEFT
+    // OPEN". IT IS MOSTLY CLOSED, AND RE-SCOPING IT WOULD BE RE-SOLVING A SOLVED PROBLEM.
+    // The claim was: "if the ACTIVITY is destroyed (a config change) while an install is in flight,
+    // installFileFlow's emit reaches no collector at all and is dropped the same way."
+    // THE IN-FLIGHT CASE IS HANDLED, by the DefaultLifecycleObserver registered in
+    // configureExtensionsUpdater a few lines below: on Activity destroy it emits
+    // `file to Result.failure(CancellationException())`, and `first { }` here receives it. It works because
+    // the AWAITING side outlives the Activity - ExtensionsViewModel is Activity-scoped, so viewModelScope
+    // and installedFlow both survive a config change; only the COLLECTOR dies and is recreated.
+    // ⚠️ WHAT ACTUALLY REMAINS is much narrower: awaitInstallation must BEGIN inside the
+    // recreation gap, between the old Activity's onDestroy and the new one's configureExtensionsUpdater.
+    // Then onSubscription's emit finds no collector, `currentFile` was never set so the observer cannot
+    // help either (and has already run), and this waits forever. A millisecond race, on a path that has
+    // never executed. CLOSED 2026-09-12 as not worth retention machinery - see the census note in
+    // AppUpdater for why the messageFlow remedy is not available here anyway.
     private suspend fun awaitInstallation(file: File): Result<Unit> {
         return installedFlow
             .onSubscription { installFileFlow.emit(file) }
@@ -276,6 +293,13 @@ class ExtensionsViewModel(
             }
 
             viewModel.update(this, false)
+            // ⚠️ NEVER RESET AFTER A SUCCESSFUL INSTALL, SO THE OBSERVER BELOW FIRES ON EVERY
+            // LATER ACTIVITY DESTROY - once per rotation for the rest of the session - emitting a spurious
+            // `Result.failure(CancellationException())` for a file that installed fine. Harmless TODAY and
+            // recorded rather than fixed: awaitInstallation has already returned by then, so nothing is
+            // subscribed to receive it. Written down because it explains an emission someone will
+            // eventually see in a capture and reasonably read as a failed install.
+            // It stops being harmless the moment anything else subscribes to installedFlow.
             var currentFile: File? = null
             collect(viewModel.installFileFlow) {
                 currentFile = it

@@ -90,6 +90,31 @@ object Cached {
     // The VALUE is deliberately not parsed. Any format an extension chooses would have to be understood
     // here, and a parse failure would silently fall back to caching — the exact outcome the rule exists to
     // prevent. Presence of the key is the whole contract; "expires" is the reserved name.
+    // ⚠⚠ CLOSED 2026-09-12: A SMARTTRACKLIST ID IS A SLOT, NOT A SNAPSHOT - CLOSED ON
+    // EVIDENCE PLUS THIS MITIGATION, NOT ON CERTAINTY. The open question was whether `inspired-by-1`
+    // names a STABLE DAILY SLOT that Deezer refills, or a SNAPSHOT of one day's generated mix. It decides
+    // whether such an id can ever be a durable cache key.
+    // THE EVIDENCE, from the STL-ID capture and GetMadeForMe:
+    //   - `inspired-by-1` appears as BOTH the smarttracklist id AND the configuration id
+    //     (stl=inspired-by-1 configId=inspired-by-1), alongside a SEPARATE compound dataId
+    //     `6563868601.3949.1.1125.2179.20260829` that embeds a date. Slot plus instance, carried in two
+    //     different fields - which is what a slot model looks like and not what a snapshot model does.
+    //   - GetMadeForMe returned `inspired-by-1` through `inspired-by-5` plus `new-releases`: stable,
+    //     enumerable, human-readable names. Snapshot ids do not come in a tidy numbered series.
+    //   - AND THE LABEL ROTATES UNDER A FIXED ID, which is the same finding from the other side and was
+    //     observed independently: module 46b377f1 read "Summer in slow-mo" and later "Hello, sunshine".
+    //     A snapshot id would have changed WITH the content; this one outlived an editorial relabel.
+    //     (Carried over from DeezerHomeFeedClient.probeSmartTracklist, now deleted - it asserted the slot
+    //     model from this observation alone, and the captures above upgrade it from assertion to evidence.)
+    // ⚠️ WHY THIS IS SAFE TO CLOSE WITHOUT BEING CERTAIN: THE CONSEQUENCE IS ALREADY MITIGATED
+    // EITHER WAY, by the rule immediately below. These items ship `expires` and regenerate daily, so
+    // carriesExpiry() already refuses to cache them durably - under BOTH readings. The id's form changes
+    // no behaviour today, which is precisely why it does not need to be settled beyond this.
+    // ⚠⚠ THIS REOPENS IF ANYTHING EVER CACHES SMARTTRACKLIST CONTENTS DURABLY. The moment the
+    // expiry rule below stops covering them - a new cache path that does not consult carriesExpiry, an
+    // extension that stops setting `expires`, or a deliberate exception - the slot-vs-snapshot question
+    // becomes load-bearing again and the evidence above is suggestive rather than sufficient. Re-open it
+    // BEFORE writing such a path, not after.
     private const val EXPIRES_EXTRA = "expires"
     private fun EchoMediaItem.carriesExpiry() = extras.containsKey(EXPIRES_EXTRA)
 
