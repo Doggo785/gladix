@@ -18,115 +18,13 @@ import dev.brahmkshatriya.echo.common.models.Track
 import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 
-// ⚠⚠ TEMPORARY PROBE - ONE QUESTION, TWO LINES OF OUTPUT, THEN DELETE IT.
-// THE QUESTION: Deezer's own app greys these tracks out and ours does not. common's Track ALREADY has
-// `isPlayable: Playable` (Yes / RegionLocked / Unreleased / No(reason)) and the app already honours it in
-// six view holders, ShelfViewHolder's click reroute, MediaHeaderAdapter's play button and
-// StreamableLoader's TrackUnavailableException. THIS IS A FIELD THE DEEZER PARSER NEVER SETS, NOT A
-// FEATURE TO BUILD - so the only open question is what to set it FROM.
-// WHAT WE ALREADY KNOW, AND WHY IT IS NOT ENOUGH:
-//   - TRACK_TOKEN empty correlated 12 of 12 with the unplayable run. Suggestive, measured once, and not
-//     a definition of unavailability.
-//   - FALLBACK_ID DOES NOT ANSWER IT, which is worth stating because it looks like it should. The parser
-//     keeps only `data["FALLBACK"].SNG_ID`, and per the project record FALLBACK is present in the NORMAL
-//     case on both paths with OPPOSITE meanings - playlist pre-substitutes (top-level = playable
-//     substitute, FALLBACK = the original) while search/album keeps the correct track at top-level with
-//     FALLBACK as an alternative. A flag built on its presence would mark ordinary playable tracks.
-// SO: dump the raw key set and let the payload answer. Keys we already consume are listed separately
-// from the ones we DISCARD, because the discarded ones are the whole point - an explicit availability
-// field sitting unread would beat TRACK_TOKEN outright.
-// ONE CAPTURE, NOT TWO: the two flags below are keyed on TRACK_TOKEN empty vs non-empty, so a single
-// pass over the affected playlist emits exactly one unplayable record and one playable one, side by side
-// for comparison. Both fire at most once per process.
-// ⚠️ VALUES ARE TRUNCATED AND ONLY PRINTED FOR DISCARDED KEYS. TRACK_TOKEN and the rest of the
-// consumed set are named but never printed - a token in a shared logcat is not worth the convenience.
-// REMOVAL CONDITION: delete this function, its two flags and the call in toTrack once the key set has
-// been read once. It answers a one-time structural question; leaving it in would dump a record on every
-// cold start forever.
-private var dumpedZeroSize = false
-private var dumpedHasSize = false
-
-// ⚠⚠ FULL VALUES FOR THESE FOUR, NOT THE 160-CHAR TRUNCATION. If any of them states
-// unavailability EXPLICITLY it is a better axis than filesize, because it sidesteps the absent-vs-zero
-// hazard recorded at the FILESIZE_MP3_MISC put below entirely. AVAILABLE_COUNTRIES came back as a bare
-// "{" last run - a structured value cut by the truncation, not an empty one.
-private val FULL_VALUE_KEYS = setOf("RIGHTS", "SNG_STATUS", "STATUS", "AVAILABLE_COUNTRIES")
-
-private val CONSUMED_KEYS = setOf(
-    "ALB_ID", "ALB_PICTURE", "ALB_TITLE", "ARTISTS", "AUTHOR", "DIGITAL_RELEASE_DATE", "DISK_NUMBER",
-    "DURATION", "EXPLICIT_LYRICS", "FALLBACK", "FILESIZE_MP3_MISC", "GAIN", "ISRC", "LOVE_STATUS",
-    "PHYSICAL_RELEASE_DATE", "SNG_CONTRIBUTORS", "SNG_ID", "SNG_TITLE", "TRACK_NUMBER", "TRACK_TOKEN",
-    "TYPE", "VERSION",
-)
-
-// Deliberately NOT DeezerParser.contentOrNull(): that one is a CLASS-PRIVATE member extension and is
-// unreachable from a top-level function. Goes when the probe goes.
-private fun JsonElement?.probeStr(): String? =
-    (this as? JsonPrimitive)?.takeIf { it !is JsonNull }?.content
-
-private fun dumpRawRecordOnce(data: JsonObject) {
-    // ⚠⚠ RE-KEYED ON FILESIZE, NOT ON TRACK_TOKEN. The token axis is REFUTED: the 2026-09-12
-    // capture fired only the HAS-TOKEN slot, and the record it caught was an UNPLAYABLE track WITH a
-    // token and every FILESIZE variant at 0. See the toSlim note in HistoryEntity for why an empty token
-    // means "this track lost its extras", not "this track cannot play". Keying on the refuted axis is
-    // also why the side-by-side never happened - both slots wanted the same kind of record.
-    // Zero when EVERY FILESIZE* key present is "0" or blank; `sizeKeys` is printed so "all zero" and
-    // "no such keys" stay distinguishable, because those are different findings.
-    val sizeKeys = data.keys.filter { it.startsWith("FILESIZE") }
-    val allZero = sizeKeys.all { (data[it].probeStr() ?: "0").trim().let { v -> v.isEmpty() || v == "0" } }
-    if (allZero && dumpedZeroSize) return
-    if (!allZero && dumpedHasSize) return
-    if (allZero) dumpedZeroSize = true else dumpedHasSize = true
-
-    val label = if (allZero) "ZERO-SIZE" else "HAS-SIZE"
-    val id = data["SNG_ID"].probeStr().orEmpty()
-    val title = data["SNG_TITLE"].probeStr().orEmpty()
-    val discarded = data.keys.filter { it !in CONSUMED_KEYS }.sorted()
-    println("GladixDeezer RAWTRACK[$label] id=$id title=${title.take(60)} sizeKeys=${sizeKeys.size}")
-    println("GladixDeezer RAWTRACK[$label] allKeys=${data.keys.sorted().joinToString(",")}")
-    // ⚠️ EVERY FILESIZE* KEY, CONSUMED OR NOT - THE PROBE'S OWN LESSON, FIXED HERE.
-    // The consumed/discarded split below suppressed FILESIZE_MP3_MISC's VALUE last run, because we
-    // already read that key - and it was the single field the question turned on. A probe that filters
-    // by "do we already use this?" can hide the answer to "what should we use?". The split still looks
-    // obviously right, which is why this line exists rather than a wider rule.
-    sizeKeys.sorted().forEach { k ->
-        println("GladixDeezer RAWTRACK[$label] $k=${data[k].probeStr() ?: data[k].toString()}")
-    }
-    println("GladixDeezer RAWTRACK[$label] TRACK_TOKEN_EMPTY=${data["TRACK_TOKEN"].probeStr().isNullOrEmpty()}")
-    discarded.forEach { k ->
-        val v = data[k].probeStr() ?: data[k].toString()
-        val cap = if (k in FULL_VALUE_KEYS) 2000 else 160
-        println("GladixDeezer RAWTRACK[$label] $k=${v.take(cap)}")
-    }
-    // FALLBACK is in the consumed set but only its SNG_ID is kept, so its own shape is still unread.
-    (data["FALLBACK"] as? JsonObject)?.let {
-        println("GladixDeezer RAWTRACK[$label] FALLBACK.keys=${it.keys.sorted().joinToString(",")}")
-    }
-}
-
 class DeezerParser(private val session: DeezerSession) {
 
-    /**
-     * Cap on the raw-item JSON dump. TEMPORARY — this and the firstItem= field it feeds are deleted after
-     * one capture; the two DROP printlns elsewhere are permanent and are NOT part of this.
-     *
-     * Raised 600 → 3000 on 2026-09-05: at 600 the last capture truncated mid-object at `item_id=`, which
-     * is the point the question turns on — whether a nested media object hangs off item_id, or the whole
-     * payload is telemetry, which decides whether smarttracklist can be supported at all.
-     *
-     * ⚠️ DO NOT RAISE THIS ABOVE ~3500. println goes to System.out, which Android redirects into logcat,
-     * and a logcat entry's payload is capped near 4000 bytes — beyond that the line is truncated by the
-     * PLATFORM with no marker, so a larger cap buys nothing and silently looks like a short object. 3000
-     * leaves room for the ~100-char prefix. If one item genuinely exceeds that, the fix is chunked output,
-     * not a bigger number.
-     */
-    private val RAW_ITEM_LOG_CAP = 3000
 
     /**
      * The SECTION overload — the receiver is the whole section object, not a bare data array.
@@ -247,10 +145,9 @@ class DeezerParser(private val session: DeezerSession) {
                 rawItems.isEmpty() -> "items-empty"
                 else -> "no-item-parsed"
             }
-            val first = rawItems?.firstOrNull()?.toString()?.take(RAW_ITEM_LOG_CAP) ?: "-"
             println(
                 "GladixDeezer DROP section=\"$name\" reason=$reason raw=${rawItems?.size ?: 0} " +
-                    "parsed=0 target=${target ?: "?"} firstItem=$first"
+                    "parsed=0 target=${target ?: "?"}"
             )
         }
 
@@ -730,12 +627,63 @@ class DeezerParser(private val session: DeezerSession) {
             //   TestExtension already sets Playable.Unreleased, so the path is exercised.
             // Deezer tracks therefore default to Playable.Yes and render as ordinary rows - which is why
             // Deezer's own app greys these and ours does not.
-            // ⚠️ WHAT IS NOT KNOWN IS WHAT TO SET IT FROM, and that is the only open part.
-            // TRACK_TOKEN empty correlated 12/12 on one capture (2026-09-12) and is suggestive, not a
-            // definition. FALLBACK_ID does NOT answer it - see the probe note above for why its presence
-            // marks ordinary playable tracks on both paths. Resolve that before populating this.
+            // ⚠⚠ CLOSED 2026-09-12: THERE IS NO PARSE-TIME FIELD TO SET IT FROM, SO GREYING
+            // OUT IN ADVANCE IS NOT ACHIEVABLE HERE. This cost three captures; do not re-open it without
+            // reading all four sections below.
+            //
+            // WHY NOT: AVAILABILITY IS DECIDED AT TOKEN EXCHANGE, NOT IN THE CATALOGUE RECORD. Three
+            // stream-time failure branches in DeezerTrackClient.createStreamableForQuality prove where the
+            // decision lives:
+            //   :40  "License token has no sufficient rights on requested media" -> step FLAC -> 320 -> 128
+            //   :43  all qualities exhausted -> throw Exception("Track not available on server")
+            //   :49  "Track token has no sufficient rights on requested media" OR mediaIsEmpty -> FALLBACK
+            // ⚠⚠ AND THAT CHAIN IS SHIPPED DESIGN, NOT OUR READING OF IT. An earlier session
+            // built it deliberately - "Fixed quality fallback: FLAC -> 320 -> 128kbps (was FLAC -> 128,
+            // skipping 320)" and "Replaced ClientException.LoginRequired catch-all with Exception('Track not
+            // available on server')". A PER-QUALITY STEPDOWN WOULD BE POINTLESS IF A CATALOGUE FIELD
+            // ANSWERED THE QUESTION. Same record adds the ACCOUNT dimension: "dzp (shared server) tracks
+            // confirmed not affected - all three qualities go through shared server on tested account" -
+            // same track, different account, different outcome. No per-track field can express that.
+            //
+            // FOUR DEAD CANDIDATES - DO NOT RE-TEST THESE:
+            //   TRACK_TOKEN  empty means the track LOST ITS EXTRAS (HistoryEntity.toSlim empties the map),
+            //                i.e. provenance, not availability. See the note at loadTrack's self-heal gate.
+            //   FILESIZE     an id from a wholly unplayable album (11764421, "Since I Fell For You") had
+            //                REAL filesize values and does not play.
+            //   RIGHTS       a track with RIGHTS={} PLAYS (69106336, "All Day and All of the Night",
+            //                verified on device). An empty rights object cannot mean "no rights".
+            //   STATUS       same record: STATUS=3 and it plays.
+            // RIGHTS and AVAILABLE_COUNTRIES are INPUTS to a decision made elsewhere; FILESIZE and STATUS
+            // describe the catalogue entry. None of them is the verdict.
+            //
+            // THE COMPLETE KEY SET OF A GATEWAY SONG RECORD, so "did anyone check the other fields" has an
+            // answer: ALB_ID ALB_PICTURE ALB_TITLE ARTISTS ART_ID ART_NAME DATE_ADD DURATION
+            // EXPLICIT_TRACK_CONTENT FILESIZE FILESIZE_AAC_64 FILESIZE_FLAC FILESIZE_FLAC_24
+            // FILESIZE_MP3_128 FILESIZE_MP3_256 FILESIZE_MP3_320 FILESIZE_MP3_64 FILESIZE_MP4_RA1
+            // FILESIZE_MP4_RA2 FILESIZE_MP4_RA3 GAIN HIERARCHICAL_TITLE ISRC LYRICS_ID MD5_ORIGIN MEDIA
+            // MEDIA_VERSION RANK_SNG RIGHTS SMARTRADIO SNG_CONTRIBUTORS SNG_ID SNG_TITLE STATUS TRACK_TOKEN
+            // TRACK_TOKEN_EXPIRE TYPE UPLOAD_ID USER_ID VERSION __TYPE__
+            // Identifiers, titles, artist fields, eleven filesizes, ISRC, MD5_ORIGIN, the token and its
+            // expiry, ranking and contributor metadata. MEDIA is the only other glanceable one and it is
+            // covered by the same argument: the media array arrives from the MEDIA ENDPOINT at request time,
+            // not from this record. Nothing plausible remains.
+            //
+            // ⚠️ THE DESIGN ERROR, WHICH IS THE TRANSFERABLE PART: the probe that produced those
+            // three captures filled two slots keyed on FILESIZE zero/non-zero, and the slot LABELS were then
+            // read as "playable"/"unplayable". The label depended on the hypothesis under test, so it
+            // asserted the very thing being measured. Opening a playlist filled both slots from whichever
+            // records parsed first, giving arbitrary pairs that could not answer a question about specific
+            // named tracks. IF A PROBE'S LABEL DEPENDS ON THE HYPOTHESIS, IT CANNOT TEST THE HYPOTHESIS -
+            // label from something independently verified (a named id) instead.
+            //
+            // PARKED, SEPARATELY AND NOT PART OF THIS CLOSURE: remember a track that FAILED to play and mark
+            // it unplayable for the session, so the second tap is not as blind as the first. The failure is
+            // already detected in the right place - StreamableLoader throws TrackUnavailableException - and
+            // Playable.No(reason) exists to carry it. ⚠️ COST, STATED: this is NEW MACHINERY, not
+            // a field to populate. There is no per-track unplayable store, and MediaItemUtils.buildLoaded
+            // replaces `state` wholesale, so a mark would not survive the next resolution. Scope it as its
+            // own item or not at all.
             extras = buildMap {
-                dumpRawRecordOnce(data)
                 put("FALLBACK_ID", data["FALLBACK"]?.jsonObject?.str("SNG_ID").orEmpty())
                 put("TRACK_TOKEN", data.str("TRACK_TOKEN").orEmpty())
                 // ⚠⚠ `?: "0"` COLLAPSES "KEY MISSING" AND "VALUE ZERO" INTO ONE STRING, AND

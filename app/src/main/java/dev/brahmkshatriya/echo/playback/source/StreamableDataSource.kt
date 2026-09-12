@@ -91,7 +91,16 @@ class StreamableDataSource(
         // LIVES IN THIS COMPANION, not its own: Kotlin allows exactly ONE companion per class, and this
         // one already existed for Streamable.Source.uri below. Adding a second made BOTH invalid, which
         // also unresolved the uri reference in open() - the failure reads as two unrelated errors.
-        // REMOVE WITH THE PROBE. This is diagnostic scaffolding, not a feature.
+        // ⚠⚠ PROMOTED TO PERMANENT 2026-09-12 - THESE OUTLIVED THE PROBE THEY WERE BUILT FOR
+        // AND NOW BELONG TO THE BUFFERING WATCHDOG. The note here used to read "REMOVE WITH THE PROBE. This
+        // is diagnostic scaffolding, not a feature." That is no longer true of either counter:
+        //   PlayerEventListener.armBufferingWatchdog snapshots both per item (openCountAtItemStart,
+        //     bytesReadAtItemStart) and reports the deltas, so they are wired into a live mechanism rather
+        //     than into a one-off capture;
+        //   and the `opens=0 bytes=0` pair has come back POPULATED in two Crashlytics reports in one week -
+        //     it is what established that a stall never made a connection at all, which no other field says.
+        // A counter whose consumer is a shipped watchdog is instrumentation, not scaffolding. Do not strip
+        // these with the temporary trace lines elsewhere in the tree.
         val openCount = AtomicInteger(0)
 
         // PROBE (2026-09-01). Total bytes DELIVERED through read(), process wide, same rationale and
@@ -104,7 +113,9 @@ class StreamableDataSource(
         // which are driven from inside the read loop — so bytes arriving in quantity with nothing prepared
         // puts the fault downstream of delivery, and near-zero bytes puts it at the connection.
         // Long, not Int: a single track is megabytes and this is process-wide across a session.
-        // REMOVE WITH THE PROBE.
+        // PERMANENT - see the note at openCount above. The "REMOVE WITH THE PROBE" that stood here was
+        // retired 2026-09-12: the field's own rationale above (bytes is what splits the two stalls that
+        // look identical in a report) is a description of a permanent diagnostic, not a temporary one.
         val bytesRead = AtomicLong(0)
 
         val Streamable.Source.uri

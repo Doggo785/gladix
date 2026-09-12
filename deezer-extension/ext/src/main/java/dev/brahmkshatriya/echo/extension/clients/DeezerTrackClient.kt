@@ -49,7 +49,7 @@ class DeezerTrackClient(private val deezerExtension: DeezerExtension, private va
                 mjString.contains("Track token has no sufficient rights on requested media") || mediaIsEmpty -> {
                     val fallBackId = track.extras["FALLBACK_ID"].orEmpty()
                     if (quality == "128") {
-                        val fallbackObject = api.track(fallBackId, "streamable.fallbackId")
+                        val fallbackObject = api.track(fallBackId)
                         val resultOj = fallbackObject["results"]?.jsonObject!!
                         val fallBackTrack = parser.run { resultOj.toTrack() }
                         val fbMediaJson = api.getMP3MediaUrl(fallBackTrack, true)
@@ -64,7 +64,7 @@ class DeezerTrackClient(private val deezerExtension: DeezerExtension, private va
                 }
 
                 mjString.contains("An error occurred while decoding track token") -> {
-                    val fallbackObject = api.track(currentTrackId, "streamable.tokenDecode")
+                    val fallbackObject = api.track(currentTrackId)
                     val resultOj = fallbackObject["results"]?.jsonObject!!
                     val fallBackTrack = parser.run { resultOj.toTrack() }
                     val fbMediaJson = api.getMP3MediaUrl(fallBackTrack, true)
@@ -235,7 +235,7 @@ class DeezerTrackClient(private val deezerExtension: DeezerExtension, private va
         // Do not reuse this condition as an availability test. See the pattern note at HistoryEntity.toSlim.
         val track = if (original.extras["TRACK_TOKEN"].isNullOrEmpty()) {
             val fresh = runCatching {
-                api.track(original.id, "loadTrack.selfheal")["results"]?.jsonObject?.let { results ->
+                api.track(original.id)["results"]?.jsonObject?.let { results ->
                     parser.run { results.toTrack() }
                 }
             }.getOrElse { if (it is CancellationException) throw it else null }

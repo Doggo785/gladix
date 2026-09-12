@@ -26,6 +26,32 @@ class QueueAdapter(
     private val inactive: Boolean = false
 ) : ListAdapter<Pair<Boolean?, MediaItem>, QueueAdapter.ViewHolder>(DiffCallback) {
 
+    // ⚠⚠ THE QUEUE DRAG DEPENDS ON areItemsTheSame COMPARING mediaId. IT IS NOT SAFE BY
+    // DEFAULT - IT IS SAFE BECAUSE OF THIS LINE, AND CHANGING IT WOULD BREAK THE DRAG SILENTLY FROM A LONG
+    // WAY AWAY. QueueFragment.onMove reorders this adapter's list in place and submits it; DiffUtil can only
+    // resolve that to a MOVE if items are identified by a stable key. Compare positions or whole objects
+    // instead and the diff becomes remove+insert, the dragged row is recycled, and
+    // ItemTouchHelper.onChildViewDetachedFromWindow (ItemTouchHelper.java:902-916, recyclerview 1.4.0)
+    // calls select(null, ACTION_STATE_IDLE) - the drag ends mid-gesture with nothing logged.
+    //
+    // ⚠️ [CORRECTED 2026-09-12] A PROJECT NOTE CLAIMED areContentsTheSame IS EFFECTIVELY ALWAYS
+    // FALSE - "MediaItem.equals() uses Bundle.equals() which is REFERENCE equality, so two separately-built
+    // items with identical data always produce false, guaranteeing bind() on every queue replacement."
+    // THAT DOES NOT HOLD FOR media3 1.11.0. MediaMetadata.equals compares extras for NULL-NESS ONLY -
+    // its final term is `((extras == null) == (that.extras == null))` - and the field's own doc
+    // (MediaMetadata.java:1180) states "the contents of these extras are not considered in the equals and
+    // hashCode". Bundle.equals is never reached. So contents compare by VALUE: title, artist, artwork uri,
+    // ratings and the rest.
+    // ⚠️ AND FOR THE DRAG IT IS MOOT EITHER WAY, WHICH IS THE STRONGER POINT: onMove reorders the
+    // SAME INSTANCES rather than rebuilding them, so every areContentsTheSame call compares a value to
+    // itself. One move, zero rebinds, whatever equals does. A submit carrying freshly-built items (from
+    // queueFlow) is the case that rebinds - and those are gated out during a drag by isDragging.
+    //
+    // ⚠️ UNVERIFIED: DUPLICATE mediaIds. A radio top-up can re-add a track already queued, giving
+    // two upcoming rows that are genuinely interchangeable to DiffUtil. For a single-element move the diff
+    // should still resolve to one move, because the rest of the list is unchanged and the moved element is
+    // matched by position-within-equal-keys. Not proven. The capture is where to watch for it: a duplicate
+    // mishandled would show as `QUEUEDRAG clearView` firing mid-drag, the same signature as a detach.
     object DiffCallback : DiffUtil.ItemCallback<Pair<Boolean?, MediaItem>>() {
         override fun areItemsTheSame(
             oldItem: Pair<Boolean?, MediaItem>,

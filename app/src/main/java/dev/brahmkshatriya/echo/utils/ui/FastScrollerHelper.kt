@@ -151,7 +151,13 @@ object FastScrollerHelper {
      * [appBar] is the collapsing header ABOVE this list, or null on a full-bleed screen. Passing it makes
      * the scroll metrics COMPOSITE — see PixelFastScrollViewHelper's note. Null keeps today's arithmetic
      * exactly, so the six full-bleed call sites are unchanged by construction rather than by testing.
-     * [traceTag] labels the temporary GladixScroll lines; REMOVE WITH THE TRACE.
+     * [traceTag] labels the GladixScroll trace lines.
+     * ⚠⚠ RETAINED DELIBERATELY - NOT PENDING A REMOVAL CONDITION (2026-09-12). The GladixScroll
+     * trace is kept at the user's explicit request for an OPEN Search investigation (the 2/3 stall and the
+     * short-of-bottom case); it is the instrument that investigation needs. It was reviewed in the
+     * 2026-09-12 temporary-logging inventory and deliberately left in place.
+     * So "REMOVE WITH THE TRACE" markers in this file and PixelFastScrollViewHelper describe what goes
+     * TOGETHER when the trace eventually goes - they are NOT a signal that it is ready to go now.
      */
     /**
      * ⚠️ THE COMPOSITE PATH WENT LIVE AGAIN ON 2026-09-07 AND HAS NOT RUN SINCE 4c4fb267. READ THIS

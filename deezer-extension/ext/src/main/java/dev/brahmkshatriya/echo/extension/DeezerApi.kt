@@ -349,6 +349,8 @@ class DeezerApi(private val session: DeezerSession) {
                     is JsonArray -> resultsElement.isNotEmpty()
                     else -> true
                 }
+                // ⚠⚠ PERMANENT (2026-09-12). It began as the Rule-A/Rule-B probe and was kept
+                // when the throw shipped, for the reason below rather than by omission.
                 // ⚠⚠ THE LOG LINE STAYS ALONGSIDE THE THROW, AND THAT IS NOT BELT-AND-BRACES.
                 // The most frequent real trigger lands on a path that SWALLOWS the throw - see below - so
                 // without this line those refusals become invisible again, which is the exact defect this
@@ -577,8 +579,7 @@ class DeezerApi(private val session: DeezerSession) {
 
     private val deezerTrack by lazy { DeezerTrack(this) }
 
-    suspend fun track(id: String, caller: String = "?"): JsonObject =
-        deezerTrack.track(id, caller)
+    suspend fun track(id: String): JsonObject = deezerTrack.track(id)
 
     suspend fun getListData(ids: List<String>): List<JsonObject> = deezerTrack.getListData(ids)
 
@@ -682,63 +683,6 @@ class DeezerApi(private val session: DeezerSession) {
     }
 
     //<============= Lyrics =============>
-
-    // == TEMPORARY: "MADE FOR ME" ID-SHAPE PROBE =================================================
-    // (!) DELETE THIS FUNCTION AND ITS CALL IN DeezerHomeFeedClient.probeSmartTracklist once the ids are
-    // in hand. It costs two network round-trips on the first Home load of each process.
-    //
-    // WHAT IT ANSWERS, AND WHY IT CANNOT BE ANSWERED ANY OTHER WAY. Deezer serves smarttracklist tracks
-    // over GRAPHQL at pipe.deezer.com, not over the gw-light.php gateway — page.get with
-    // PAGE="smarttracklist/<id>" is refused outright ("Page type smarttracklist does not exist",
-    // measured 2026-09-07). The query is verified from open source:
-    //   music-assistant/deezer-python-gql, queries/get_smart_tracklist.graphql —
-    //     query GetSmartTracklist($smartTracklistId: String!, $first: Int = 50, $after: String)
-    //     { smartTracklist(smartTracklistId: $smartTracklistId) { … tracks(first:, after:)
-    //       { edges { cursor node { ...TrackFields } } pageInfo { … } } } }
-    //   response path data.smartTracklist.tracks.edges[].node, confirmed twice — by the .graphql
-    //   document and by the generated model deezer_python_gql/generated/get_smart_tracklist.py
-    //   (smart_tracklist aliased "smartTracklist", page_info aliased "pageInfo").
-    //
-    // ⚠️ WHAT THAT VERIFICATION DOES NOT ESTABLISH — AND THIS PROJECT HAS BEEN BURNED BY EXACTLY THIS.
-    // It establishes that the endpoint EXISTS and what shape it returns. IT DOES NOT ESTABLISH THAT IT
-    // ACCEPTS THE IDS WE HOLD. playlist.getSongs was verified the same way, against the same class of
-    // repo, applied and committed — and the following session opened with "the prior playlist.getSongs
-    // switch did NOT fix the wrong Piper (both methods read the same mis-attributed stored records)".
-    // The method was real exactly as documented; it did not answer the question being asked of it.
-    //
-    // AND THE FIXTURES IN THAT REPO CANNOT SETTLE IT. tests/fixtures/get_smart_tracklist.json and
-    // get_made_for_me.json give ids "smart:daily_mix_1" / "flow:default" with covers at
-    // .../images/misc/smart_1/264x264.jpg. Those are HAND-WRITTEN, not captured: real Deezer covers are
-    // md5-addressed (/images/cover/<32-hex>/…, which is what DeezerParser.getCover builds). They match
-    // NEITHER form our Home payload carries. The field is a String; that is all a fixture can prove.
-    //
-    // SO ASK THE API FOR ITS OWN IDS. `me { madeForMe }` returns SmartTracklist nodes whose `id` is BY
-    // DEFINITION what smartTracklist(smartTracklistId:) accepts — same schema, same type. Comparing those
-    // against the two ids in our Home item is a measurement, not a guess. Query shape taken verbatim from
-    // music-assistant/deezer-python-gql, queries/get_made_for_me.graphql; PageInfoFields is dropped here
-    // because only the ids matter and inlining the fragment would add nothing.
-    suspend fun probeMadeForMe(): JsonObject {
-        val request = Request.Builder()
-            .url("https://auth.deezer.com/login/arl?jo=p&rto=c&i=c")
-            .post(RequestBody.EMPTY)
-            .headers(Headers.headersOf("Cookie", "arl=$arl; sid=$sid"))
-            .build()
-        val response = clientNP.newCall(request).await()
-        val jwt = decodeJson(response.body.string())["jwt"]?.jsonPrimitive?.content
-        val params = encodeJson {
-            put("operationName", "GetMadeForMe")
-            put("query", $$"query GetMadeForMe($first: Int = 10) { me { madeForMe(first: $first) { edges { node { __typename ... on SmartTracklist { id title subTitle } ... on Flow { id title } } } } } }")
-            putJsonObject("variables") {
-                put("first", 10)
-            }
-        }
-        val pipeRequest = Request.Builder()
-            .url("https://pipe.deezer.com/api")
-            .post(params.toRequestBody())
-            .headers(Headers.headersOf("Authorization", "Bearer $jwt", "Content-Type", "application/json"))
-            .build()
-        return decodeJson(clientNP.newCall(pipeRequest).await().body.string())
-    }
 
     /**
      * Track ids for one smarttracklist, over GRAPHQL. NOT the gateway — page.get has no smarttracklist

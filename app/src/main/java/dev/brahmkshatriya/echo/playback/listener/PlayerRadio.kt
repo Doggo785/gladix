@@ -1051,6 +1051,16 @@ class PlayerRadio(
                 }
             player.addMediaItems(items)
             if (player.playbackState == Player.STATE_IDLE) player.prepare()
+            // ⚠⚠ PROMOTED TO PERMANENT 2026-09-12. THE MOST USEFUL DIAGNOSTIC IN THE APP - IT
+            // HAS ANSWERED FOUR QUESTIONS IT WAS NOT BUILT FOR. Built for the three-copies duplicate hunt,
+            // it then settled: whether an append was landing against a stale queue (the epoch work), how
+            // many times an exhausted station regenerated (eight before generationInFlight, two after), and
+            // WHICH caller produced a given append (the `source=` tag). Do not strip it with the temporary
+            // lines; it is not one.
+            // ⚠️ WHY IT GENERALISES, so the next diagnostic can be built the same way: it prints
+            // on EVERY append rather than only on failures, so silence means "no append happened" and
+            // nothing else; and it carries the CALLER, which is what let one line answer questions about
+            // four different code paths. Those two properties are the whole reason it outlived its purpose.
             // ⚠⚠ OFFERED vs ADDED, TAGGED BY SOURCE - THE LINE THAT MAKES A DUPLICATE HUNT
             // DECIDABLE. On 2026-09-11 three copies of one recording reached the queue and NOTHING in the
             // log could say which append produced them, so two rounds were spent reasoning about which
@@ -1113,11 +1123,24 @@ class PlayerRadio(
                 // zero-yield, consulted before regenerating - the same key shape claimFallback already uses,
                 // for the same reason (per-queue, so a new queue retries). It collapses the eight to one and
                 // takes the seed-not-loaded refusals with them as a side effect.
-                // NOT DONE HERE, and the reason is a real open question rather than scope timidity: the memo
-                // needs a LIFETIME, and "exhausted" is not permanent - a station that is spent now may serve
-                // fresh tracks in an hour, so a memo keyed only on (epoch, id) suppresses a legitimate later
-                // retry for the rest of the queue. Deciding that needs a policy this file does not have yet.
-                // Do not build it as a bare `Set` without answering that.
+                // ⚠⚠ [CLOSED 2026-09-12 - NOT WORTH BUILDING. MEASURED, NOT ARGUED.]
+                // The blocker recorded here was that the memo needs a LIFETIME: "exhausted" is not
+                // permanent, so a memo keyed on (epoch, id) would suppress a legitimate later retry.
+                // THAT PROBLEM NEVER HAS TO BE SOLVED, because generationInFlight removed almost all of the
+                // waste the memo was aimed at:
+                //     before generationInFlight   EIGHT site=loadPlaylist regenerations in one context
+                //     after                       TWO, spread 34 seconds apart
+                // Two spread over 34s is ordinary top-up cadence, not a loop. And the suppression line
+                // (LOADPLAYLIST reason=generation_in_flight) fires exactly once, right where the 19ms burst
+                // used to be.
+                // ⚠️ SO THE DIAGNOSIS RECORDED ABOVE WAS RIGHT ABOUT THE COUNT AND WRONG ABOUT
+                // THE CAUSE, WHICH IS THE PART WORTH KEEPING. The eight regenerations were read as
+                // REPETITION - one per qualifying transition, inherent to Empty erasing the station - and
+                // the memo was designed against that. They were almost entirely CONCURRENCY: several
+                // coroutines entering loadPlaylist from one callback. Fixing the concurrency left a residual
+                // that needs no fix, and the expensive change was never required.
+                // Two counts, one mechanism each, and only measurement separated them. Do not rebuild the
+                // memo without first showing that the regeneration count is high again.
                 stateFlow.value = if (tracks.continuation == null) PlayerState.Radio.Empty
                 // Stamped here and not carried through copy(): play() receives an UNSTAMPED Loaded straight
                 // from start() on the radio()/trackRadio paths, so relying on copy() alone would publish -1L
@@ -1185,6 +1208,14 @@ class PlayerRadio(
                         // was perfectly usable - the dedupKeys note records the pre-resolution seed as
                         // `ta:underwater\0the frogmen`, artist present - so those EIGHT seed-not-loaded
                         // refusals should now succeed on the first attempt instead of the third.
+                        // ⚠⚠ [CONFIRMED 2026-09-12 - PREDICTION MET, ZERO OBSERVED.] The same
+                        // Frogmen artist station that produced the eight refusals now reaches the bridge on
+                        // its FIRST attempt: `LASTFM q="The Frogmen - Underwater" artist="The Frogmen"
+                        // reason=ok similar=25 searched=10 matched=6`, and NO seed-not-loaded line anywhere
+                        // in the capture. So the queued copy WAS usable all along, exactly as the dedupKeys
+                        // note recorded, and loaded-ness was the wrong gate. The content-first rule in
+                        // resolveSeed is what changed it. The prediction below stands as written and is kept
+                        // because the reasoning is what makes the result checkable, not the outcome.
                         // ⚠⚠ THE PREDICTION IS ZERO, NOT "FEWER", AND ZERO IS WHAT MAKES IT A
                         // TEST. On this path candidate is null, so `ordered` holds exactly one entry - the
                         // queued copy - and seed-not-loaded can now fire ONLY if that copy has a blank
@@ -1207,6 +1238,14 @@ class PlayerRadio(
                         // emitted by the marker and by nothing else, so the two fixes are read from two
                         // disjoint log lines and neither can borrow the other's evidence.
                         val check = resolveSeed(player, null)
+                        // ⚠⚠ PROMOTED TO PERMANENT 2026-09-12 - reason= AND artist= BOTH.
+                        // `reason=` separates SIX outcomes that would otherwise be one silence
+                        // (seed-not-loaded / no-seed / no-seed-fields / already_claimed / ok / no-similar),
+                        // and every one of those has been read off a real capture at least once.
+                        // `artist=` earned its place independently: it is what exposed the metadata-timing
+                        // bug - q="Unknown - Kokomo" on YTM, q="The Frogmen - Underwater" after the
+                        // content-first fix - and confirmed the zero-refusal prediction. The query being
+                        // readable at a glance IS the fix for "Unknown", not a step toward one.
                         // ⚠️ A SKIP HERE IS A SILENT NO-RESCUE - THE QUEUE ENDS. That is correct
                         // (a lookup on a blank or absent artist cannot match anything), but it means this log
                         // line is LOAD-BEARING rather than decorative: without it, an unresolved seed is
@@ -1387,6 +1426,13 @@ class PlayerRadio(
         // startRadio -> here, i.e. ONE generation, so it has no duplicate to remove and never claims the
         // marker. ⚠️ PARKED, RECORDED NOT FIXED: an AA single-track queue with autoStartRadio OFF
         // therefore gets no radio at all, because AA has no trackRadio equivalent to generate one.
+        // ⚠⚠ BOTH LOADPLAYLIST reason= LINES ARE PERMANENT AS OF 2026-09-12, AND THE PAIRING IS
+        // WHY. Each fires only on a refusal, which alone would be ambiguous - silence could mean "no
+        // refusal" or "loadPlaylist never ran". The always-printing half is the adjacent
+        // `append site=loadPlaylist` line: refusal line present = suppressed, append present = proceeded,
+        // neither = never entered. DO NOT STRIP ONE WITHOUT THE OTHER; they are one instrument.
+        // generation_in_flight is what measured the concurrency fix (one line exactly where the 19ms burst
+        // used to be), and track_radio_generating is what proves the duplicate suppression end to end.
         if (trackRadioGenerating.get()) {
             Log.d("GladixRadio", "LOADPLAYLIST reason=track_radio_generating")
             return
@@ -1587,6 +1633,8 @@ class PlayerRadio(
         if (itemContext != null) {
             val kind = (itemContext as? Radio)?.extras?.get(RADIO_KIND_EXTRA)
             if (kind != RADIO_KIND_TRACK) {
+                // PERMANENT (2026-09-12): already "mandatory" here, now said in the word used everywhere
+                // else so a strip pass cannot misread it as temporary.
                 // Mandatory - see the gate note above. `kind` is reported verbatim so an ABSENT key is
                 // distinguishable from a present-but-different one, which is the whole point: absent means
                 // the key was dropped somewhere upstream and Radio.kind() is simultaneously treating this

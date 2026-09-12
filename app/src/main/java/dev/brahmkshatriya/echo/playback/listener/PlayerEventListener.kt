@@ -185,6 +185,32 @@ class PlayerEventListener(
         }
     }
 
+    // ⚠⚠ THIS DEBOUNCE STARVES UNDER A QUEUE DRAG, AND THAT BROKE REORDERING FOR THREE MONTHS.
+    // THE ARITHMETIC, which reads as obvious once stated and is invisible otherwise:
+    //   a drag fires QueueFragment's onMove roughly every 16ms (once per frame);
+    //   each one calls moveMediaItem -> onTimelineChanged -> here;
+    //   this CANCELS the pending job and restarts a 50ms timer;
+    //   so the timer NEVER EXPIRES while the finger is moving.
+    // No emission means no queueFlow, no submitList, and an adapter that never reorders - so
+    // ItemTouchHelper re-asked for the same move every frame (`onMove 22->21` x10, measured 1102) while
+    // LinearLayoutManager.prepareForDrop scrolled the list instead of moving the tile. THAT is why "barely
+    // move it" works - a pause lets the 50ms elapse - and a continuous drag does not.
+    // ⚠⚠ INTRODUCED BY 2e11248c (2026-06-24), WHICH ADDED fullQueueFlow AND THIS DEBOUNCE
+    // TOGETHER. QueueFragment.onMove is UNCHANGED across all four of its commits and QueueAdapter has not
+    // been touched since 2025 - SO THE BREAK CAME FROM A CHANGE MADE ON ANOTHER SCREEN'S BEHALF, and the
+    // next person reading onMove will not find the cause there. That is the whole reason this note is here
+    // rather than only at the drag site.
+    // ⚠⚠ DO NOT FIX IT BY EXEMPTING THE DRAG. Two independent justifications, NEITHER about
+    // drag, and a caller-dependent branch on a timer that fires every 16ms is the wrong place to get
+    // timing right:
+    //   RENDERING - changeQueue's incremental removeMediaItems/addMediaItems each fire a separate
+    //     onTimelineChanged, and without coalescing the UI renders intermediate, partially-torn-down queue
+    //     states.
+    //   MEMORY - the Car/AA OOM audit lists "everything replace-latest (fullQueueFlow StateFlow) or
+    //     debounce-cancel" as one of the reasons there are no per-switch leaks. Cancel-and-restart is doing
+    //     work that investigation relied on.
+    // The drag was fixed on its own side instead: QueueFragment.onMove now reorders the adapter locally, so
+    // the gesture no longer depends on this round trip at all.
     private var pendingFullQueueUpdate: Job? = null
     private fun emitFullQueue() {
         pendingFullQueueUpdate?.cancel()
@@ -456,36 +482,33 @@ class PlayerEventListener(
             // windowed-index seeks). Guarded so it fires exactly once and loses to a user action: mediaId must
             // still be the restored track (not one the user tapped mid-buffer), and currentPosition must still
             // be at the start (a user seek before this READY moves it past the belt and we leave it alone).
-            consumeRestoreSeek()?.let { seek ->
-                // ⚠⚠ EPOCH FIRST, BEFORE THE TWO OLD GUARDS - THEY CANNOT DECIDE THIS. Read the
-                // mechanism note at PlayerState.pendingRestoreSeek: the latch has no timeout and nothing
-                // clears it on a user action, so after a cold start where the user never pressed play, THIS
-                // STATE_READY can belong to a track the user just tapped. mediaId and the belt are both
-                // SATISFIED by that case - same track, position 0 - because they were written to catch a
-                // DIFFERENT track during the restore's own buffering window.
-                // The epoch is the only term that separates "the queue this position was saved for" from
-                // "a queue the user built afterwards": any user tap replaces the queue, which bumps
-                // queueEpoch structurally at ShufflePlayer's own overrides.
-                // ⚠️ null MEANS UNKEYED AND IS NOT A FAILURE - the onPlaybackResumption arm
-                // cannot read a valid epoch (Media3 applies the queue after that function returns), so it
-                // arms unkeyed and keeps today's behaviour. See the residual note at that site.
-                val staleQueue = seek.epoch != null && seek.epoch != player.queueEpochOrZero
-                if (staleQueue) Log.d(
-                    "GladixPlayback",
-                    "RESTORE_SEEK dropped=${seek.mediaId} builtFor=${seek.epoch} now=${player.queueEpochOrZero}"
-                )
-                if (!staleQueue
-                    && player.currentMediaItem?.mediaId == seek.mediaId
-                    && player.currentPosition < RESTORE_SEEK_BELT_MS
-                ) player.seekTo(seek.positionMs)
+            // ⚠⚠ ONE LINE, ALWAYS PRINTED, STATING WHAT THE GUARD DECIDED - NOT A LINE ONLY
+            // WHEN IT REJECTS. A refusal-only probe cannot tell "fixed" from "never ran", and its silence
+            // has cost three separate rounds of investigation. Here `restoreSeek=` always carries a verdict,
+            // so silence can only mean STATE_READY itself did not happen.
+            // Order matters: pos is captured BEFORE the seek, so the line shows the position the fix was
+            // judging rather than the one it produced.
+            // Epoch is tested FIRST because the two older guards cannot decide this - see the mechanism note
+            // at PlayerState.pendingRestoreSeek: mediaId and the belt are both SATISFIED by a fresh tap on
+            // the restored track, which is the case they were meant to exclude.
+            val posBefore = player.currentPosition
+            val seek = consumeRestoreSeek()
+            val verdict = when {
+                seek == null -> "none"
+                seek.epoch != null && seek.epoch != player.queueEpochOrZero ->
+                    "drop:stale-epoch(builtFor=${seek.epoch},now=${player.queueEpochOrZero})"
+                player.currentMediaItem?.mediaId != seek.mediaId -> "drop:other-track"
+                posBefore >= RESTORE_SEEK_BELT_MS -> "drop:user-moved"
+                else -> "seek:${seek.positionMs}"
             }
-            // ⚠️ TIME-BOXED PROOF, REMOVE WITH THE trackRadio COUNTERPART. Pairs with the
-            // `prepare pos=` line in PlayerCallback.trackRadio: zero there and NON-zero here on a
-            // cold-start search tap is the mechanism demonstrated rather than inferred. Remove BOTH once
-            // one capture shows it, or once a capture shows the drop line above firing instead.
+            if (seek != null && verdict.startsWith("seek")) player.seekTo(seek.positionMs)
+            // ⚠️ TIME-BOXED, REMOVE WITH trackRadio's PAIRED `prepare pos=` LINE. On a cold-start
+            // search tap the pair reads `prepare pos=0` then `READY pos=0 restoreSeek=drop:stale-epoch` -
+            // the fix catching it. `restoreSeek=none` means the latch was never armed and the run did not
+            // exercise the fix at all, which is a DIFFERENT result from the fix working.
             Log.d(
-                "GladixPlayback",
-                "READY pos=${player.currentPosition} id=${player.currentMediaItem?.mediaId}"
+                "GladixQueue",
+                "READY pos=$posBefore id=${player.currentMediaItem?.mediaId} restoreSeek=$verdict"
             )
         }
     }

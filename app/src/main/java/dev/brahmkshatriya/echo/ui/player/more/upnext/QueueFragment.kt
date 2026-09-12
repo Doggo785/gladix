@@ -43,7 +43,6 @@ class QueueFragment : Fragment() {
     // so storing a snapshot would replay a list that may be several mutations stale by the time the finger
     // lifts. Recording only THAT a submit was suppressed lets the catch-up read the latest state. Copying
     // pendingList across would have been the faithful-looking choice and the worse one.
-    private var submitSuppressed = false
 
     // ⚠⚠ PERMANENT, KEEP WHEN THE PROBE BELOW IS DELETED: ItemTouchHelper CAPTURES
     // mSelectedStartY ONCE AND NEVER RE-CAPTURES IT. Read from recyclerview 1.4.0:
@@ -60,9 +59,6 @@ class QueueFragment : Fragment() {
     // documented. Recorded because it reads as a per-screen quirk and is a library-wide one.
     // It explains RUNAWAY, NOT ONSET - the first frame's curY is not yet corrupted, which is exactly why
     // the probe below logs only that frame.
-    private var dragStartTop: Int? = null
-    private var dragItemView: android.view.View? = null
-    private var oobRun = 0
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -105,14 +101,35 @@ class QueueFragment : Fragment() {
                 if (fromPos == RecyclerView.NO_POSITION || toPos == RecyclerView.NO_POSITION)
                     return false
                 // Seam 2/G2: keep current at index 0 — an upcoming track can't be dropped at/above the
-                // current row, so nothing gets stranded above current. Current index read from the
-                // viewModel (same source as submit()), NOT queueAdapter — referencing the adapter here
-                // creates a by-lazy ↔ by-lazy type-inference cycle with its touchHelper-using listener.
-                val currentPos = viewModel.playerState.current.value?.let { c ->
-                    viewModel.queue.indexOfFirst { it.mediaId == c.mediaItem.mediaId }
-                } ?: -1
+                // current row, so nothing gets stranded above current.
+                // ⚠⚠ [CORRECTED 2026-09-12] READ FROM queueAdapter.currentList, NOT viewModel.queue.
+                // The note here used to say the opposite: "Current index read from the viewModel (same
+                // source as submit()), NOT queueAdapter — referencing the adapter here creates a
+                // by-lazy <-> by-lazy type-inference cycle with its touchHelper-using listener." That cycle
+                // was real (18066872 moved the read for it) and IS NOW GONE: queueAdapter and touchHelper
+                // both carry EXPLICIT types, so neither needs the other's type inferred.
+                // And the read MUST come back here, because `toPos` is an ADAPTER index and the adapter now
+                // holds a drag-local order that diverges from viewModel.queue for the rest of the gesture.
+                // Comparing an adapter index against a viewModel-derived one would check the pin against a
+                // stale position the moment the first row is crossed.
+                val currentPos = queueAdapter.currentList.indexOfFirst { it.first != null }
                 if (currentPos != -1 && toPos <= currentPos) return false
                 android.util.Log.d("GladixQueue", "QUEUEDRAG onMove $fromPos->$toPos")
+                // ⚠⚠ THE LOCAL REORDER - THIS IS THE FIX, AND IT MUST SIT AFTER BOTH REFUSALS.
+                // ItemTouchHelper's contract is that `true` means "I moved the items in my data set". We
+                // returned true while moving nothing: onMove only called the PLAYER and waited for
+                // queueFlow to come back, so getAbsoluteAdapterPosition never changed, moveIfNecessary
+                // re-fired on the same from-index every frame, and onMoved -> LinearLayoutManager
+                // .prepareForDrop scrolled the list instead. Measured on 1102: `onMove 22->21` ten times.
+                // SAME INSTANCES, REORDERED - not rebuilt. areContentsTheSame therefore compares a value to
+                // itself for every row, so DiffUtil emits ONE move and ZERO rebinds; see the note at
+                // DiffCallback for why that is what keeps the dragged ViewHolder attached.
+                // ORDER: after the NO_POSITION guard and the pin above, so the UI can never show a move the
+                // player refused. Before moveQueueItems only for readability - that call is async and
+                // returns immediately, so the two cannot interleave meaningfully.
+                queueAdapter.submitList(
+                    queueAdapter.currentList.toMutableList().apply { add(toPos, removeAt(fromPos)) }
+                )
                 viewModel.moveQueueItems(fromPos, toPos)
                 return true
             }
@@ -125,10 +142,6 @@ class QueueFragment : Fragment() {
                 super.onSelectedChanged(viewHolder, actionState)
                 if (actionState == ItemTouchHelper.ACTION_STATE_DRAG) {
                     isDragging = true
-                    // Captured at the same instant, and from the same expression, as ItemTouchHelper's own
-                    // mSelectedStartY (:687) - so the log can show whether that value has gone stale.
-                    dragStartTop = viewHolder?.itemView?.top
-                    dragItemView = viewHolder?.itemView
                 }
                 android.util.Log.d(
                     "GladixQueue", "QUEUEDRAG selected state=$actionState armed=$isDragging"
@@ -149,69 +162,21 @@ class QueueFragment : Fragment() {
                 recyclerView: RecyclerView, viewHolder: RecyclerView.ViewHolder
             ) {
                 super.clearView(recyclerView, viewHolder)
-                android.util.Log.d(
-                    "GladixQueue", "QUEUEDRAG clearView suppressed=$submitSuppressed"
-                )
+                android.util.Log.d("GladixQueue", "QUEUEDRAG clearView")
                 isDragging = false
-                dragStartTop = null
-                dragItemView = null
-                oobRun = 0
-                if (!submitSuppressed) return
-                submitSuppressed = false
-                // ⚠⚠ NO SCROLL ON THE CATCH-UP, AND THE RECORD IS WHY. The
-                // scrollToPosition in submit() arrived on 2026-06-24 with fullCurrentIndex as part of the
-                // WINDOWED-INDEX fix - viewModel.queue had been populated from the 50-item windowed
-                // MediaController timeline, so every index into it pointed at the wrong track. The scroll
-                // was one-time orientation onto the newly-correct row, NOT a continuous invariant that
-                // every commit owes. The drag case was never considered, which is what makes this a gap
-                // being closed rather than a trade-off being reopened.
-                // AND HERE THE CURRENT ROW CANNOT HAVE MOVED: getMovementFlags gives it no drag flags, and
-                // onMove refuses any toPos <= currentPos. So a drag-end scroll would travel to a row that
-                // is exactly where it was, dragging the viewport away from the drop the user is looking at
-                // at the worst possible moment - the instant they lift.
-                submit(scroll = false)
-            }
-
-            // ⚠⚠ TEMPORARY PROBE - REMOVE THIS WHOLE OVERRIDE ONCE ONE CAPTURE IS READ.
-            // THE QUESTION IT ANSWERS: why does drag auto-scroll fire with the tile MID-LIST, when
-            // topDiff = curY - mTmpRect.top - getPaddingTop() should be comfortably positive there? All
-            // three terms were checked against source and none explains it - paddingTop is 4dp from
-            // fragment_player_queue.xml (PlayerMoreFragment's inset lands on the SHEET's root, not this
-            // list), mTmpRect.top is 0 because this screen adds no ItemDecoration, and mSelectedStartY is
-            // in the RecyclerView's own space, matching getPaddingTop(). The expression should not fire.
-            // ONLY THE FIRST FRAME OF EACH SCROLL RUN IS LOGGED, and that is the point rather than tidiness:
-            // ItemTouchHelper sets mDragScrollStartTimeInMs AFTER calling this (:798-800), so
-            // msSinceStartScroll == 0 marks the frame BEFORE any scrollBy has happened - the only frame
-            // whose curY is not already corrupted by the stale-mSelectedStartY drift noted above. Every
-            // later frame describes the runaway, not the onset.
-            // `viewSizeOutOfBounds` IS topDiff (negative, upward) or bottomDiff (positive, downward) - the
-            // exact quantity that should not be crossing zero here.
-            // CANNOT FIRE OUTSIDE A DRAG ON THIS SCREEN BY CONSTRUCTION: the library calls this only from
-            // scrollIfNecessary, which returns early unless mSelected != null (:746), and this override
-            // exists only on QueueFragment's callback.
-            // REMOVAL CONDITION: delete once the first line has been read once. Either topDiff arrives
-            // negative mid-list - and the four numbers say which term is not what source says - or this
-            // never prints, which means the scroll is not scrollIfNecessary's and the identification is
-            // wrong. Both outcomes end the probe.
-            override fun interpolateOutOfBoundsScroll(
-                recyclerView: RecyclerView,
-                viewSize: Int,
-                viewSizeOutOfBounds: Int,
-                totalSize: Int,
-                msSinceStartScroll: Long
-            ): Int {
-                if (msSinceStartScroll == 0L) {
-                    oobRun++
-                    android.util.Log.d(
-                        "GladixQueue",
-                        "QUEUEDRAG oob#$oobRun outOfBounds=$viewSizeOutOfBounds tileH=$viewSize " +
-                            "rvH=$totalSize padTop=${recyclerView.paddingTop} " +
-                            "startTop=$dragStartTop nowTop=${dragItemView?.top}"
-                    )
-                }
-                return super.interpolateOutOfBoundsScroll(
-                    recyclerView, viewSize, viewSizeOutOfBounds, totalSize, msSinceStartScroll
-                )
+                // ⚠⚠ NO RESUBMIT HERE, AND THAT IS A FIX RATHER THAN AN OMISSION. A catch-up
+                // `submit()` used to run here. It recomputed from viewModel.queue - which the 1102 capture
+                // proved is STILL STALE at this moment: the drag's own moveMediaItem calls emit through
+                // emitFullQueue's 50ms debounce and land AFTER clearView (every `scrolled` line read
+                // dragging=false). So the catch-up submitted the pre-drag order and snapped the list
+                // backwards, then the real emission snapped it forward again.
+                // The adapter already holds the right order from onMove's local reorder, and the debounced
+                // emission delivers the authoritative one a moment later. Nothing to do here but disarm.
+                // ⚠️ DIVERGENCE WINDOW, NAMED RATHER THAN LEFT TO BE FOUND: if the player applies
+                // NO move - ShufflePlayer.moveMediaItem has its own out-of-range no-op - then no timeline
+                // change fires, no emission arrives, and the local order stands diverged from the player's.
+                // It self-heals at the NEXT queue event (a track transition, a radio append), not
+                // immediately. Bounded and visible-as-a-snap rather than silent.
             }
 
             override fun onSwiped(viewHolder: RecyclerView.ViewHolder, direction: Int) {
@@ -238,10 +203,9 @@ class QueueFragment : Fragment() {
 
     private fun submitOrDefer() {
         android.util.Log.d("GladixQueue", "QUEUEDRAG submitOrDefer dragging=$isDragging")
-        if (isDragging) {
-            submitSuppressed = true
-            return
-        }
+        // Dropped, not deferred - see the note at clearView. The adapter's drag-local order is already
+        // correct, and re-submitting after the drag would only replay a stale snapshot.
+        if (isDragging) return
         submit()
     }
 
@@ -250,7 +214,7 @@ class QueueFragment : Fragment() {
     // listener calls touchHelper.startDrag), and routing a third reference through an INFERRED type is
     // what produces the cycle the onMove/getMovementFlags notes warn about. Declared types break it at the
     // root; those two notes stay accurate about why they read the index from the viewModel.
-    private fun submit(scroll: Boolean = true) {
+    private fun submit() {
         val current = viewModel.playerState.current.value
         val fullCurrentIndex = current?.let { c ->
             viewModel.queue.indexOfFirst { it.mediaId == c.mediaItem.mediaId }
@@ -260,7 +224,7 @@ class QueueFragment : Fragment() {
             else null to mediaItem
         }
         queueAdapter.submitList(it) {
-            if (!scroll || fullCurrentIndex < 0) return@submitList
+            if (fullCurrentIndex < 0) return@submitList
             android.util.Log.d(
                 "GladixQueue", "QUEUEDRAG scrollToPosition idx=$fullCurrentIndex dragging=$isDragging"
             )

@@ -577,8 +577,12 @@ class PlayerCallback(
                 // EPISODE branch), so a music seed starts at 0 and this should print pos=0. If the paired
                 // READY line then prints a non-zero pos for the same mediaId, something seeked in between
                 // and the restore latch is it. Zero then non-zero is the whole proof.
+                // ⚠️ GladixQueue, NOT GladixPlayback - SAME REASON AS THE TRACKRADIO LINE
+                // ABOVE, WHICH I BROKE ONCE ALREADY. The 2026-09-12 capture returned GladixQueue and
+                // GladixRadio lines and this one was filtered out, so a fix shipped with its proof and the
+                // proof was invisible. A diagnostic belongs on the tag that is demonstrably being captured.
                 Log.d(
-                    "GladixPlayback",
+                    "GladixQueue",
                     "TRACKRADIO prepare pos=$currentPosition id=${currentMediaItem?.mediaId}"
                 )
             }

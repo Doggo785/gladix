@@ -119,6 +119,13 @@ object ImageUtils {
         // request built below is byte-identical for them: `listener` is only attached when non-null.
         // Exists because the target lambdas receive an Image, not an ImageResult, so the DataSource is
         // otherwise unreachable from a caller. REMOVE WITH THE TRACE.
+        // ⚠️ CONDITION UNRESOLVED (2026-09-12), NOT "waiting on something specific". Reviewed in
+        // the temporary-logging inventory and left in: NOBODY CURRENTLY KNOWS whether this trace is still
+        // wanted - the investigation it belonged to is not identified in the record, and no capture this
+        // month has used it. Recorded as unresolved rather than as KEEP, because implying it waits on a
+        // named condition would be false. Whoever next touches image loading should decide it; until then
+        // it is neither safe to strip blind nor legitimately "pending".
+        // Applies equally to warmIssued / warmDone below.
         onSource: ((String) -> Unit)? = null,
         onDrawable: T.(Drawable?) -> Unit
     ) = tryWith(true) {
