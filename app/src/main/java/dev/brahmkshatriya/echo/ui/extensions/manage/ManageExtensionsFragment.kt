@@ -76,6 +76,22 @@ class ManageExtensionsFragment : Fragment() {
             tabs.forEach { addTab(it) }
         }
 
+        // ⚠️ PARKED 2026-09-12, SAME FAMILY AS THE QUEUE-DRAG FIX, DEVICE-UNVERIFIED HERE.
+        // This screen has the resubmit-during-drag half WITHOUT the scroll half: onMove calls
+        // viewModel.moveExtensionItem, which feeds manageExtListFlow, whose observer below calls
+        // extensionAdapter.submit -> submitData(PagingData.from(list)) on EVERY emission. There is no
+        // scrollToPosition anywhere here, so there is no visible jump - which is exactly why it would go
+        // unnoticed if it is real.
+        // THE EXPOSURE THAT REMAINS: recyclerview 1.4.0's ItemTouchHelper.java:902-916 terminates a drag
+        // outright if the dragged row is detached - `if (mSelected != null && holder == mSelected)
+        // select(null, ACTION_STATE_IDLE);`. Whether Paging's differ actually detaches it for a pure
+        // REORDER of the same items is a device question, not a source one, and it is the reason this is
+        // parked rather than fixed: QueueFragment had a reproduced symptom, this has a mechanism and no
+        // report. Do not fix it blind - drag an extension and see whether the drag survives first.
+        // THE FIX, IF IT IS REAL, IS ALREADY WRITTEN TWICE: PlaylistTrackAdapter's isDragging/pendingList,
+        // and QueueFragment's isDragging/submitSuppressed. Prefer pendingList's shape here, because this
+        // observer CARRIES the list - see the note at QueueFragment.submitSuppressed for why that
+        // distinction decides which of the two to copy.
         val callback = object : ItemTouchHelper.SimpleCallback(
             ItemTouchHelper.UP or ItemTouchHelper.DOWN, 0
         ) {

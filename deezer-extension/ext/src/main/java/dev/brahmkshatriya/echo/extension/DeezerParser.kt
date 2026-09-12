@@ -18,10 +18,73 @@ import dev.brahmkshatriya.echo.common.models.Track
 import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
+
+// ⚠⚠ TEMPORARY PROBE - ONE QUESTION, TWO LINES OF OUTPUT, THEN DELETE IT.
+// THE QUESTION: Deezer's own app greys these tracks out and ours does not. common's Track ALREADY has
+// `isPlayable: Playable` (Yes / RegionLocked / Unreleased / No(reason)) and the app already honours it in
+// six view holders, ShelfViewHolder's click reroute, MediaHeaderAdapter's play button and
+// StreamableLoader's TrackUnavailableException. THIS IS A FIELD THE DEEZER PARSER NEVER SETS, NOT A
+// FEATURE TO BUILD - so the only open question is what to set it FROM.
+// WHAT WE ALREADY KNOW, AND WHY IT IS NOT ENOUGH:
+//   - TRACK_TOKEN empty correlated 12 of 12 with the unplayable run. Suggestive, measured once, and not
+//     a definition of unavailability.
+//   - FALLBACK_ID DOES NOT ANSWER IT, which is worth stating because it looks like it should. The parser
+//     keeps only `data["FALLBACK"].SNG_ID`, and per the project record FALLBACK is present in the NORMAL
+//     case on both paths with OPPOSITE meanings - playlist pre-substitutes (top-level = playable
+//     substitute, FALLBACK = the original) while search/album keeps the correct track at top-level with
+//     FALLBACK as an alternative. A flag built on its presence would mark ordinary playable tracks.
+// SO: dump the raw key set and let the payload answer. Keys we already consume are listed separately
+// from the ones we DISCARD, because the discarded ones are the whole point - an explicit availability
+// field sitting unread would beat TRACK_TOKEN outright.
+// ONE CAPTURE, NOT TWO: the two flags below are keyed on TRACK_TOKEN empty vs non-empty, so a single
+// pass over the affected playlist emits exactly one unplayable record and one playable one, side by side
+// for comparison. Both fire at most once per process.
+// ⚠️ VALUES ARE TRUNCATED AND ONLY PRINTED FOR DISCARDED KEYS. TRACK_TOKEN and the rest of the
+// consumed set are named but never printed - a token in a shared logcat is not worth the convenience.
+// REMOVAL CONDITION: delete this function, its two flags and the call in toTrack once the key set has
+// been read once. It answers a one-time structural question; leaving it in would dump a record on every
+// cold start forever.
+private var dumpedUnplayable = false
+private var dumpedPlayable = false
+
+private val CONSUMED_KEYS = setOf(
+    "ALB_ID", "ALB_PICTURE", "ALB_TITLE", "ARTISTS", "AUTHOR", "DIGITAL_RELEASE_DATE", "DISK_NUMBER",
+    "DURATION", "EXPLICIT_LYRICS", "FALLBACK", "FILESIZE_MP3_MISC", "GAIN", "ISRC", "LOVE_STATUS",
+    "PHYSICAL_RELEASE_DATE", "SNG_CONTRIBUTORS", "SNG_ID", "SNG_TITLE", "TRACK_NUMBER", "TRACK_TOKEN",
+    "TYPE", "VERSION",
+)
+
+// Deliberately NOT DeezerParser.contentOrNull(): that one is a CLASS-PRIVATE member extension and is
+// unreachable from a top-level function. Goes when the probe goes.
+private fun JsonElement?.probeStr(): String? =
+    (this as? JsonPrimitive)?.takeIf { it !is JsonNull }?.content
+
+private fun dumpRawRecordOnce(data: JsonObject) {
+    val tokenEmpty = data["TRACK_TOKEN"].probeStr().isNullOrEmpty()
+    if (tokenEmpty && dumpedUnplayable) return
+    if (!tokenEmpty && dumpedPlayable) return
+    if (tokenEmpty) dumpedUnplayable = true else dumpedPlayable = true
+
+    val label = if (tokenEmpty) "NO-TOKEN" else "HAS-TOKEN"
+    val id = data["SNG_ID"].probeStr().orEmpty()
+    val title = data["SNG_TITLE"].probeStr().orEmpty()
+    val discarded = data.keys.filter { it !in CONSUMED_KEYS }.sorted()
+    println("GladixDeezer RAWTRACK[$label] id=$id title=${title.take(60)}")
+    println("GladixDeezer RAWTRACK[$label] allKeys=${data.keys.sorted().joinToString(",")}")
+    discarded.forEach { k ->
+        val v = data[k].probeStr() ?: data[k].toString()
+        println("GladixDeezer RAWTRACK[$label] $k=${v.take(160)}")
+    }
+    // FALLBACK is in the consumed set but only its SNG_ID is kept, so its own shape is still unread.
+    (data["FALLBACK"] as? JsonObject)?.let {
+        println("GladixDeezer RAWTRACK[$label] FALLBACK.keys=${it.keys.sorted().joinToString(",")}")
+    }
+}
 
 class DeezerParser(private val session: DeezerSession) {
 
@@ -628,7 +691,27 @@ class DeezerParser(private val session: DeezerSession) {
             albumDiscNumber = data.long("DISK_NUMBER"),
             isrc = data.str("ISRC"),
             isExplicit = data.str("EXPLICIT_LYRICS") == "1",
+            // ⚠⚠ `isPlayable` IS MISSING HERE, AND THAT IS THE ENTIRE "GREY OUT UNAVAILABLE
+            // TRACKS" JOB. It is A FIELD TO POPULATE, NOT A FEATURE TO BUILD - record kept permanently
+            // because the task NAME makes it sound like the opposite, and it would be re-scoped as UI work.
+            // EVERYTHING DOWNSTREAM ALREADY EXISTS AND ALREADY WORKS:
+            //   common's Track carries `isPlayable: Playable = Playable.Yes` with Yes / RegionLocked /
+            //     Unreleased / No(reason) - polymorphic, already in the ABI, no version-skew question;
+            //   MediaViewHolder, MediaGridViewHolder, ShelfViewHolder and both video holders all grey out
+            //     on `isPlayable != Playable.Yes`;
+            //   ShelfViewHolder reroutes the TAP to onMediaClicked instead of playing;
+            //   MediaHeaderAdapter hides the play button;
+            //   StreamableLoader throws TrackUnavailableException, with a documented silent-skip and a
+            //     consecutiveUnavailableSkips breaker (max 3) behind it;
+            //   TestExtension already sets Playable.Unreleased, so the path is exercised.
+            // Deezer tracks therefore default to Playable.Yes and render as ordinary rows - which is why
+            // Deezer's own app greys these and ours does not.
+            // ⚠️ WHAT IS NOT KNOWN IS WHAT TO SET IT FROM, and that is the only open part.
+            // TRACK_TOKEN empty correlated 12/12 on one capture (2026-09-12) and is suggestive, not a
+            // definition. FALLBACK_ID does NOT answer it - see the probe note above for why its presence
+            // marks ordinary playable tracks on both paths. Resolve that before populating this.
             extras = buildMap {
+                dumpRawRecordOnce(data)
                 put("FALLBACK_ID", data["FALLBACK"]?.jsonObject?.str("SNG_ID").orEmpty())
                 put("TRACK_TOKEN", data.str("TRACK_TOKEN").orEmpty())
                 put("FILESIZE_MP3_MISC", data.str("FILESIZE_MP3_MISC") ?: "0")

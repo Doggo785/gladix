@@ -76,11 +76,8 @@ sealed class ShelfViewHolder<T : ShelfType>(view: View) : ScrollAnimViewHolder(v
                     is Track -> {
                         if (item.isPlayable != Track.Playable.Yes) {
                             listener.onMediaClicked(it, shelf?.extensionId, item, shelf?.context)
-                        // A single discrete shelf.media item - never an ordered run, so this is the
-                        // radio case by construction. See FeedType.orderedList.
                         } else listener.onTracksClicked(
-                            it, shelf?.extensionId, shelf?.context, listOf(item), 0,
-                            ordered = false
+                            it, shelf?.extensionId, shelf?.context, listOf(item), 0
                         )
                     }
 
@@ -131,9 +128,8 @@ sealed class ShelfViewHolder<T : ShelfType>(view: View) : ScrollAnimViewHolder(v
                     val track = tracks.getOrNull(index)
                     if (track?.isPlayable != Track.Playable.Yes) listener.onMediaClicked(
                         view, shelf?.extensionId, track, shelf?.context
-                    // shelf.tracks is an ordered track list rendered horizontally - queue the run.
                     ) else listener.onTracksClicked(
-                        view, shelf?.extensionId, shelf?.context, tracks, pos, ordered = true
+                        view, shelf?.extensionId, shelf?.context, tracks, pos
                     )
                 }
                 binding.root.setOnLongClickListener {

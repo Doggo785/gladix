@@ -108,10 +108,10 @@ class SearchFragment : Fragment(R.layout.fragment_search) {
         // THE POINT. It forced context = null and flattened tracks to a 1-element list so the base
         // single-track branch would route to playTrackRadio. That made the rule TRUE ON THIS SCREEN
         // ONLY, by manufacturing the inputs the branch tested for.
-        // The branch now keys on FeedType.orderedList instead, which is derived from the shelf kind at
-        // toFeedType. Deezer search returns Shelf.Lists.Items, so its track rows are discrete and
+        // The branch now keys on FeedClickListener.isOrderedCollection(context) instead. Search's
+        // FeedData.State carries item = null, so its track rows are not an ordered collection and
         // still radio - SAME BEHAVIOUR, DIFFERENT MECHANISM. Do not reintroduce this override: it
-        // would discard the surrounding run, which is exactly what the new rule exists to preserve.
+        // would discard the surrounding run, which is exactly what the rule exists to preserve.
         FeedClickListener(this@SearchFragment, nav.parentFragmentManager, nav.id)
     }
 

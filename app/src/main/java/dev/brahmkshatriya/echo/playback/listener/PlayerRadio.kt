@@ -613,7 +613,46 @@ class PlayerRadio(
         /** The seed to query with, or null plus the reason it is unusable. */
         private data class SeedCheck(val seed: Track?, val reason: String?)
 
-        // ⚠⚠ THE BRIDGE MUST QUERY THE RESOLVED COPY OF THE SEED, NOT THE QUEUED ONE.
+        // ⚠⚠ [CORRECTED 2026-09-12] THE HEADLINE BELOW IS WRONG AND IS KEPT BECAUSE IT READS
+        // AS OBVIOUSLY RIGHT. It said: "THE BRIDGE MUST QUERY THE RESOLVED COPY OF THE SEED, NOT THE QUEUED
+        // ONE." The Deezer measurement under it is real and still holds; the RULE generalised from it is
+        // not. TWO INVERSIONS, MEASURED ON TWO EXTENSIONS, SAME DEFECT, OPPOSITE POLARITY:
+        //     Deezer, long-press -> Radio   queued/passed copy "Unknown"   player's resolved copy CORRECT
+        //     YTM,    long-press -> Radio   passed copy CORRECT            player's resolved copy "Unknown"
+        // (YTM capture 2026-09-12: TRACKRADIO ext=Youtube_music seed=Kokomo, then
+        //  LASTFM q="Unknown - Kokomo" artist="Unknown" reason=no-similar similar=0 matched=0.)
+        // Preferring RESOLVED fixes Deezer and breaks YTM. Preferring PRE-RESOLUTION does the reverse.
+        // ⚠⚠ SO NEITHER RESOLUTION STAGE NOR PROVENANCE IS THE AXIS - ONLY CONTENT IS. Note that
+        // in the Deezer case BOTH copies were resolved, just by different loaders (MediaMoreBottomSheet
+        // passes state.item from a MediaState.Loaded that MediaDetailsViewModel resolved; the player's copy
+        // comes from StreamableLoader.loadTrack), so "which producer supplied it" does not predict quality
+        // either. The rule that survives both captures is the only one that never looks at where a copy came
+        // from: TAKE THE FIRST CANDIDATE THAT ACTUALLY HAS AN ARTIST. Loaded-ness is now a TIEBREAK among
+        // usable copies, not a gate in front of them.
+        //
+        // ⚠️ WHY THE COPIES CAN DISAGREE AT ALL - ESTABLISHED BY A PRIOR AUDIT, NOT RE-DERIVED
+        // HERE, WHICH IS WHAT MAKES IT INDEPENDENT EVIDENCE. The extensionId-promotion audit grep-confirmed
+        // that `state` is written at EXACTLY ONE SITE inside MediaItemUtils.toMetaData - "every other path
+        // is putAll-copy-then-overwrite-unrelated-keys (never rewriting state or extensionId) -> identical
+        // at birth, copied together forever". That audit was done for a different purpose and found the same
+        // property. (It cites MediaItemUtils.kt:207; the site is now :335 - the line drifted, the property
+        // did not. See "In comments, reference symbols rather than line numbers".)
+        // Consequence: resolution REPLACES the Track wholesale - there is no field-level merge - so an
+        // extension whose loadTrack returns thinner metadata than it supplied silently overwrites the good
+        // copy everywhere MediaItem.track is read. YTM is one instance of that class, not the class itself.
+        //
+        // ⚠⚠ THE GENERAL FIX IS HELD, AND THE REASON IS SPECIFIC RATHER THAN CAUTION. Preserving
+        // the pre-resolution artist in the MediaItem bundle - the shape unloadedCover already uses one line
+        // above the `state` overwrite - would cover play()'s bridge too, and would close the recordingKey
+        // observation below as a side effect. It is not blocked on size: one artist name is negligible
+        // against that comment block's own 20-30 KB-per-item measurement.
+        // IT IS BLOCKED ON WHERE IT LANDS. The parked extensionId promotion targets "the budget-device
+        // main-thread full-Track-JSON busy-decode ANR in MediaItemUtils.toMetaData" - so this would add a
+        // second change to the exact hot path whose decode cost is already the subject of an open ANR item,
+        // and the parked item exists PRECISELY BECAUSE that bundle is too expensive to decode. Two changes
+        // to one hot path, one of them parked for the cost of the thing the other would add to. Scope them
+        // together or not at all; note that unloadedCover is a precedent for the MECHANISM only - its own
+        // note records it as a hot-path decode AVOIDANCE, which is the opposite concern.
         // FOUND BY A DISCRIMINATOR WORTH KEEPING, because it would otherwise be re-derived from scratch:
         // on the SAME track, a single-track play from search ALWAYS produced a working bridge and
         // long-press -> Radio NEVER did -
@@ -656,17 +695,50 @@ class PlayerRadio(
                 val current = player.currentMediaItem
                 val sameTrack = current != null &&
                     (candidate == null || current.track.id == candidate.id)
-                val seed = when {
-                    sameTrack && !current!!.isLoaded ->
-                        return@withContext SeedCheck(null, "seed-not-loaded")
-                    sameTrack -> current!!.track
-                    else -> candidate
-                } ?: return@withContext SeedCheck(null, "no-seed")
-                if (seed.artists.firstOrNull()?.name?.trim().isNullOrEmpty())
-                    return@withContext SeedCheck(null, "no-seed-fields")
-                SeedCheck(seed, null)
+                // ⚠️ `current` IS NON-NULL IN THE sameTrack BRANCHES BY CONSTRUCTION, NOT BY
+                // LUCK: sameTrack is `current != null && ...`, and `current` is a local val captured ONCE
+                // from player.currentMediaItem. Both !! here were unnecessary from the moment they were
+                // written (Kotlin 2.4 carries the smart cast through a local val boolean); they were
+                // defensive-by-assumption, not load-bearing, and nothing upstream changed to retire them.
+                // ⚠️ THE CAPTURE IS THE PART THAT MATTERS. Re-reading player.currentMediaItem in
+                // each branch would be the dangerous shape - a property that can return a different value
+                // on every read, so no check on one read guards another. Reading it once into a local is
+                // both why the smart cast is possible and why it is correct.
+                val playerSeed = if (sameTrack) current.track else null
+                // The TIEBREAK, and it only decides when BOTH copies are usable: prefer the loaded one,
+                // since that is the copy actually playing and the one carrying ISRC and servers. When they
+                // disagree on usability - which is both measured cases above - the content filter below
+                // decides and this ordering never gets a say.
+                val ordered = if (sameTrack && current.isLoaded) listOfNotNull(playerSeed, candidate)
+                else listOfNotNull(candidate, playerSeed)
+                val seed = ordered.firstOrNull { it.hasUsableArtist() }
+                if (seed != null) return@withContext SeedCheck(seed, null)
+                // ⚠️ THE THREE REASONS STILL MEAN DIFFERENT THINGS, AND THE ORDER OF THESE TESTS
+                // IS WHAT KEEPS THEM HONEST. seed-not-loaded now means "no candidate we HAVE is usable AND
+                // resolution is still pending", which is its true meaning - it used to fire while a
+                // perfectly good candidate was in hand, which is exactly the YTM THROWBRIDGE line above.
+                // Non-burning is unchanged and load-bearing: every caller claims via
+                // `seed != null && claimFallback(...)`, so a null seed short-circuits before the claim and
+                // spends nothing. That is what makes "MAY become usable later" a true statement.
+                return@withContext when {
+                    ordered.isEmpty() -> SeedCheck(null, "no-seed")
+                    sameTrack && !current.isLoaded -> SeedCheck(null, "seed-not-loaded")
+                    else -> SeedCheck(null, "no-seed-fields")
+                }
             }
 
+        // Blank or missing is checkable for ANY extension; a non-blank placeholder like "Unknown" is not,
+        // and is deliberately allowed through - see the note at resolveSeed's placeholder paragraph.
+        private fun Track.hasUsableArtist() =
+            !artists.firstOrNull()?.name?.trim().isNullOrEmpty()
+
+        // ⚠️ UNMEASURED OBSERVATION, RECORDED BEFORE THE BUNDLE WORK IS SCOPED BECAUSE THAT
+        // WORK WOULD ALSO CLOSE IT. If an extension stamps a placeholder artist catalogue-wide - YTM
+        // resolves every track to "Unknown", measured 2026-09-12 - then this returns `<title>\0unknown` for
+        // EVERY track on it, and dedupKeys()'s `ta:` namespace loses its artist discriminator there. Under
+        // match-on-either, two genuinely different recordings that share a title would then collide and one
+        // would be DROPPED. It fails quiet - a missing track, not a duplicate - which is the direction that
+        // does not generate a report. Not looked for in any capture yet; do not treat it as observed.
         private fun Track.recordingKey(): String {
             val t = stripVersionSuffix(title)
             val a = artists.firstOrNull()?.name?.trim().orEmpty()
@@ -1027,6 +1099,25 @@ class PlayerRadio(
                     return PlayResult(0, exhausted = false, failed = true)
                 }
 
+                // ⚠⚠ PARKED, WITH EVIDENCE: THE EXHAUSTED-STATION MEMO. Empty here means
+                // "no station", so it is indistinguishable from "never had one" - and the next qualifying
+                // transition therefore takes topUpQueue's `Empty -> loadPlaylist()` branch and REBUILDS this
+                // station from scratch. For a deterministic station id that is start() plus a page-1 fetch,
+                // two network round-trips, to re-derive a page we already proved deduped to nothing.
+                // ⚠️ MEASURED 2026-09-12 (Frogmen artist radio, build 1099): EIGHT regenerations
+                // of radio=273559 in one context, every one `site=loadPlaylist offered=2 added=0`, every one
+                // followed by a LASTFM reason=seed-not-loaded and a RESEED reason=not_seed_determined. The
+                // site tag is the proof it is this line: a station still Loaded would have logged
+                // site=topUpQueue, so Empty was written here every time.
+                // THE FIX WOULD BE a memo of (queue epoch, station id) proven continuation-less and
+                // zero-yield, consulted before regenerating - the same key shape claimFallback already uses,
+                // for the same reason (per-queue, so a new queue retries). It collapses the eight to one and
+                // takes the seed-not-loaded refusals with them as a side effect.
+                // NOT DONE HERE, and the reason is a real open question rather than scope timidity: the memo
+                // needs a LIFETIME, and "exhausted" is not permanent - a station that is spent now may serve
+                // fresh tracks in an hour, so a memo keyed only on (epoch, id) suppresses a legitimate later
+                // retry for the rest of the queue. Deciding that needs a policy this file does not have yet.
+                // Do not build it as a bare `Set` without answering that.
                 stateFlow.value = if (tracks.continuation == null) PlayerState.Radio.Empty
                 // Stamped here and not carried through copy(): play() receives an UNSTAMPED Loaded straight
                 // from start() on the radio()/trackRadio paths, so relying on copy() alone would publish -1L
@@ -1077,6 +1168,44 @@ class PlayerRadio(
                     // latch was moved below the seed read; claiming in the wrong order here would reintroduce
                     // it through a different door. Cheap, reversible check first; permanent claim second.
                     if (thin && extension != null && rescueInFlight.compareAndSet(false, true)) try {
+                        // ⚠⚠ `null` CANDIDATE - THIS PATH HAS NO SECOND COPY, SO THE
+                        // CONTENT-FIRST RULE CANNOT RESCUE IT THE WAY IT RESCUES throwBridge. Read
+                        // resolveSeed's note first; this is the half that is NOT fixed.
+                        // throwBridge receives trackRadio's own object as a candidate and can therefore
+                        // prefer whichever copy has an artist. Here there is only player.currentMediaItem,
+                        // so once resolution has OVERWRITTEN a good artist with a placeholder the good one
+                        // is gone - `state` is replaced wholesale at MediaItemUtils.toMetaData, no merge.
+                        // ⚠️ CONCRETELY: A YTM ARTIST STATION GOING THIN STILL PRODUCES
+                        // q="Unknown - <title>" AND STILL FAILS. Do not read the content-first change as
+                        // having fixed YTM generally - it fixed long-press -> Radio, which is throwBridge.
+                        // ⚠️ WHAT IT DOES FIX HERE, WHICH IS NARROWER THAN IT LOOKS AND WAS
+                        // FOUND WHILE BUILDING RATHER THAN PREDICTED: when the current item has NOT
+                        // resolved yet, `current.track` is still the QUEUED copy, and this used to refuse on
+                        // loaded-ness alone without ever looking at it. The Frogmen capture shows that copy
+                        // was perfectly usable - the dedupKeys note records the pre-resolution seed as
+                        // `ta:underwater\0the frogmen`, artist present - so those EIGHT seed-not-loaded
+                        // refusals should now succeed on the first attempt instead of the third.
+                        // ⚠⚠ THE PREDICTION IS ZERO, NOT "FEWER", AND ZERO IS WHAT MAKES IT A
+                        // TEST. On this path candidate is null, so `ordered` holds exactly one entry - the
+                        // queued copy - and seed-not-loaded can now fire ONLY if that copy has a blank
+                        // artist. Every track in a Deezer station queue comes from a radio page, a
+                        // catalogue search or the tapped seed, and all three carry artists. ANY residual
+                        // falsifies "the queued copy is always usable" and is independently worth chasing:
+                        // an artist-less queued track also makes recordingKey() `<title>\0`, degrading the
+                        // ta: namespace for that track exactly as described at recordingKey.
+                        //
+                        // ⚠⚠ AND THIS COUNT CANNOT BE READ ALONE, BECAUSE generationInFlight
+                        // SHIPPED IN THE SAME BUILD AND MOVES THE DENOMINATOR. Fewer regenerations means
+                        // fewer thin appends means fewer bridge attempts, so a DROP in the seed-not-loaded
+                        // total is ambiguous between the two fixes. The discriminator is to stop counting
+                        // and read ONE event:
+                        //   THE FIRST thin `site=loadPlaylist` APPEND IN THE CAPTURE decides this fix, and
+                        //   only this fix. Its LASTFM line reads `q="The Frogmen - Underwater"` if
+                        //   content-first works, or `reason=seed-not-loaded` if it does not.
+                        // generationInFlight cannot touch that line: it only suppresses LATER overlapping
+                        // entries, never the first. Conversely `LOADPLAYLIST reason=generation_in_flight` is
+                        // emitted by the marker and by nothing else, so the two fixes are read from two
+                        // disjoint log lines and neither can borrow the other's evidence.
                         val check = resolveSeed(player, null)
                         // ⚠️ A SKIP HERE IS A SILENT NO-RESCUE - THE QUEUE ENDS. That is correct
                         // (a lookup on a blank or absent artist cannot match anything), but it means this log
@@ -1183,6 +1312,58 @@ class PlayerRadio(
     // exceptions, coroutine cancellation) unwinds through finally and always releases it.
     private val tvInFlight = AtomicBoolean(false)
 
+    // ⚠⚠ THE PHONE ANALOGUE OF tvInFlight ABOVE, AND ITS ABSENCE WAS A REAL RACE, MEASURED.
+    // tvDriveRadio has serialised overlapping transition callbacks since it was written - "tvInFlight (not
+    // the radioFlow state) serializes overlapping transition / STATE_ENDED calls so a boundary never
+    // double-appends". Phone had NO equivalent, and phone reaches loadPlaylist from TWO coroutines launched
+    // by ONE callback: onMediaItemTransition does `scope.launch { startRadio() }` and
+    // `scope.launch { topUpQueue() }` back to back, and on the last track of a batch BOTH proceed -
+    // hasNextMediaItem() is false so startRadio does not return, remaining == 0 so topUpQueue does not
+    // either - and both land on their `Empty -> loadPlaylist()` branch.
+    //
+    // ⚠⚠ MEASURED 2026-09-12, The Frogmen artist radio, build 1099. This is the line that makes
+    // it a RACE rather than a cadence, and it is why the marker exists:
+    //     08:05:43.307  append site=loadPlaylist offered=2 added=0
+    //     08:05:43.316  append site=loadPlaylist offered=2 added=0   <- +9ms
+    //     08:05:43.326  append site=loadPlaylist offered=2 added=0   <- +10ms
+    // THREE FULL STATION REGENERATIONS IN 19 MILLISECONDS - each one a start() plus a page-1 fetch, i.e.
+    // six network round-trips, all for the same station against the same queue. The other five
+    // regenerations in that capture were spread across genuine transitions (08:04:50.686, .937, 51.313,
+    // then a 33s gap, then 08:05:24.238, 25.809, 27.521), which is the designed per-transition cadence and
+    // is NOT what this closes. Only the burst is.
+    //
+    // ⚠⚠ AN AtomicBoolean AND NOT "MOVE THE Loading WRITE UP", WHICH WAS THE OTHER CANDIDATE
+    // AND IS THE ONE THIS FILE HAS ALREADY GOT WRONG ONCE. Both entry points test
+    // `stateFlow.value is Loading` before calling in, so moving loadPlaylist's Loading write above the
+    // currentMediaItem read would narrow the window - and leave it open, because a check-then-act on a
+    // plain field is non-atomic wherever the write lands. That is the correction recorded at
+    // reseedFanOutLocked verbatim: "stateFlow is not a mutex, and using it as one discards the transitions
+    // it blocks instead of deferring them." A CAS is atomic; a state read is not. It would also push
+    // Loading above an early `?: return` that no finally covers yet, reintroducing the pinning shape that
+    // the same correction removed.
+    //
+    // ⚠️ WHERE IT SITS: CLAIMED AFTER THE trackRadioGenerating GATE, RELEASED IN A finally
+    // AROUND EVERYTHING ELSE. Following reseedFanOut's ordering exactly - "claimed AFTER the
+    // seed-determined gate above, which is pure logic plus a log and costs nothing, so that gate still
+    // reports on every attempt. Only the expensive half is serialised." Everything past the claim (the
+    // Main-thread hop, start(), play(), reseedFanOut) is the work that must not run twice; the gate above
+    // is a field read and a log, and keeping it outside preserves it as an honest per-attempt counter.
+    //
+    // ⚠️ THE LOSER IS DROPPED, NOT DEFERRED, AND THAT IS ACCEPTABLE HERE FOR A REASON THAT DOES
+    // NOT GENERALISE. The lost-wakeup objection to Loading-as-mutex applies to any marker, so it has to be
+    // answered rather than assumed: what gets dropped here is a DUPLICATE of work already running against
+    // the same queue and the same station, not a distinct piece of work. Transitions keep arriving and
+    // `remaining` is still under the threshold, so a genuinely-needed generation is retried at the next
+    // one. ⚠️ The one bounded exposure: if the queue is REPLACED mid-flight, the winner's append
+    // is discarded by appendDeduped's epoch check and the loser was already dropped - but the replacement
+    // itself fires onTimelineChanged -> startRadio, which runs after the marker clears. Bounded by one
+    // transition, not stranded.
+    //
+    // No interaction with the other markers: play() and reseedFanOut both claim rescueInFlight, a
+    // different flag, and nothing nests this one inside itself. On TV this always succeeds, because
+    // tvInFlight has already serialised tvDriveRadio before it calls in - so TV behaviour is unchanged.
+    private val generationInFlight = AtomicBoolean(false)
+
     private suspend fun loadPlaylist() {
         // ⚠⚠ CHECKED HERE AND NOT IN startRadio, BECAUSE topUpQueue IS A REAL THIRD CONTENDER
         // AND THAT IS NOT VISIBLE FROM READING EITHER FUNCTION ALONE. topUpQueue returns early unless
@@ -1210,6 +1391,25 @@ class PlayerRadio(
             Log.d("GladixRadio", "LOADPLAYLIST reason=track_radio_generating")
             return
         }
+        // ⚠️ THE REFUSAL LOGS, matching every other drop in this file - the silent fall-through
+        // is what kept the Last.fm latch's dead end invisible for a week. It is also the only way to tell a
+        // closed race from a race that never fired: this line appearing twice in 19ms is the burst above,
+        // now suppressed rather than served.
+        if (!generationInFlight.compareAndSet(false, true)) {
+            Log.d("GladixRadio", "LOADPLAYLIST reason=generation_in_flight")
+            return
+        }
+        try {
+            loadPlaylistLocked()
+        } finally {
+            generationInFlight.set(false)
+        }
+    }
+
+    // Split out purely so the claim above can wrap the whole body in try/finally without reindenting it -
+    // the same shape, and for the same reason, as reseedFanOut / reseedFanOutLocked below.
+    // Everything here runs under generationInFlight.
+    private suspend fun loadPlaylistLocked() {
         val mediaItem = withContext(Dispatchers.Main) { player.currentMediaItem } ?: return
         val extensionId = mediaItem.extensionId
         val item = mediaItem.track
@@ -1714,6 +1914,39 @@ class PlayerRadio(
         }
     }
 
+    // ⚠⚠ A ZERO-TRACK APPEND DOES NOT FIRE THIS, SO THERE IS NO APPEND -> REGENERATE -> APPEND
+    // FEEDBACK LOOP. Recorded because the hypothesis is a good one and WILL be re-derived: appendDeduped
+    // calls player.addMediaItems(items) UNCONDITIONALLY - there is no isNotEmpty guard - so a 2/0 append
+    // really does call into the player, and `reason` being ignored below really does mean every timeline
+    // change reaches startRadio. Both halves are true; the conclusion still does not follow.
+    // READ FROM media3 1.11.0 SOURCE, NOT INFERRED:
+    //   ExoPlayerImpl.java:709 addMediaSources has no empty short-circuit - it calls
+    //     addMediaSourcesInternal then updatePlaybackInfo(..., TIMELINE_CHANGE_REASON_PLAYLIST_CHANGED).
+    //   ExoPlayerImpl.java:2312 `boolean timelineChanged = !previousPlaybackInfo.timeline.equals(...)`.
+    //   ExoPlayerImpl.java:2356 `if (timelineChanged)` GUARDS the EVENT_TIMELINE_CHANGED dispatch.
+    //   Timeline.java:1369 Timeline.equals is VALUE-BASED - window count, period count, every Window and
+    //     Period, plus the shuffled-order walk.
+    // Adding zero holders leaves all of those identical, so timelineChanged is false and no event is
+    // queued. THE GUARD THAT SAVES US IS IN THE LIBRARY, NOT IN OUR CODE - which is exactly why it must be
+    // written down here rather than trusted to be re-noticed.
+    // And the non-empty case is self-limiting by construction: an append that DOES mutate the timeline is
+    // the same append that makes hasNextMediaItem() true, so startRadio returns at its own guard.
+    //
+    // ⚠️ WHAT IS STILL UNEXPLAINED, AND IS NOT THIS: a cluster of three regenerations 251ms and
+    // 376ms apart in the 2026-09-12 capture (08:04:50.686 / .937 / 51.313) - too fast for track
+    // transitions, too slow for the 19ms concurrent burst that generationInFlight closes, and each gap wide
+    // enough for a full start() + page fetch to have completed in between.
+    // ⚠️ HYPOTHESIS, NOT A FINDING, AND IT IS NOT BUILT ON: `reason` is ignored below, so
+    // TIMELINE_CHANGE_REASON_SOURCE_UPDATE reaches startRadio too. A track's window changes by VALUE as it
+    // resolves - Timeline.Window.equals (Timeline.java:378) compares durationUs and isPlaceholder - and
+    // this app's sources are deferred, so resolution publishes real timelines after playback starts. With
+    // remaining == 0 the hasNextMediaItem guard is open, so each such update would reach loadPlaylist.
+    // THE DISCRIMINATOR IS ALREADY IN THE NEXT CAPTURE, no new logging needed: sequential entries 250ms
+    // apart do NOT overlap, so generationInFlight neither blocks nor masks them - a refusal ALWAYS logs.
+    //   cluster replaced by `LOADPLAYLIST reason=generation_in_flight`  -> it was concurrent after all
+    //   cluster still present, no refusal lines                         -> a third, SEQUENTIAL trigger
+    // Do not add a `reason` filter here on the strength of the hypothesis alone: this callback predates
+    // that reading and its breadth has never been shown to be accidental.
     override fun onTimelineChanged(timeline: Timeline, reason: Int) {
         if (isTv) return // TV: radio is driven by onMediaItemTransition + onPlaybackStateChanged instead
         scope.launch { startRadio() }

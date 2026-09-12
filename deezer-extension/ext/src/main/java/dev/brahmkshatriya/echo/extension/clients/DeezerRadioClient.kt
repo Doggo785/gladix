@@ -60,7 +60,7 @@ class DeezerRadioClient(private val api: DeezerApi, private val parser: DeezerPa
                 val seedJobs = if (includeSeeds) seedIds.map { tId ->
                     async {
                         runCatching {
-                            api.track(tId)["results"]?.jsonObject?.toTrack(parser)
+                            api.track(tId, "radio.seed")["results"]?.jsonObject?.toTrack(parser)
                         }.getOrNull()
                     }
                 } else emptyList()

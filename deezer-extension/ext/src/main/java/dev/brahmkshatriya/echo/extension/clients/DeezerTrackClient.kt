@@ -49,7 +49,7 @@ class DeezerTrackClient(private val deezerExtension: DeezerExtension, private va
                 mjString.contains("Track token has no sufficient rights on requested media") || mediaIsEmpty -> {
                     val fallBackId = track.extras["FALLBACK_ID"].orEmpty()
                     if (quality == "128") {
-                        val fallbackObject = api.track(fallBackId)
+                        val fallbackObject = api.track(fallBackId, "streamable.fallbackId")
                         val resultOj = fallbackObject["results"]?.jsonObject!!
                         val fallBackTrack = parser.run { resultOj.toTrack() }
                         val fbMediaJson = api.getMP3MediaUrl(fallBackTrack, true)
@@ -64,7 +64,7 @@ class DeezerTrackClient(private val deezerExtension: DeezerExtension, private va
                 }
 
                 mjString.contains("An error occurred while decoding track token") -> {
-                    val fallbackObject = api.track(currentTrackId)
+                    val fallbackObject = api.track(currentTrackId, "streamable.tokenDecode")
                     val resultOj = fallbackObject["results"]?.jsonObject!!
                     val fallBackTrack = parser.run { resultOj.toTrack() }
                     val fbMediaJson = api.getMP3MediaUrl(fallBackTrack, true)
@@ -196,9 +196,33 @@ class DeezerTrackClient(private val deezerExtension: DeezerExtension, private va
         // any failure we fall back to the original track unchanged — the stream-time token-error
         // fallback in createStreamableForQuality still applies — never crashing. CancellationException
         // is rethrown so coroutine cancellation is honoured.
+        // ⚠⚠ THIS runCatching ABSORBS THE NEW GATEWAY THROW, AND THAT MAKES THE FLIP A NO-OP
+        // ON THE PATH THAT TRIGGERS IT MOST. Measured 2026-09-12: one playlist and the album behind it,
+        // containing tracks that will not play, produced TWELVE `GATEWAY-ERROR method=deezer.pageTrack
+        // error=REQUEST_ERROR=Wrong parameters` on one screen - every one from the api.track call below.
+        // ⚠️ THE CAUSE OF THE UNPLAYABILITY IS NOT KNOWN AND IS NOT ASSERTED. What IS observed:
+        // those tracks reach here with an EMPTY TRACK_TOKEN, because that is the gate on the `if` below and
+        // it opened for each of them. So each asks the gateway for a record the gateway then refuses.
+        // Do not upgrade "empty TRACK_TOKEN" into a catalogue-state explanation - it is a correlation
+        // measured once, at 12 of 12, and nothing here establishes why.
+        // BEFORE THE FLIP: callApi returned {error, results:{}}; `results` parsed to nothing, this
+        // runCatching caught whatever that produced, fresh = null, fall back to `original`.
+        // AFTER: callApi throws DeezerGatewayException; the SAME runCatching catches it, the SAME
+        // getOrElse yields null, the SAME fallback to `original` runs. Identical screen, identical
+        // behaviour - twelve exceptions constructed and immediately absorbed by a handler that already
+        // existed for exactly this outcome. ⚠️ NOT A FLOOD AND NOT AN IMPROVEMENT HERE: it is
+        // ABSORBED, bounded by construction at one per token-less track. What it does buy is determinism -
+        // `fresh` is now reliably null on a refusal instead of depending on how an empty `results` object
+        // happens to parse.
+        // WHERE THE FLIP ACTUALLY PAYS is createStreamableForQuality's two api.track calls on the FALLBACK
+        // branches: those are NOT wrapped, so they surface - and they already failed today, opaquely, on a
+        // `!!` or a parse of empty results. They now fail with Deezer's own sentence attached. Same
+        // failure, readable cause.
+        // The fourth call site, DeezerRadioClient's seed fetch, is runCatching{}.getOrNull() - absorbed
+        // like this one.
         val track = if (original.extras["TRACK_TOKEN"].isNullOrEmpty()) {
             val fresh = runCatching {
-                api.track(original.id)["results"]?.jsonObject?.let { results ->
+                api.track(original.id, "loadTrack.selfheal")["results"]?.jsonObject?.let { results ->
                     parser.run { results.toTrack() }
                 }
             }.getOrElse { if (it is CancellationException) throw it else null }

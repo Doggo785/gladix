@@ -54,6 +54,21 @@ import javax.net.ssl.SSLSocketFactory
 import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
 
+// ⚠⚠ TWO STRINGS, DELIBERATELY: `message` IS FOR THE USER, `errorText` IS FOR THE LOG.
+// Do not collapse them. The generic message is what reaches a snackbar, where "REQUEST_ERROR=Wrong
+// parameters" would be noise; errorText is what makes a capture decidable, and dropping it would have
+// left both gateway investigations exactly where they started. Precedent to avoid: ClientException
+// .LoginRequired carries nothing, so it cannot distinguish "user must sign in" from "internal token went
+// stale, no user action possible".
+// `method` is on the exception rather than folded into the text so a future classifier can branch on it
+// without re-parsing a sentence - the same reason ErrorCategory takes types rather than strings.
+class DeezerGatewayException(
+    val method: String,
+    val errorText: String,
+) : Exception("Deezer refused this request.") {
+    override fun toString() = "DeezerGatewayException(method=$method, error=$errorText)"
+}
+
 class DeezerApi(private val session: DeezerSession) {
 
     companion object {
@@ -334,10 +349,38 @@ class DeezerApi(private val session: DeezerSession) {
                     is JsonArray -> resultsElement.isNotEmpty()
                     else -> true
                 }
+                // ⚠⚠ THE LOG LINE STAYS ALONGSIDE THE THROW, AND THAT IS NOT BELT-AND-BRACES.
+                // The most frequent real trigger lands on a path that SWALLOWS the throw - see below - so
+                // without this line those refusals become invisible again, which is the exact defect this
+                // whole probe exists to remove. The throw serves the surfacing paths; the log serves the
+                // swallowing ones. Two audiences, two mechanisms.
                 println(
                     "GladixDeezer GATEWAY-ERROR method=$method resultsUsable=$resultsUsable " +
                         "error=${errorText.take(300)}"
                 )
+                // ⚠⚠ [FLIPPED 2026-09-12] RULE B CONFIRMED BY MEASUREMENT, NOT BY ARGUMENT.
+                // Thirteen samples across two sessions, zero counter-examples:
+                //   1x  page.get          REQUEST_ERROR=Page type smarttracklist does not exist
+                //   12x deezer.pageTrack  REQUEST_ERROR=Wrong parameters   (one playlist and the album
+                //                         behind it, containing tracks that will not play. WHY they will
+                //                         not play is NOT KNOWN and is deliberately not asserted here -
+                //                         what matters for Rule B is that the gateway refused and the
+                //                         results were unusable every time.)
+                // Every hit resultsUsable=false. NO PARTIAL-FAILURE SHAPE WAS EVER OBSERVED - no response
+                // carried a non-empty `error` object alongside usable `results`, which was the entire risk.
+                // ⚠️ THE SAMPLE IS LARGER THAN THIRTEEN, AND THAT IS THE ARGUMENT THAT ACTUALLY
+                // CARRIED IT. This is a NEGATIVE test: it fires only when `error` is a non-empty object, so
+                // every gateway call that did NOT log proved its own response carried the benign shape.
+                // A full browsing session - Home, albums, artists, search, playback - is hundreds of calls
+                // through this one chokepoint, every one an implicit negative that passed. Counting only
+                // the positives understates the evidence by orders of magnitude.
+                //
+                // ⚠️ MESSAGE SPLIT AS THE NOTE ABOVE REQUIRES: a generic user-facing string, with
+                // Deezer's own sentence ATTACHED rather than substituted. The LoginRequired precedent is
+                // what this is avoiding - a typed failure that carries nothing cannot tell "signed out"
+                // from "token went stale", and the whole value of the two captures above was the literal
+                // text "Page type smarttracklist does not exist".
+                throw DeezerGatewayException(method, errorText)
             }
             result
         }
@@ -534,7 +577,8 @@ class DeezerApi(private val session: DeezerSession) {
 
     private val deezerTrack by lazy { DeezerTrack(this) }
 
-    suspend fun track(id: String): JsonObject = deezerTrack.track(id)
+    suspend fun track(id: String, caller: String = "?"): JsonObject =
+        deezerTrack.track(id, caller)
 
     suspend fun getListData(ids: List<String>): List<JsonObject> = deezerTrack.getListData(ids)
 

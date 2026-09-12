@@ -35,10 +35,7 @@ class VideoHorizontalViewHolder(
                 return@setOnClickListener
             }
             val (tracks, pos) = getAllTracks(feed!!)
-            listener.onTracksClicked(
-                        it, feed?.extensionId, feed?.context, tracks, pos,
-                        ordered = feed?.orderedList ?: true
-                    )
+            listener.onTracksClicked(it, feed?.extensionId, feed?.context, tracks, pos)
         }
         binding.root.setOnLongClickListener {
             listener.onMediaLongClicked(

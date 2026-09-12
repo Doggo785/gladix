@@ -37,27 +37,6 @@ sealed interface FeedType {
     val context: EchoMediaItem?
     val tabId: String?
 
-    // ⚠⚠ DID THIS ROW COME FROM AN ORDERED TRACK LIST? Shelf.Lists.Tracks is a COLLECTION whose
-    // order matters - an album, a playlist, a curated list - and tapping one of its tracks should queue the
-    // run from that point. Shelf.Item and Shelf.Lists.Items are DISCRETE media that happen to be tracks;
-    // tapping one should start a radio. Shelf.Lists.Items is plural for LAYOUT reasons, not ordering - it
-    // holds heterogeneous EchoMediaItems, so a track sits there beside albums and artists.
-    // Default false, overridden true only in toFeedType's Shelf.Lists.Tracks branch. A default GETTER, so
-    // the types that cannot hold a track need no change at all.
-    //
-    // ⚠️ A BOOLEAN, NOT A NEW Enum VARIANT, AND THE PRECEDENT DOES NOT ARGUE OTHERWISE. The
-    // CategoryGrid/Category split exists because those two need DIFFERENT SPAN SIZES AND VIEW TYPES, and
-    // that separation is what makes the preview cap unreachable from the expanded view by construction.
-    // Here the row renders IDENTICALLY and only the tap differs, so an enum would add a layout-dispatch
-    // branch for no layout reason.
-    //
-    // ⚠️ THE toFeedType-COUPLING OBJECTION DOES NOT TRANSFER, though it looks like it should.
-    // That objection - "suppression at source preferred over toFeedType() coupling to a Deezer-specific
-    // string" - was about binding this chokepoint to ONE EXTENSION'S VOCABULARY. A shelf kind is part of
-    // the common feed model that EVERY extension already produces, so the coupling is to our own
-    // abstraction rather than to a vendor's. They look alike and are not.
-    val orderedList: Boolean get() = false
-
     @Serializable
     data class Header(
         override val feedId: String,
@@ -95,7 +74,6 @@ sealed interface FeedType {
         override val tabId: String?,
         val item: EchoMediaItem,
         val number: Long?,
-        override val orderedList: Boolean = false,
     ) : FeedType {
         override val id = item.id
         override val type: Enum = Enum.Media
@@ -110,7 +88,6 @@ sealed interface FeedType {
         override val tabId: String?,
         val item: Track,
         override val type: Enum = Enum.Video,
-        override val orderedList: Boolean = false,
     ) : FeedType {
         override val id = item.id
         override val extras: Map<String, String>? = item.extras
@@ -124,7 +101,6 @@ sealed interface FeedType {
         override val tabId: String?,
         val item: EchoMediaItem,
         val number: Int? = null,
-        override val orderedList: Boolean = false,
     ) : FeedType {
         override val id = item.id
         override val type: Enum = Enum.MediaGrid
@@ -205,9 +181,8 @@ sealed interface FeedType {
                         MediaGrid(feedId, extId, context, tabId, it)
                     }
 
-                    // The ONLY branch that produces an ordered run - see FeedType.orderedList.
                     is Shelf.Lists.Tracks -> shelf.list.mapIndexed { index, item ->
-                        MediaGrid(feedId, extId, context, tabId, item, index + 1, orderedList = true)
+                        MediaGrid(feedId, extId, context, tabId, item, index + 1)
                     }
                 }
             }

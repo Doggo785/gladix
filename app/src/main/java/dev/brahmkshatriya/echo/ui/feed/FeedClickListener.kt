@@ -5,8 +5,10 @@ import androidx.fragment.app.Fragment
 import androidx.fragment.app.FragmentManager
 import androidx.fragment.app.activityViewModels
 import dev.brahmkshatriya.echo.R
+import dev.brahmkshatriya.echo.common.models.Album
 import dev.brahmkshatriya.echo.common.models.EchoMediaItem
 import dev.brahmkshatriya.echo.common.models.Feed
+import dev.brahmkshatriya.echo.common.models.Playlist
 import dev.brahmkshatriya.echo.common.models.Radio
 import dev.brahmkshatriya.echo.common.models.Shelf
 import dev.brahmkshatriya.echo.common.models.Track
@@ -26,6 +28,39 @@ open class FeedClickListener(
     private val afterOpen: () -> Unit = {}
 ) {
     companion object {
+        // ⚠⚠ DOES THIS FEED BELONG TO A COLLECTION WHOSE ORDER MATTERS? Tapping a track inside
+        // one queues it from that point; tapping a lone track anywhere else starts a radio.
+        //
+        // ⚠⚠ WHY THIS IS NOT A SHELF-KIND TEST, WHICH IS THE OBVIOUSLY-CORRECT-LOOKING SIGNAL.
+        // A FeedType.orderedList field WAS built (2026-09-12), derived from Shelf.Lists.Tracks in
+        // toFeedType, and it regressed every album and playlist tap. MediaDetailsViewModel's
+        // trackCachedFlow and tracksLoadedFlow both emit album and playlist tracks as INDIVIDUAL
+        // Shelf.Item rows - `.map { it?.map { t -> t.toShelf() } }`, and EchoMediaItem.toShelf() is
+        // `Shelf.Item(this)` - so the ordering is destroyed before toFeedType
+        // ever runs, for rendering reasons. orderedList could NEVER be true on a detail page: the field was
+        // reverted as INERT, not merely unused. Do not rebuild it.
+        //
+        // ⚠️ THE SPLIT IS TOTAL, WHICH IS WHAT MAKES THIS COMPLETE RATHER THAN A HEURISTIC.
+        // context is FeedData.State.item, and every producer was audited: MediaDetailsViewModel supplies
+        // the page's item at all four sites (tracks/feed x cached/loaded); HomeFragment, LibraryFragment,
+        // SearchFragment, FeedFragment and DownloadFragment all pass null. No screen mixes the two.
+        // Two consequences, both accepted: FeedFragment's "see all" passes null even when expanded FROM an
+        // album, so a track there radios - consistent with it being a browse surface; and DownloadFragment
+        // passes null, where tracks are discrete downloads.
+        //
+        // ⚠️ NAMED POSITIVELY, NOT AS `context != null`, AND THAT IS DELIBERATE. A Track detail
+        // page has a NON-NULL context (the track itself); onTracksClicked never fires there today because
+        // trackFeed() shows only album and artist rows, so a negative test would be correct BY ACCIDENT.
+        // Artist is excluded on purpose too: an artist page's top-tracks row is discrete, so radio is right.
+        // ⚠⚠ AND THE POSITIVE FORM AVOIDS A TRAP THIS PROJECT HAS ALREADY HIT ONE TYPE UP. When
+        // isReplayableContext() was introduced, a test on the parent type EchoMediaItem.Lists silently
+        // captured Radio, because Radio : EchoMediaItem.Lists - that was the bug. Album, Playlist AND Radio
+        // are all Lists here too, so the same test would misfire the same way.
+        // Album and Playlist are `data class`, i.e. FINAL - neither can be subclassed, so naming them
+        // positively cannot capture anything else now or later. Checked, not assumed.
+        fun isOrderedCollection(context: EchoMediaItem?) =
+            context is Album || context is Playlist
+
         fun Fragment.getFeedListener(
             navFragment: Fragment = this,
             afterOpen: () -> Unit = {}
@@ -158,43 +193,27 @@ open class FeedClickListener(
         extensionId: String?,
         context: EchoMediaItem?,
         tracks: List<Track>?,
-        pos: Int,
-        // Whether these tracks came from an ORDERED collection. Defaulted true so any caller or override
-        // that does not pass it keeps today's queueing behaviour, which is the safe direction.
-        ordered: Boolean = true,
+        pos: Int
     ): Boolean {
         if (extensionId == null) return notFoundSnack(R.string.extension)
         if (tracks.isNullOrEmpty()) return notFoundSnack(R.string.tracks)
 
-        // A single track tapped with no surrounding context IS a "radio" tile (Home "Mixes inspired by",
+        // A track tapped OUTSIDE an ordered collection IS a "radio" tile (Home "Mixes inspired by",
         // search): play the SEED first, then extend it into a radio. Route to playTrackRadio, which queues
         // the seed and APPENDS the generated radio server-side — mirroring phone's setQueue+auto-radio, but
         // explicit so it works on TV where auto-radio never fires (the seed used to loop). Videos are
-        // excluded (a "<title> Radio" label doesn't fit video). Multi-track / in-context taps queue normally.
-        // ⚠⚠ THIS PREDICATE MUST KEY ON `ordered` ALONE, PLUS THE VIDEO EXCLUSION. IT MUST NOT
-        // REGAIN A `tracks.size == 1` TERM. THAT IS THE MOST IMPORTANT LINE IN THIS FILE.
-        // It used to read `context == null && tracks.size == 1 && ...`, and search worked ONLY because
-        // SearchFragment overrode this method to MANUFACTURE a 1-element list. Search results are
-        // Shelf.Lists.Items, so with that override gone the list is the full run and a size term would
-        // silently stop radioing on the one screen that already worked - no crash, no log, just a tap that
-        // queues instead of starting a radio.
-        // ⚠️ THAT IS THE 2026 LESSON IN A NEW COSTUME. The earlier reroute of this same branch
-        // was believed TV-only, regressed phone, and the lesson recorded was "different code = new failure
-        // modes; prove phone paths untouched, not just same-outcome". A size term left in by habit is
-        // exactly that: same intent, different path, silent regression.
-        //
-        // ⚠️ `context` IS GONE FROM THE TEST DELIBERATELY, NOT DROPPED BY ACCIDENT. It is
-        // FEED-WIDE, not per-shelf - toFeedType threads one value (FeedData's state.item, i.e. what the
-        // FEED is about) into every row - so it cannot distinguish two shelves on the same screen. A
-        // discrete "related tracks" row on an album page has context = that Album and should still radio.
-        //
-        // ⚠⚠ AND "JUST MOVE SearchFragment'S OVERRIDE INTO getFeedListener" IS WRONG, which is
-        // worth stating because it is the obvious-looking fix. That override works by flattening the list
-        // to one element, which DESTROYS THE SURROUNDING RUN - generalising it would turn every album and
-        // playlist tap into a radio on that one track. The shelf kind is the real signal; list size was
-        // only ever a proxy for it.
+        // excluded (a "<title> Radio" label doesn't fit video). Taps inside an album or playlist queue the
+        // run from that point.
+        // ⚠️ [CORRECTED 2026-09-12] This read "a single track tapped with NO SURROUNDING CONTEXT",
+        // and the test carried a `context == null && tracks.size == 1` term to match. Both halves were wrong.
+        // `tracks.size == 1` was never the real rule — it held only because SearchFragment OVERRODE this
+        // method to manufacture a 1-element list; with that override gone, search passes its full run and a
+        // size term would silently stop radioing on the one screen that already worked. And `context == null`
+        // is too coarse in the other direction: an Artist page has a non-null context but its top-tracks row
+        // is discrete, so radio is right there. See isOrderedCollection above for both.
         val single = tracks.getOrNull(pos)?.takeIf {
-            !ordered && it.type != Track.Type.Video && it.type != Track.Type.HorizontalVideo
+            !isOrderedCollection(context) &&
+                it.type != Track.Type.Video && it.type != Track.Type.HorizontalVideo
         }
         val vm by fragment.activityViewModels<PlayerViewModel>()
         if (single != null) {

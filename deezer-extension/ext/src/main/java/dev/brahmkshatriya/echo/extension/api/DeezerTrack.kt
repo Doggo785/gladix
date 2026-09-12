@@ -6,9 +6,27 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.add
 
+// Temporary, paired with the PAGETRACK probe below. Plain vars, not atomics: a racing duplicate line
+// costs nothing here and avoids importing concurrency machinery into a file that will lose this again.
+private const val PAGETRACK_LOG_CAP = 20
+private var pageTrackLogged = 0
+
 class DeezerTrack(private val deezerApi: DeezerApi) {
 
-    suspend fun track(id: String): JsonObject {
+    // ⚠⚠ TEMPORARY PROBE - REMOVE WITH THE `caller` PARAMETER ONCE THE pageTrack QUESTION IS
+    // ANSWERED. Twelve `GATEWAY-ERROR method=deezer.pageTrack` fired on one screen (2026-09-12) and the
+    // tree CANNOT say which of the four api.track call sites produced them. Enumerating the four is not
+    // the check - see "Trace one real input to the branch" in CLAUDE.md; this is that rule's own failure
+    // mode, so the answer is one tag, not more reasoning.
+    // A skip-cascade explanation was drafted and REFUTED before it was offered:
+    // PlayerEventListener.maxConsecutiveUnavailableSkips is 3, so auto-skip cannot produce twelve.
+    // REMOVAL CONDITION: delete this println, the `caller` parameter and the four labels once one capture
+    // shows which caller dominates. It answers exactly one question and has no value after that.
+    suspend fun track(id: String, caller: String = "?"): JsonObject {
+        if (pageTrackLogged < PAGETRACK_LOG_CAP) {
+            pageTrackLogged++
+            println("GladixDeezer PAGETRACK caller=$caller id=$id")
+        }
         return deezerApi.callApi(
             method = "deezer.pageTrack",
             paramsBuilder = {

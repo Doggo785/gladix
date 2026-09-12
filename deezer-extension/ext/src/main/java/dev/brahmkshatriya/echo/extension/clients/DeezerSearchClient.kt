@@ -161,6 +161,38 @@ class DeezerSearchClient(private val deezerExtension: DeezerExtension, private v
             searchHomePipe.await() to exploreTab.await()
         }
 
+        // ⚠⚠ THE ONE LINE THAT DECIDES WHETHER channels/search-home-pipe STAYS. logSections
+        // above already reports the sections each endpoint RETURNED; this reports what survived
+        // toBrowseShelves, and the gap between the two is real - that function drops
+        // GO_BEYOND_STREAMING_MODULE_ID, drops blank/"?" titles, drops grid sections whose category list
+        // comes back empty (takeIf), and drops non-grid sections that do not cast to Shelf.Lists.Items.
+        // So a healthy `sections:` line does NOT prove a non-empty shelf list, which is exactly the
+        // question the parked item asks.
+        // PREDICTION, STATED BEFORE THE CAPTURE so the number cannot be read after the fact:
+        //   search-home-pipe >= 2  -> it is carrying the Genres/Categories grid the June work switched to
+        //                             it for. IT STAYS. Parked item closes as "load-bearing".
+        //   search-home-pipe == 0  -> dead weight on every Search-tab open. The endpoint, its async block
+        //                             and searchHomePipeShelves can all go, leaving explore-tab alone.
+        //   search-home-pipe == 1  -> partial; read the sections line above to see WHICH of Genres or
+        //                             Categories is being dropped, and by which of the four filters.
+        // A zero here with a NON-EMPTY sections line above means the endpoint works and toBrowseShelves
+        // is rejecting it - a different bug, and do not delete the endpoint on that reading.
+        // REMOVE THIS LINE once the parked item is closed either way; the logSections pair above is
+        // permanent instrumentation, this one is not.
+        println(
+            "GladixDeezer BROWSE shelves: search-home-pipe=${searchHomePipeShelves.size} " +
+                "explore-tab=${exploreTabShelves.size}"
+        )
+
+        // ⚠️ CLOSED 2026-09-12, DO NOT RE-OPEN: channels/explore/explore-tab IS NOT UNTESTED.
+        // It was investigated twice with temporary logging and DELIBERATELY DEMOTED. Confirmed then: it
+        // returns personalized content ("Dig deeper", "Evening chill") rather than the Genres/Categories
+        // grid of Deezer's official Search tab, and returns exactly 5 sections - the personalized ones plus
+        // EXPLORE_MODULE_ID ("Explore all"). It is CORRECT PER ITS OWN CONTRACT; it is simply a personalized
+        // browse feed rather than a genre grid. That is why channels/search-home-pipe became the primary
+        // source and this one is appended BELOW it rather than removed. Ordering in the sum below is that
+        // decision, not an accident - do not reorder it, and do not re-investigate this endpoint as though
+        // its behaviour were unknown.
         return searchHomePipeShelves + exploreTabShelves
     }
 
