@@ -136,10 +136,28 @@ class FeedFragment : Fragment(R.layout.fragment_generic_collapsable) {
             val binding = FragmentRecyclerWithRefreshBinding.bind(view)
             val recyclerView = binding.recyclerView as RecyclerView
             val uiViewModel by activityViewModel<UiViewModel>()
-            // ⚠️ ORDER IS LOAD-BEARING: the ItemTouchHelper is attached BEFORE the fast scroller,
-            // matching HomeFragment/LibraryFragment/SearchFragment. Both are OnItemTouchListeners and
+            // ⚠⚠ [CORRECTED 2026-09-13] THE "matching HomeFragment/LibraryFragment/SearchFragment"
+            // CLAIM WAS FALSE - AND IT WAS FALSE FOR ALL THREE, NOT JUST ONE. Verified by reading them:
+            //     HomeFragment     applyInsets(recyclerView, ...) :68  ->  getTouchHelper ... :84
+            //     LibraryFragment  applyInsets(recyclerView, ...) :86  ->  getTouchHelper ... :90
+            //     SearchFragment   applyInsets(recyclerView, ...) :132 ->  getTouchHelper ... :199
+            // applyInsets is MainFragment's companion extension and calls FastScrollerHelper.applyTo inside
+            // (MainFragment:105), so ALL THREE register the SCROLLER FIRST - the order this comment calls broken.
+            // ⚠⚠ WHAT THAT COST: Search has a live fast-scroller grab fault, and it was never in the
+            // fix's list BECAUSE THIS COMMENT CERTIFIED IT AS ALREADY CORRECT. A comment that certifies a screen
+            // it never checked is worse than no comment - a month of the investigation went elsewhere on its word.
+            // It is also a SINGLE ASSERTION with no second record: the claim appears in no session summary, only
+            // here and in its twin, so nothing could contradict it.
+            // ⚠️ WHAT SURVIVES: the REORDER ON THESE TWO FILES IS STILL RIGHT - it demonstrably fixed a
+            // thumb that rendered and refused to drag. What does NOT survive is the explanation, because the three
+            // screens cited as working exemplars use the opposite order. So the mechanism below is UNCONFIRMED:
+            // either those three have the same latent fault and nobody has tried to grab their thumbs, or
+            // registration order is not the whole cause here. Do not cite this comment as evidence about any screen
+            // other than this one.
+            // ORDER IS LOAD-BEARING ON THIS FILE: the ItemTouchHelper is attached BEFORE the fast scroller.
+            // Both are OnItemTouchListeners and
             // RecyclerView.dispatchOnItemTouch walks mOnItemTouchListeners IN REGISTRATION ORDER, latching
-            // the first that intercepts — upstream AndroidFastScroll issue #53. This file and FeedFragment
+            // the first that intercepts - upstream AndroidFastScroll issue #53. This file and its twin
             // had the opposite order and were the only two screens where the fast-scroll thumb rendered but
             // refused to drag. Do not reorder these two lines.
             getTouchHelper(listener).attachToRecyclerView(recyclerView)

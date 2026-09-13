@@ -482,34 +482,19 @@ class PlayerEventListener(
             // windowed-index seeks). Guarded so it fires exactly once and loses to a user action: mediaId must
             // still be the restored track (not one the user tapped mid-buffer), and currentPosition must still
             // be at the start (a user seek before this READY moves it past the belt and we leave it alone).
-            // ⚠⚠ ONE LINE, ALWAYS PRINTED, STATING WHAT THE GUARD DECIDED - NOT A LINE ONLY
-            // WHEN IT REJECTS. A refusal-only probe cannot tell "fixed" from "never ran", and its silence
-            // has cost three separate rounds of investigation. Here `restoreSeek=` always carries a verdict,
-            // so silence can only mean STATE_READY itself did not happen.
-            // Order matters: pos is captured BEFORE the seek, so the line shows the position the fix was
-            // judging rather than the one it produced.
-            // Epoch is tested FIRST because the two older guards cannot decide this - see the mechanism note
+            // ⚠⚠ EPOCH FIRST - THE TWO OLDER GUARDS CANNOT DECIDE THIS. See the mechanism note
             // at PlayerState.pendingRestoreSeek: mediaId and the belt are both SATISFIED by a fresh tap on
-            // the restored track, which is the case they were meant to exclude.
+            // the restored track, which is exactly the case they were written to exclude. A null epoch means
+            // the arm could not capture one (onPlaybackResumption) and keeps the old behaviour.
+            // posBefore is read BEFORE the seek, because the belt is asking what the position was when the
+            // fix judged it, not what the fix produced.
             val posBefore = player.currentPosition
             val seek = consumeRestoreSeek()
-            val verdict = when {
-                seek == null -> "none"
-                seek.epoch != null && seek.epoch != player.queueEpochOrZero ->
-                    "drop:stale-epoch(builtFor=${seek.epoch},now=${player.queueEpochOrZero})"
-                player.currentMediaItem?.mediaId != seek.mediaId -> "drop:other-track"
-                posBefore >= RESTORE_SEEK_BELT_MS -> "drop:user-moved"
-                else -> "seek:${seek.positionMs}"
-            }
-            if (seek != null && verdict.startsWith("seek")) player.seekTo(seek.positionMs)
-            // ⚠️ TIME-BOXED, REMOVE WITH trackRadio's PAIRED `prepare pos=` LINE. On a cold-start
-            // search tap the pair reads `prepare pos=0` then `READY pos=0 restoreSeek=drop:stale-epoch` -
-            // the fix catching it. `restoreSeek=none` means the latch was never armed and the run did not
-            // exercise the fix at all, which is a DIFFERENT result from the fix working.
-            Log.d(
-                "GladixQueue",
-                "READY pos=$posBefore id=${player.currentMediaItem?.mediaId} restoreSeek=$verdict"
-            )
+            if (seek != null
+                && (seek.epoch == null || seek.epoch == player.queueEpochOrZero)
+                && player.currentMediaItem?.mediaId == seek.mediaId
+                && posBefore < RESTORE_SEEK_BELT_MS
+            ) player.seekTo(seek.positionMs)
         }
     }
 

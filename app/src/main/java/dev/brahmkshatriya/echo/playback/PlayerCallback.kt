@@ -546,10 +546,6 @@ class PlayerCallback(
         // never ran" and "GladixRadio was not in the filter" are indistinguishable from those captures.
         // Logging entry under the tag that is demonstrably being captured removes that ambiguity whichever
         // way it turns out.
-        // ⚠️ THIS LINE IS TIME-BOXED, like STALE_STATION: remove it once a capture shows
-        // TRACKRADIO and LOADPLAYLIST reason=track_radio_generating together, which is the pair that proves
-        // the duplicate suppression works end to end.
-        Log.d("GladixQueue", "TRACKRADIO ext=$extId seed=${seed.title}")
         PlayerRadio.markTrackRadioGenerating(true)
         try {
             player.with {
@@ -568,23 +564,19 @@ class PlayerCallback(
                 // everything else was YTM-only. Kept recorded rather than deleted because the ORDERING was the
                 // hard part - it could not be removed until trackRadio bridged its own start() failure, since
                 // until then the duplicate was the only thing making the YTM rescue reachable.
+                // ⚠⚠ SALVAGED FROM A DELETED PROBE 2026-09-12 - THIS DOES NOT RESUME MUSIC, AND
+                // THE REASON IS NOT VISIBLE FROM HERE. `playedDuration` is set in EXACTLY ONE PLACE,
+                // DeezerParser's EPISODE branch, from Deezer's own bookmark - so it is POPULATED FOR
+                // PODCASTS ONLY and a music seed always passes 0. Four call sites read it as a start
+                // position (this one, PlayerViewModel's setQueue, and two in playItem) and every one of them
+                // looks like a resume until you know that.
+                // Recorded here because the probe note that carried it was removed with the restore-seek
+                // proof, and the fact outlived the question that found it: it is what ruled out "the seed
+                // carries a resume point" when a cold-start tap started mid-song.
                 setMediaItems(listOf(seedItem), 0, seed.playedDuration ?: 0)
                 (this as? ShufflePlayer)?.syncShuffleFlag(false)
                 if (playbackState == Player.STATE_IDLE) prepare()
                 playWhenReady = true
-                // ⚠️ TIME-BOXED PROOF, REMOVE WITH THE `READY pos=` LINE IN PlayerEventListener.
-                // playedDuration is podcast-only (DeezerParser sets it from Deezer's bookmark on the
-                // EPISODE branch), so a music seed starts at 0 and this should print pos=0. If the paired
-                // READY line then prints a non-zero pos for the same mediaId, something seeked in between
-                // and the restore latch is it. Zero then non-zero is the whole proof.
-                // ⚠️ GladixQueue, NOT GladixPlayback - SAME REASON AS THE TRACKRADIO LINE
-                // ABOVE, WHICH I BROKE ONCE ALREADY. The 2026-09-12 capture returned GladixQueue and
-                // GladixRadio lines and this one was filtered out, so a fix shipped with its proof and the
-                // proof was invisible. A diagnostic belongs on the tag that is demonstrably being captured.
-                Log.d(
-                    "GladixQueue",
-                    "TRACKRADIO prepare pos=$currentPosition id=${currentMediaItem?.mediaId}"
-                )
             }
             // 2) Generate the radio and append it after the seed (mirrors PlayerRadio.loadPlaylist: start +
             //    play). Fully guarded: a missing extension or any generation error is reported but cannot abort

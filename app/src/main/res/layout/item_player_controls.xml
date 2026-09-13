@@ -132,17 +132,27 @@
                  PlayerFragment's playerColors block, which otherwise overrides this at runtime.
                  KNOWN COST: no buffer display on the expanded player. Real on a slow connection.
                  tv_buffer_bar carries the same change; keep the two in step. -->
+            <!-- RAIL COLOUR AND ALPHA ARE LOAD-BEARING TOGETHER - see PlayerFragment's seekWaveBar
+                 block for the full rationale.
+                 amoled_fg, NOT ?attr/colorOnSurface: the wave now uses amoled_fg too, and ONE SOURCE for
+                 both halves is the point - colorOnSurface is wallpaper-derived under DynamicColors on
+                 Android 12+, so the two halves could drift apart per device.
+                 THE ALPHA NOW CARRIES THE PLAYED/UNPLAYED DISTINCTION. While the wave was artwork-tinted,
+                 hue separated the halves and the 2dp-vs-4dp thickness step was a secondary cue. With both
+                 halves the same hue, thickness alone provides NO CONTRAST AT THE BOUNDARY - solid-versus-0.3
+                 is what separates them. Do not raise this back toward the wave's opacity, and do not equalise
+                 the thicknesses. -->
             <com.google.android.material.progressindicator.LinearProgressIndicator
                 android:id="@+id/bufferBar"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_gravity="center"
                 android:layout_marginHorizontal="12dp"
-                android:alpha="0.5"
+                android:alpha="0.3"
                 android:progress="40"
                 app:indicatorColor="@android:color/transparent"
                 app:indicatorTrackGapSize="0dp"
-                app:trackColor="?attr/colorOnSurface"
+                app:trackColor="@color/amoled_fg"
                 app:trackThickness="2dp" />
 
             <!-- Wavy POSITION track. Ordered between bufferBar and seekBar deliberately: later children

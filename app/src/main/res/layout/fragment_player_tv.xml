@@ -133,16 +133,19 @@
                      density-independent and not DISTANCE-independent, so a 2dp line at three metres is far
                      fainter than 2dp at arm's length. Half the 4dp+ wave without vanishing.
                      KNOWN COST: no buffer display on the TV player. Real on a slow connection. -->
+                <!-- Mirrors item_player_controls.xml's bufferBar - amoled_fg with a 0.3 alpha carrying the
+                     played/unplayed distinction now that both halves share one hue. Rationale at
+                     PlayerFragment's seekWaveBar block. -->
                 <com.google.android.material.progressindicator.LinearProgressIndicator
                     android:id="@+id/tv_buffer_bar"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_gravity="center_vertical"
                     android:layout_marginHorizontal="12dp"
-                    android:alpha="0.5"
+                    android:alpha="0.3"
                     app:indicatorColor="@android:color/transparent"
                     app:indicatorTrackGapSize="0dp"
-                    app:trackColor="?attr/colorOnSurface"
+                    app:trackColor="@color/amoled_fg"
                     app:trackThickness="3dp" />
 
                 <!-- Wavy POSITION track — TV twin of item_player_controls.xml's seekWaveBar; see the note

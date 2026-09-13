@@ -458,6 +458,30 @@ class PixelFastScrollViewHelper(
             // drag (new children attach with different heights), the fraction-to-pixels mapping drifts.
             // But it drifts IDENTICALLY for the thumb and for the content, because both now read the same
             // extrapolation — which is the property that matters. The estimate broke exactly that.
+            //
+            // ⚠⚠ [2026-09-13] THAT DISMISSAL DOES NOT COVER REACHABILITY, AND A REPORTED FAULT
+            // SITS IN THE GAP. SYMPTOM: on the Search landing, grabbing the thumb at the very top and
+            // dragging down STOPS ABOUT TWO-THIRDS OF THE WAY AND WILL NOT REACH THE BOTTOM.
+            // ⚠⚠ THE NUMBERS ARE ALREADY IN THIS NOTE, WHICH IS WHY THIS IS NEAR-PROOF RATHER
+            // THAN A HYPOTHESIS: the Search capture recorded above measured 4082 at the top and 5918
+            // further down, 33 items throughout. 4082 / 5918 = 0.69. "ABOUT TWO-THIRDS" IS NOT AN
+            // APPROXIMATION OF THE SYMPTOM - IT IS THE NUMBER THIS CODE PRODUCES.
+            // MECHANISM: getScrollRange() grows as the drag descends, so getScrollOffsetRange() =
+            // getScrollRange() - view.height grows with it, and the bottom RECEDES as the finger
+            // approaches it.
+            // ⚠️ WHY THE PARAGRAPH ABOVE MISSED IT: "drifts identically for the thumb and for
+            // the content" is sound for KEEPING THE THUMB UNDER THE FINGER, and says nothing about whether
+            // the END IS REACHABLE. Those are different properties of the same drift. So this is a known
+            // residual whose dismissal rested on a property that does not apply to this symptom - not a
+            // new fault, and not one the September work refuted.
+            // ⚠️ NOT FIXED, AND THE OBVIOUS FIX IS NEITHER DEAD NOR CLEAR. Freezing
+            // getScrollRange() for the duration of a drag is NOT the same operation as the freeze already
+            // refuted here - that one froze childCount INSIDE the extrapolation's denominator, leaving the
+            // other terms live, which made the ceiling internally inconsistent and pinned the thumb.
+            // Freezing the whole composite at DOWN keeps every term consistent. Its own untested risk is
+            // the mirror image: frozen at the top means frozen at 4082, which could make the bottom
+            // unreachable a different way. Left unproposed - the Search screen has a SECOND, unrelated
+            // fault (an initial thumb grab over the card sections is refused), and one fault at a time.
             gestureSpan = librarySpan
             lastFraction = fraction
             pendingPixels = 0.0
@@ -554,6 +578,20 @@ class PixelFastScrollViewHelper(
      * until the following ACTION_MOVE, so it is seeded by the NaN check instead.
      */
     private fun trackGesture(event: MotionEvent, consumed: Boolean) {
+        // ⚠⚠ TEMPORARY (2026-09-13) - REMOVE WITH THE `SCROLLTOUCH observer` LINE IN
+        // SearchFragment; the two are one instrument and neither reads alone.
+        // THIS IS THE SCROLLER'S OWN VERDICT. `consumed` is the library's Predicate result - the listener
+        // object is OURS (addOnTouchEventListener below builds the SimpleOnItemTouchListener) but the
+        // decision is AndroidFastScroll's, so this observes its answer without wrapping or altering it.
+        // Prints on EVERY DOWN that reaches this listener, not only refusals, so silence here means
+        // "this listener was not called" and nothing else.
+        // REMOVAL CONDITION: delete once one capture shows which of the three outcomes occurs over a card
+        // row. It answers one question and has no value after.
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) android.util.Log.d(
+            "GladixScroll",
+            "SCROLLTOUCH scroller tag=$traceTag consumed=$consumed " +
+                "x=${event.x.toInt()} y=${event.y.toInt()}"
+        )
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> if (consumed) gestureActive = true
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {

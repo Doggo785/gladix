@@ -254,6 +254,48 @@ class ShufflePlayer(
         player.replaceMediaItems(fromIndex, toIndex, mediaItems)
     }
 
+    // ⚠⚠ OPEN UNEXPLAINED SYMPTOM - AA FROZE ON AN OLD TRACK. NO WORK BEHIND THIS, ONLY
+    // EXCLUSIONS. Written symptom-first so it is findable by what was SEEN rather than by a mechanism
+    // nobody has. THIS IS THE THIRD OCCURRENCE OF THIS SYMPTOM and the earlier ones could not be found by
+    // searching, because they were recorded under their root causes.
+    //
+    // WHAT WAS SEEN: Android Auto's NOW-PLAYING DISPLAY FROZE ON A TRACK FROM AN EARLIER PLAYLIST - art,
+    // title, artist AND duration all stuck - while PLAYBACK, PROGRESS AND THE TRANSPORT CONTROLS STAYED
+    // COMPLETELY CORRECT. Right audio, progress bar moving, pause/skip/next all working from the head unit.
+    // The freeze PERSISTED ACROSS TRACK CHANGES and was cleared only by ENDING THE AA SESSION (car off,
+    // fresh start). Every other session that day behaved correctly.
+    //
+    // TRIGGER: switching to a DIFFERENT PLAYLIST FROM THE PHONE while AA was connected, within Deezer.
+    // Build 1103, once, NOT REPRODUCIBLE. Whether AA's QUEUE also froze was not observed - do not assume
+    // either way; that observation is the most useful thing a recurrence could add.
+    //
+    // FOUR EXCLUSIONS - A RECURRENCE STARTS FROM THESE RATHER THAN RE-DERIVING THEM:
+    //   1. NO EXTENSION SWITCH (Deezer throughout) - rules out the aug07b "phone extension switch = queue
+    //      REPLACE -> AA card doesn't refresh" case.
+    //   2. NO HUNG OR UNRESOLVED TRACK AND NO MANUAL ADVANCE PAST ONE - rules out the Aug 9 fix's arming
+    //      condition, `departing?.isLoaded == false || skipHistory`.
+    //   3. NO PLAYBACK FAILURE AND NO ERROR STATE - rules out the Aug 11 case immediately below, whose
+    //      entire mechanism is playerError staying non-null.
+    //   4. NO BITMAP-DEFERRAL SUPPRESSION - MediaSessionLegacyStub:1825's setMetadata is UNCONDITIONAL,
+    //      OUTSIDE the bitmap block, so text publishes synchronously and only ARTWORK can lag. A TOTAL
+    //      freeze is the opposite of what that path produces. (Proposed and killed 2026-09-13 by the
+    //      observation that title/artist/duration froze too.)
+    //
+    // ⚠️ AND THE BITMAP-PATH Log.w IS DIAGNOSTICALLY USELESS HERE. MediaSessionLegacyStub logs
+    // "failed to load bitmap" on the artwork future's onFailure - but PlayerBitmapLoader delivers CANCELLED
+    // loads as FAILED ones (futureCatching launders CancellationException into future.setException), and
+    // cancellations are routine. So that warning fires in healthy sessions and FINDING IT IN A CAPTURE
+    // PROVES NOTHING. Do not treat it as evidence either way.
+    //
+    // MECHANISM ANALYSIS, LAST BECAUSE IT IS THE PART THAT FAILED: no traced path admits this symptom.
+    // The stub's four-field diff (lastMediaMetadata/lastMediaId/lastMediaUri/lastDurationMs) cannot match
+    // across two different tracks - our mediaId is the track id. BOTH onTimelineChanged AND
+    // onMediaItemTransition call updateMetadataIfChanged on a queue replace, so single-callback
+    // suppression (the Aug 9 shape) cannot explain it. And a window-UID collision between two playlists is
+    // impossible: MediaSourceList.MediaSourceHolder assigns `uid = new Object()`, identity, so
+    // evaluateMediaItemTransitionReason always takes its !equals branch and reports PLAYLIST_CHANGED.
+    // Read from media3 1.11.0 source. THE NEXT STEP IS A REPRODUCTION, NOT ANOTHER THEORY.
+    //
     // Error-state sequencing for the media session (Android Auto). A queue replace while the inner player
     // still holds a live playbackError publishes the NEW track's MediaMetadataCompat under a
     // PlaybackStateCompat that STILL reads STATE_ERROR: Media3's legacy stub runs onTimelineChanged /

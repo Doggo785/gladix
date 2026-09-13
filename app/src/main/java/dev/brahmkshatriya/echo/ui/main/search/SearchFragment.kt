@@ -28,6 +28,7 @@ import dev.brahmkshatriya.echo.databinding.FragmentSearchBinding
 import dev.brahmkshatriya.echo.extensions.ExtensionUtils.getAs
 import dev.brahmkshatriya.echo.extensions.ExtensionUtils.getExtension
 import dev.brahmkshatriya.echo.extensions.cache.Cached
+import android.view.MotionEvent
 import androidx.recyclerview.widget.RecyclerView
 import dev.brahmkshatriya.echo.ui.common.GridAdapter.Companion.configureGridLayout
 import dev.brahmkshatriya.echo.ui.common.TvAwareRecyclerView
@@ -129,6 +130,30 @@ class SearchFragment : Fragment(R.layout.fragment_search) {
         val binding = FragmentSearchBinding.bind(view)
         val recyclerView = binding.recyclerView as RecyclerView
         setupTransition(view, false, MaterialSharedAxis.Y)
+        // ⚠⚠ TEMPORARY (2026-09-13) - REMOVE WITH trackGesture's `SCROLLTOUCH scroller` LINE.
+        // REGISTERED BEFORE applyInsets ON PURPOSE: RecyclerView.dispatchOnItemTouchIntercept walks
+        // listeners in REGISTRATION ORDER, so registering first means this sees every DOWN that reaches the
+        // RecyclerView's item-touch dispatch at all - including ones a later listener latches.
+        // BEHAVIOUR-NEUTRAL: it returns false always, and a listener that never returns true never latches
+        // the gesture, so nothing downstream changes.
+        // IT PRINTS ON EVERY DOWN, not only the failing ones - the whole point is that silence must be
+        // unambiguous. `child` names what is under the finger, which is how the POSITIONAL half is read:
+        // a nested RecyclerView there means the press was over a card row.
+        // REMOVAL CONDITION: delete once one capture separates the three outcomes below.
+        recyclerView.addOnItemTouchListener(object : RecyclerView.SimpleOnItemTouchListener() {
+            override fun onInterceptTouchEvent(rv: RecyclerView, e: MotionEvent): Boolean {
+                if (e.actionMasked == MotionEvent.ACTION_DOWN) {
+                    val child = rv.findChildViewUnder(e.x, e.y)
+                    android.util.Log.d(
+                        "GladixScroll",
+                        "SCROLLTOUCH observer x=${e.x.toInt()} y=${e.y.toInt()} " +
+                            "child=${child?.javaClass?.simpleName} " +
+                            "nested=${child is RecyclerView} w=${rv.width}"
+                    )
+                }
+                return false
+            }
+        })
         applyInsets(recyclerView, binding.appBarOutline) {
             binding.swipeRefresh.configure(it)
         }
@@ -196,6 +221,44 @@ class SearchFragment : Fragment(R.layout.fragment_search) {
             searchAdapter.notifyItemChanged(0)
             binding.quickSearchView.setText(it)
         }
+        // ⚠⚠ OPEN FAULT - CANNOT START A THUMB GRAB OVER THE CARD/TILE SECTIONS ON THIS SCREEN.
+        // WHAT WAS SEEN: on the Search landing, an INITIAL TOUCH on the fast-scroll thumb over a card/tile
+        // section does not take. The thumb IS visible there and drags through those sections fine if the
+        // grab BEGINS above or below them. It is the start of the gesture that fails, not visibility, and
+        // not the drag. (A second, UNRELATED fault on this screen - the drag stopping two-thirds down - is
+        // recorded at PixelFastScrollViewHelper's extrapolation note. Different half of the system.)
+        //
+        // REGISTRATION ORDER HERE IS SCROLLER-FIRST: applyInsets(recyclerView, ...) at :132 calls
+        // FastScrollerHelper.applyTo inside (MainFragment:105), and the ItemTouchHelper attaches below.
+        // That is the order FeedFragment's comment calls broken - but read that comment's [CORRECTED]
+        // block before drawing from it: HomeFragment and LibraryFragment are scroller-first too, so the
+        // three screens it cited as working exemplars all use this order. Order alone therefore explains
+        // neither their working state nor this fault, and it CANNOT explain a POSITIONAL symptom in any
+        // case - registration order does not vary with where the finger lands.
+        //
+        // ⚠️ THE CAROUSEL HYPOTHESIS IS WEAKER THAN IT LOOKS, WHICH IS WORTH RECORDING BECAUSE
+        // IT IS THE OBVIOUS CANDIDATE. The card sections DO host nested horizontal RecyclerViews
+        // (HorizontalListViewHolder: binding.root is the inner RecyclerView, LinearLayoutManager.HORIZONTAL)
+        // - established, not in doubt. But they are BARE: grepping the whole feed package finds NO
+        // onInterceptTouchEvent override, NO requestDisallowInterceptTouchEvent, NO setOnTouchListener.
+        // And the OUTER RecyclerView's OnItemTouchListeners run in ITS onInterceptTouchEvent, which
+        // ViewGroup dispatch runs BEFORE any child sees the DOWN - so a bare nested RecyclerView should not
+        // be able to take a gesture the scroller's listener claimed. Not refuted, but it does not follow
+        // from what is in the tree; something else is doing the positional part.
+        //
+        // ⚠️ ALPHA CONSIDERED AND RANKED BELOW IT, NOT UNTRIED: a thumb at alpha 0 (the library's
+        // auto-hide) would refuse a grab while still being visible once re-shown. Dropped because AUTO-HIDE
+        // IS TEMPORAL AND THIS SYMPTOM IS POSITIONAL - it would refuse a grab anywhere, not specifically
+        // over cards. Note also that FixOnItemTouchListenerRecyclerView, named in the record as the gate
+        // that would close this question, IS NOT IN THIS TREE - it exists only as a mention in
+        // PixelFastScrollViewHelper's addOnTouchEventListener note, describing something the library ships.
+        //
+        // ⚠️ AND ONE WRONG TURN, RECORDED SO IT IS NOT REPEATED: applyTo is called with
+        // traceTag = "main" here, and that was read as evidence the thumb belonged to a DIFFERENT
+        // RecyclerView (MainFragment's). It does not - applyInsets is a SHARED companion extension and the
+        // tag is a label on the helper, not on a view. This screen has ONE RecyclerView with TWO listeners.
+        // Second time in this codebase a NAME has been read as describing a function it does not perform;
+        // the other is bufferBar, whose only surviving job is to draw the static unplayed rail.
         getTouchHelper(listener).attachToRecyclerView(recyclerView)
         configureGridLayout(
             recyclerView,

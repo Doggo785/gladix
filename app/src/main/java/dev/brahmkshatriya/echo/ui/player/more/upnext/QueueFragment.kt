@@ -36,6 +36,11 @@ class QueueFragment : Fragment() {
     // appear until the finger lifts. A few seconds of staleness beats a cancelled drag.
     private var isDragging = false
 
+    // Captured at the same instant, and from the same expression, as ItemTouchHelper's own mSelectedStartY
+    // (:687) - so the geom line below can report the gap between that frozen value and the tile's live
+    // position. REMOVE WITH THE QUEUEDRAG SET.
+    private var dragStartTop: Int? = null
+
     // ⚠⚠ A BOOLEAN, NOT PlaylistTrackAdapter'S pendingList, AND THE DIFFERENCE IS NOT STYLE.
     // There the observer CARRIES the value (`observe(vm.currentTracks) { ... pendingList = it }`), so the
     // deferred list has to be stored or it is lost - pendingList is NECESSARY there.
@@ -57,8 +62,30 @@ class QueueFragment : Fragment() {
     // accelerates FASTER than Callback.interpolateOutOfBoundsScroll's 2s ramp alone implies, because the
     // out-of-bounds magnitude it is fed is itself growing. Two compounding terms, only one of them
     // documented. Recorded because it reads as a per-screen quirk and is a library-wide one.
-    // It explains RUNAWAY, NOT ONSET - the first frame's curY is not yet corrupted, which is exactly why
-    // the probe below logs only that frame.
+    // ⚠⚠ [2026-09-12] THE LOCAL-REORDER FIX ADDED A SECOND DIVERGENCE SOURCE, AND THIS NOTE IS
+    // NOW OPERATIVE RATHER THAN BACKGROUND. Before the fix nothing reordered, so no swap ever completed and
+    // the only thing moving children was scrollIfNecessary's own scrollBy. Now every successful onMove runs
+    // Callback.onMoved -> LinearLayoutManager.prepareForDrop -> scrollToPositionWithOffset, so the list is
+    // scrolled ON EVERY ROW CROSSED while mSelectedStartY still holds the pickup value. curY is therefore
+    // "where the tile would be if the list had never moved", and the error accumulates with the drag's
+    // history - how many rows were crossed and in which order.
+    // ⚠️ THAT IS THE LEADING EXPLANATION FOR "DRAGGING UP SOMETIMES SCROLLS AND SOMETIMES DOES
+    // NOT", REPORTED ON DEVICE AFTER THE FIX. It is UNMEASURED and it is the FOURTH mechanism proposed for
+    // this defect, so treat it as a hypothesis. It is better supported than the first three, and the
+    // difference is worth stating rather than asserting confidence: mSelectedStartY's single assignment is
+    // READ (:687, no other write), and the second divergence source is not speculation about the library -
+    // it is a consequence of a change WE made, whose call chain is read end to end.
+    // ⚠️ WHAT IS NOT A DEFECT, so it is not re-investigated: up and down are asymmetric BY
+    // DESIGN. scrollIfNecessary's down branch adds itemView.getHeight(), so it triggers as soon as the
+    // tile's BOTTOM reaches the list's bottom; the up branch needs the tile's TOP to clear the padded top
+    // edge, which a finger may never reach on a tall row. "Down works cleanly, up is reluctant" is those
+    // two expressions, not a bug.
+    // ⚠️ AND THE "DISAPPEARING TILE" MAY NOT BE A SCROLL AT ALL: if the dragged view leaves the
+    // window, onChildViewDetachedFromWindow (:902-916) calls select(null, ACTION_STATE_IDLE) and the drag
+    // ENDS. The surviving QUEUEDRAG lines separate the two at no cost - clearView mid-drag with no further
+    // onMove is a dropped drag; clearView only at the end with onMove continuing is the scroll geometry.
+    // It explains RUNAWAY, NOT ONSET - the first frame's curY is not yet corrupted, which is why any
+    // rebuilt probe must log the FIRST frame of each scroll run, and startTop against live getTop().
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -115,6 +142,35 @@ class QueueFragment : Fragment() {
                 val currentPos = queueAdapter.currentList.indexOfFirst { it.first != null }
                 if (currentPos != -1 && toPos <= currentPos) return false
                 android.util.Log.d("GladixQueue", "QUEUEDRAG onMove $fromPos->$toPos")
+                // ⚠⚠ TEMPORARY - REMOVE WITH THE QUEUEDRAG SET. WHY IT IS LOGGED HERE AND NOT IN
+                // interpolateOutOfBoundsScroll, WHICH IS WHERE THE LIBRARY DOES THE ARITHMETIC: that method
+                // is called ONLY when scrollIfNecessary already decided to scroll (:787-796), so on the
+                // failing case it emits NOTHING - and nothing is what the earlier oob probe produced, which
+                // was then misread as "auto-scroll is not the mechanism". onMove fires once per row crossed
+                // regardless of the outcome, so this prints on the frames where the threshold is MISSED,
+                // which are the ones in question.
+                // WHAT THE NUMBERS ARE: startTop is mSelectedStartY's value (same expression, same instant);
+                // nowTop is the tile's LIVE layout position; drift is how far the frozen capture has fallen
+                // behind after prepareForDrop scrolled the list under it. topFresh/bottomFresh are the two
+                // library thresholds recomputed from the LIVE position instead of the stale one.
+                // ⚠️ NOT LITERALLY THE LIBRARY'S NUMBERS: it uses curY = mSelectedStartY + mDy,
+                // and mDy (the finger delta) is not reachable from here. These are "what the threshold would
+                // be if the capture were fresh", which is exactly the comparison at issue. mTmpRect is 0 on
+                // this screen - it holds ItemDecoration offsets and QueueFragment adds none - so that term
+                // drops out honestly rather than being ignored.
+                run {
+                    val v = viewHolder.itemView
+                    val start = dragStartTop
+                    val nowTop = v.top
+                    android.util.Log.d(
+                        "GladixQueue",
+                        "QUEUEDRAG geom dir=${if (toPos < fromPos) "up" else "down"} " +
+                            "startTop=$start nowTop=$nowTop drift=${start?.let { nowTop - it }} " +
+                            "topFresh=${nowTop - recyclerView.paddingTop} " +
+                            "bottomFresh=${nowTop + v.height - (recyclerView.height - recyclerView.paddingBottom)} " +
+                            "tileH=${v.height} rvH=${recyclerView.height}"
+                    )
+                }
                 // ⚠⚠ THE LOCAL REORDER - THIS IS THE FIX, AND IT MUST SIT AFTER BOTH REFUSALS.
                 // ItemTouchHelper's contract is that `true` means "I moved the items in my data set". We
                 // returned true while moving nothing: onMove only called the PLAYER and waited for
@@ -142,6 +198,7 @@ class QueueFragment : Fragment() {
                 super.onSelectedChanged(viewHolder, actionState)
                 if (actionState == ItemTouchHelper.ACTION_STATE_DRAG) {
                     isDragging = true
+                    dragStartTop = viewHolder?.itemView?.top
                 }
                 android.util.Log.d(
                     "GladixQueue", "QUEUEDRAG selected state=$actionState armed=$isDragging"
@@ -164,6 +221,7 @@ class QueueFragment : Fragment() {
                 super.clearView(recyclerView, viewHolder)
                 android.util.Log.d("GladixQueue", "QUEUEDRAG clearView")
                 isDragging = false
+                dragStartTop = null
                 // ⚠⚠ NO RESUBMIT HERE, AND THAT IS A FIX RATHER THAN AN OMISSION. A catch-up
                 // `submit()` used to run here. It recomputed from viewModel.queue - which the 1102 capture
                 // proved is STILL STALE at this moment: the drag's own moveMediaItem calls emit through

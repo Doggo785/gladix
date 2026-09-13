@@ -25,6 +25,7 @@ import com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDE
 import com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_HIDDEN
 import com.google.android.material.slider.Slider
 import kotlinx.coroutines.flow.combine
+import androidx.core.content.ContextCompat
 import dev.brahmkshatriya.echo.R
 import dev.brahmkshatriya.echo.databinding.FragmentPlayerTvBinding
 import dev.brahmkshatriya.echo.ui.media.more.MediaMoreBottomSheet
@@ -406,8 +407,18 @@ class PlayerTvFragment : Fragment() {
             // Accent goes on the WAVE, not the Slider's active track — see PlayerFragment's twin of this
             // line. A runtime tint here would override the transparent trackColorActive in XML and draw a
             // straight line back under the wave.
-            b.tvSeekWaveBar.setIndicatorColor(colors.accent)
-            b.tvSeekBar.thumbTintList = ColorStateList.valueOf(colors.accent)
+            // ⚠⚠ NEUTRAL, MIRRORING PlayerFragment - AND THE CASE IS STRONGER HERE, NOT WEAKER.
+            // Read the full rationale at PlayerFragment's twin of this line. On phone the wave and its
+            // background are two colours drawn from ONE image; on TV, `b.root.setBackgroundColor(...)` a few
+            // lines above sets the root to `colors.accent` ITSELF when dynamic - so the wave and the surface
+            // behind it were the SAME VALUE, not merely the same region of colour space. Invisible by
+            // arithmetic rather than by coincidence.
+            // TV already uses amoled_fg for its own chrome (icon tints, text in fragment_player_tv.xml), so
+            // this matches what is beside it. tvPlayingIndicator below KEEPS the accent: it is not on the
+            // seek row and does not sit on the progress track.
+            val seekNeutral = ContextCompat.getColor(ctx, R.color.amoled_fg)
+            b.tvSeekWaveBar.setIndicatorColor(seekNeutral)
+            b.tvSeekBar.thumbTintList = ColorStateList.valueOf(seekNeutral)
             b.tvPlayingIndicator.setIndicatorColor(colors.accent)
             // tvBufferBar.setIndicatorColor is DELIBERATELY ABSENT — mirrors PlayerFragment. The buffer
             // indicator is transparent in XML because DeterminateDrawable never assigns startFraction, so

@@ -60,6 +60,7 @@ import com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_COLLAPS
 import com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED
 import com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_HIDDEN
 import com.google.android.material.slider.Slider
+import androidx.core.content.ContextCompat
 import dev.brahmkshatriya.echo.R
 import dev.brahmkshatriya.echo.common.models.Artist
 import dev.brahmkshatriya.echo.common.models.EchoMediaItem
@@ -1199,7 +1200,53 @@ class PlayerFragment : Fragment() {
                 // The accent goes on the WAVE, not the Slider's active track. seekBar.trackColorActive is
                 // transparent in XML so the wave is the only thing drawing the position line — but a
                 // runtime tint would override that XML and paint a straight line back under the wave.
-                seekWaveBar.setIndicatorColor(colors.accent)
+                // ⚠⚠ NEUTRAL BY DESIGN - DO NOT RE-TINT THIS FROM PlayerColors.accent.
+                // It will look plain next to the rest of the player and that is the trade, made knowingly.
+                //
+                // ⚠⚠ 1. THE COUPLING WAS STRUCTURAL, NOT A TUNING PROBLEM. The background here is
+                // a BLURRED VERSION OF THE SAME ARTWORK the accent is extracted from (bgImage via
+                // ImageUtils.loadBlurred; accent via Palette in PlayerColors.getColorsFrom). On a monochrome
+                // cover both land in the same region of colour space BY CONSTRUCTION, and no swatch choice
+                // escapes it - lightVibrant, darkVibrant and the muted fallbacks are all drawn from the same
+                // pixels. OBSERVED: a warm red cover (Ray Lamontagne, "Supernova") rendered the played wave
+                // as dark red on red - a smudge, not a progress indicator - while the theme-derived rail
+                // beside it stayed perfectly legible. The two halves of one control, opposite problems,
+                // same track.
+                //
+                // ⚠️ 2. THE PAUSED STATE IS THE ACCESSIBILITY BASELINE, NOT THE PLAYING ONE.
+                // updateWaveMotion sets waveAmplitude = 0 on pause, so the wave flattens to a plain 4dp
+                // line and loses the shape cue that helps it read at low contrast. Motion cannot be the
+                // sole means of making a control perceivable (WCAG 1.4.11, which also sets the 3:1 non-text
+                // contrast threshold). Judge any future tint against the PAUSED render.
+                //
+                // ⚠️ 3. FOUR SHIPPING PLAYERS BREAK THE COUPLING THE SAME WAY - Spotify, Apple
+                // Music, YouTube Music, Tidal: the background carries the artwork, the progress control is a
+                // fixed neutral. None of them tints the bar.
+                //
+                // ⚠️ 4. AND GLADIX ALREADY AGREED WITH THEM EVERYWHERE ELSE: the Android Auto and
+                // lock-screen renderings use a fixed-colour bar. The in-app player was the odd one out
+                // within its own app.
+                //
+                // ⚠⚠ WHY amoled_fg AND NOT ?attr/colorOnSurface, WHICH THE RAIL USED TO USE:
+                // colorOnSurface is WALLPAPER-DERIVED under DynamicColors on Android 12+, so it carries a
+                // tint unrelated to the artwork and DIFFERS PER DEVICE. amoled_fg is a pure neutral -
+                // @color/black in light, @color/white in night - and is already this player's foreground
+                // token (transport buttons, artist name, trackSubtitle, icon tints). ONE SOURCE FOR BOTH
+                // HALVES means they cannot drift apart on someone else's phone.
+                // Verified on device in LIGHT mode: the player renders light, the transport buttons are
+                // black, and they read clearly against the dimmed blurred cover - so the buttons were
+                // already the experiment for this colour in both themes.
+                //
+                // ⚠️ PARKED, NOT BUILT: an AMBIENT-GLOW alternative - a soft blurred
+                // artwork-tinted shadow BEHIND a neutral wave. It would keep artwork presence on the control
+                // without putting colour where contrast has to be. More work than this and unverified; it is
+                // the answer if the tinting is ever missed.
+                //
+                // ⚠️ SCOPE: THIS ROW ONLY. PlayerColors.accent is untouched and still tints the
+                // blurred background, the codec pill, the heart when checked, the playing indicator, the
+                // collapsed mini-player, MainActivity's system chrome and TV's root background.
+                val seekNeutral = ContextCompat.getColor(requireContext(), R.color.amoled_fg)
+                seekWaveBar.setIndicatorColor(seekNeutral)
                 // The heart is the one control here that shows a persistent CHOICE, so it gets the
                 // accent when checked and stays amoled_fg otherwise (see color/button_player_heart.xml
                 // for why accent's weak-palette fallback is acceptable on a glyph but not on a fill).
@@ -1211,7 +1258,9 @@ class PlayerFragment : Fragment() {
                 // as a container behind them rather than competing with them.
                 trackSubtitle.backgroundTintList = ColorStateList.valueOf(colors.background)
                 trackSubtitle.setTextColor(colors.onBackground)
-                seekBar.thumbTintList = ColorStateList.valueOf(colors.accent)
+                // The thumb MUST match the wave: it reads as the LEADING EDGE of the played portion, and
+                // a coloured thumb over a neutral track is not a pattern any shipping player uses.
+                seekBar.thumbTintList = ColorStateList.valueOf(seekNeutral)
                 playingIndicator.setIndicatorColor(colors.accent)
                 // bufferBar.setIndicatorColor is DELIBERATELY ABSENT — do not restore it without also
                 // changing the layout. bufferBar's indicator is transparent in XML because

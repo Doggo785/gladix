@@ -712,6 +712,18 @@ class DeezerApi(private val session: DeezerSession) {
      * there. If a second pipe consumer appears, factor a cached holder THEN. Mirrors `lyrics` below.
      */
     suspend fun smartTracklistTrackIds(id: String, first: Int = 100): List<String> {
+        // ⚠⚠ THIS IS A SECOND AUTH SURFACE, NOT THE GATEWAY'S. The pipe/GraphQL path does its
+        // own exchange - ARL + sid cookie POSTed to auth.deezer.com/login/arl, which returns a JWT used as
+        // `Authorization: Bearer` against pipe.deezer.com. callApi never touches that JWT; it sends the
+        // ARL/sid cookie straight to gw-light.php.
+        // ⚠️ SO ONE CAN REFUSE WHILE THE OTHER WORKS, AND THAT IS NOT A CONTRADICTION.
+        // Measured (Crashlytics, 2026-09-12): this handshake returned the body `"Invalid Arl provided"`
+        // while the gateway kept serving tracks, playlists and search on the same ARL, and the tiles
+        // worked again afterwards. Transient, on this surface only. DO NOT READ A PIPE AUTH FAILURE AS
+        // EVIDENCE THAT THE ARL IS BAD - check the gateway before concluding anything.
+        // ⚠️ AND THE HANDSHAKE IS DUPLICATED INLINE in this function and in lyrics, so both
+        // carry this exposure. If a third consumer appears, factor the exchange out THEN - see the caching
+        // note above - and this comment moves with it.
         val request = Request.Builder()
             .url("https://auth.deezer.com/login/arl?jo=p&rto=c&i=c")
             .post(RequestBody.EMPTY)
@@ -747,6 +759,9 @@ class DeezerApi(private val session: DeezerSession) {
     }
 
     suspend fun lyrics(id: String): JsonObject {
+        // ⚠️ SECOND AUTH SURFACE - the JWT exchange below is NOT the gateway's ARL/sid path, so
+        // this can fail while the rest of Deezer works. Full note at smartTracklistTrackIds, which repeats
+        // this same handshake inline; the observed failure there was transient and surface-specific.
         val request = Request.Builder()
             .url("https://auth.deezer.com/login/arl?jo=p&rto=c&i=c")
             .post(RequestBody.EMPTY)
@@ -787,12 +802,64 @@ class DeezerApi(private val session: DeezerSession) {
         // "Expected start of the object '{', but had 'EOF'". exhausted() is robust for chunked
         // responses where contentLength() is -1.
         if (source.exhausted()) throw IOException("Empty response body from Deezer (HTTP $code)")
+        // Same guard as decodeJson below, on the streaming path. Peek rather than read: peek() gives a
+        // read-ahead view that leaves `source` untouched for the real decode.
+        source.peek().let { peek ->
+            val buf = ByteArray(NON_OBJECT_PEEK_BYTES)
+            val n = peek.read(buf)
+            if (n > 0) requireJsonObject(String(buf, 0, n), "HTTP $code")
+        }
         json.decodeFromStream<JsonObject>(source.inputStream())
     }
 
     suspend fun decodeJson(raw: String): JsonObject = withContext(Dispatchers.IO) {
         if (raw.isBlank()) throw IOException("Empty response body from Deezer")
+        requireJsonObject(raw, null)
         json.decodeFromString<JsonObject>(raw)
+    }
+
+    private val NON_OBJECT_PEEK_BYTES = 200
+
+    // ⚠⚠ A REFUSAL MUST NOT SURFACE AS A SYNTAX ERROR - SAME HOUSE RULE AS callApi's
+    // GATEWAY-ERROR AND decodeJson's empty-body check, extended to the case that actually bit.
+    // MEASURED (Crashlytics, 2026-09-12, tapping a "Made for You" tile): auth.deezer.com/login/arl
+    // returned the body `"Invalid Arl provided"` and we reported
+    // `JsonDecodingException: Expected start of the object '{', but had '"' instead at path: $`.
+    // Deezer told us exactly what was wrong and the decoder threw that away.
+    // ⚠️ THE BODY IS VALID JSON - A STRING PRIMITIVE - WHICH IS WHY A "NOT JSON" SNIFF WOULD
+    // MISS IT. AddViewModel.getExtensionList guards `body.trimStart().startsWith("<")`, i.e. HTML ONLY; a
+    // bare quoted string starts with `"` and sails straight through that shape of check. Testing for the
+    // OBJECT we actually require, rather than for particular kinds of non-object, covers HTML, bare
+    // strings, arrays and plain text in one condition and cannot be out-guessed by a new body shape.
+    // ⚠️ IOException, MATCHING THE EMPTY-BODY PRECEDENT ABOVE, AND THAT IS A JUDGEMENT CALL
+    // WORTH KNOWING ABOUT: from inside a decoder we cannot tell an auth refusal from a WAF page or a
+    // truncated response, and the existing convention treats "the body is not what we asked for" as
+    // transport-shaped and retryable. The observed case supports that - the ARL was fine before and after,
+    // and the gateway kept working throughout. If a NON-transient refusal ever needs to surface as an auth
+    // error instead, the discriminator is the body text, which this message now preserves.
+    //
+    // ⚠⚠ AND THIS IS NOW THE THIRD MEMBER OF A FAMILY THAT ALREADY HAS A RECORDED
+    // CLASSIFICATION PROBLEM. NAMED TOGETHER HERE SO THE NEXT PERSON FINDS ALL THREE AT ONCE RATHER THAN
+    // DISCOVERING THIS ONE BY ACCIDENT:
+    //     1. "Empty response body from Deezer (HTTP N)"   decodeJsonStream, exhausted() guard
+    //     2. "API call failed with status ..."            callApi
+    //     3. "Deezer returned a non-object body: ..."     this
+    // THE RECORDED PROBLEM: all three are GENUINELY TRANSIENT, NONE CARRIES A JDK NETWORK TYPE, and
+    // IOException CANNOT BE EXCLUDED WHOLESALE by a classifier because it is the SUPERTYPE of
+    // InvalidResponseCodeException. So "treat IOException as transient" over-matches and "match on JDK
+    // network types" under-matches; the existing entry records this as having NO MITIGATION in the full
+    // version. A third throw does not make that worse - it was already unresolved - but a future
+    // classifier now has three strings to account for, not two.
+    // ⚠️ IF ONE IS EVER FIXED, FIX THEM AS A SET. They share a chokepoint, a shape and a
+    // failure mode; splitting them leaves the classifier half-right, which is how this got recorded as
+    // unmitigated in the first place.
+    private fun requireJsonObject(head: String, ctx: String?) {
+        val first = head.trimStart().firstOrNull() ?: return
+        if (first == '{') return
+        val where = ctx?.let { " ($it)" } ?: ""
+        throw IOException(
+            "Deezer returned a non-object body$where: ${head.trim().take(NON_OBJECT_PEEK_BYTES)}"
+        )
     }
 
     suspend fun encodeJson(raw: JsonObjectBuilder.() -> Unit = {}): String = withContext(Dispatchers.IO) {

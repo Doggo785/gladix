@@ -101,6 +101,20 @@ data class PlayerState(
     // ⚠️ THE EPOCH IS NULLABLE, AND null IS A REAL STATE - "THIS ARM COULD NOT CAPTURE A VALID
     // EPOCH", NOT "UNKNOWN". Read the note at each arming site before changing either. A nullable field
     // rather than a magic number precisely so nobody later reads a sentinel as a real epoch.
+    // ⚠⚠ CLOSED 2026-09-12 ON THE OUTCOME, NOT ON THE CONDITION - AND THE DIFFERENCE IS THE
+    // POINT. The fix shipped with a paired proof (`TRACKRADIO prepare pos=` / `READY pos=… restoreSeek=…`)
+    // whose stated condition was a capture showing the verdict. THAT CAPTURE NEVER HAPPENED. The drop line
+    // never fired; what settled it was the SYMPTOM GOING AWAY - cold start, tap a track from search, it
+    // starts at the beginning. The user closed it on that and judged that proving WHICH mechanism removed
+    // the symptom changes nothing they would do differently. A legitimate call, recorded as what it is.
+    // ⚠️ PER THE ABSENCE RULE, WHAT WOULD HAVE MADE IT FIRE, SO A LATER READER IS NOT LEFT
+    // READING SILENCE AS PROOF: a latch armed by a cold-start restore (applyRestoreIfCold, which requires
+    // data.pos > 0, i.e. the app was killed MID-TRACK), left unconsumed because the restored queue never
+    // reached STATE_READY (the user did not press play), and then consumed by a later user tap ON THE SAME
+    // TRACK. All three conditions at once. Not pursued - deliberately, not by oversight.
+    // SO THE MECHANISM BELOW IS STILL A HYPOTHESIS, WELL-SUPPORTED AND UNPROVEN. If the symptom ever
+    // returns, that is the first thing to re-instrument, and the probe already existed once - see git
+    // history rather than re-deriving it.
     data class RestoreSeek(val mediaId: String, val positionMs: Long, val epoch: Long?)
 
     var pendingRestoreSeek: RestoreSeek? = null

@@ -102,14 +102,27 @@ open class MainActivity : AppCompatActivity() {
         // finds nothing, and :1021 dereferences it. Note :1021 is NOT gated by windowFixedWidthMajor /
         // windowFixedHeightMajor — those only gate the a.hasValue() blocks from :1025 on — so no theme
         // attribute of ours is involved and none would prevent it. We set none of them anyway.
+        // ⚠⚠ AND THAT IS THE OBVIOUS FIRST MOVE, SO IT IS CALLED OUT RATHER THAN LEFT IMPLICIT:
+        // "applyFixedSizeWindow is in the stack, therefore something declared a fixed window size" is the
+        // natural reading of this trace and IT IS WRONG. The method runs on EVERY ensureSubDecor, for every
+        // theme, on every device; the hasValue() guards are BELOW the dereference, not around it. Checking
+        // whether we set windowFixedWidthMajor / WidthMinor / HeightMajor / HeightMinor leads nowhere -
+        // grep says we set none (2026-09-13), and setting or unsetting them would change nothing.
         //
         // WHY IT IS THE ROM: on a stock Window this null is UNREACHABLE. PhoneWindow.generateLayout
         // (android-34 sources, :2711-2714) does `if (contentParent == null) throw new RuntimeException(
         // "Window couldn't find content container view")`, installDecor (:2771) assigns mContentParent
         // from it, and Window.findViewById delegates to getDecorView(), which installs the decor. Stock
         // either has the content parent or throws a different, explicit exception — it never returns null.
-        // Foldables are exactly where OEMs replace or wrap Window for fold/unfold continuity and display
-        // switching, which is what this needs.
+        // ⚠️ [NARROWED 2026-09-13 - THIRD OCCURRENCE] This paragraph used to end "Foldables are
+        // exactly where OEMs replace or wrap Window for fold/unfold continuity and display switching, which
+        // is what this needs." THAT SCOPE IS TOO NARROW. The third report is HONOR FCP-AN10 (Android 16,
+        // build 1100, sideloaded), which is NOT A FOLDABLE - the first two were Magic V3, which is. So the
+        // fold/unfold rationale explains why a foldable OEM would touch Window, but it does not bound WHO
+        // is affected: the scope is HONOR'S Window IMPLEMENTATION GENERALLY, across their range, not their
+        // foldables specifically.
+        // The conclusion is unchanged and slightly strengthened - three crashes, one manufacturer, one
+        // signature is what a ROM-specific Window replacement looks like.
         //
         // ⚠️ WHY THE REPORT READS AS A NULL FIELD ACCESS RATHER THAN A NULL RECEIVER — this paragraph is
         // the one that saves the next person a retrace. R8 inlined ContentFrameLayout.setDecorPadding into
@@ -136,8 +149,12 @@ open class MainActivity : AppCompatActivity() {
         // cannot tell which.
         //
         // ESCALATION CONDITION: if this signature appears on a SECOND UNRELATED DEVICE FAMILY, the
-        // stock-unreachability read above is wrong somewhere and that is the thread to pull. Until then it
-        // is one ROM, one user.
+        // stock-unreachability read above is wrong somewhere and that is the thread to pull.
+        // ⚠️ STILL NOT TRIGGERED AT THREE REPORTS (2026-09-13), AND THAT IS DELIBERATE RATHER
+        // THAN AN OVERSIGHT: Magic V3 x2 and FCP-AN10 are all HONOR. SAME MANUFACTURER IS NOT A SECOND
+        // UNRELATED DEVICE FAMILY - it is the same ROM lineage, so more of them is confirmation of the
+        // existing diagnosis rather than evidence against it. The condition is about a DIFFERENT OEM.
+        // Muted rather than fixed; there is still no injection point.
         setContentView(binding.root)
 
         enableEdgeToEdge(
