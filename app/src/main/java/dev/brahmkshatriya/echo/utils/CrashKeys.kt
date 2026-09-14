@@ -284,12 +284,41 @@ object CrashKeys {
      *   "downloaded" the APK/zip transferred and passed the length check.
      *   "ready"      the file is a plain APK, or was successfully unwrapped from nightly's artifact zip,
      *                and is being handed to the installer.
+     * ⚠⚠ [2026-09-14] "ready" ON A REPORT THAT EXISTS AT ALL MEANS THE SELF-INSTALL FAILED.
+     * A SUCCESSFUL self-update kills this process (the package manager tears us down to replace us),
+     * so a live process filing a report while carrying stage=ready has necessarily gotten a FAILURE
+     * back from the installer. Use it to tell the APP path from the EXTENSION path, which the stack
+     * alone cannot do - InstallationUtils.installApp serves both, and ExtensionsViewModel.update
+     * takes the app branch and the extension branch as an if/else, never both in one pass.
+     * First used this way on a build 1100 report (resultCode=1, status=-22); the comment at
+     * installApp that claimed the app path could never reach its throw was falsified by it.
      * "downloaded" as the last value means the step between download and installer failed — which for
      * builds 1072-1078 was the unzip branch running on a plain release APK (fixed 2026-09-05). Without
      * this key that failure was only distinguishable by hunting for a companion non-fatal.
      */
     fun onAppUpdateStage(stage: String) {
         set("app_update_stage", stage)
+    }
+
+    /**
+     * The PREVIOUS session's update, observed on the launch after it. `<from>-><to>`, plus whether the
+     * replace was ours and whether it went backwards.
+     *
+     * ⚠⚠ THIS KEY CANNOT BE THE INSTRUMENT, ONLY THE CORROBORATION - A CUSTOM KEY RIDES ON A
+     * REPORT. If the self-updater works and the session is clean there IS no report, so a key alone
+     * would measure update success only in sessions that ALSO failed at something else - the same
+     * blind spot this was built to close, one level up. The instrument is the user-visible line in
+     * Settings (SettingsBottomSheet's version view), which needs no report to be seen.
+     * ⚠️ A Firebase ANALYTICS event was considered and rejected 2026-09-14: firebase-analytics
+     * is on the classpath (libs.bundles.firebase) but NOTHING in the tree calls it, so this would be
+     * the project's first custom event - a product decision, not a bug fix. recordException was also
+     * rejected: reporting a SUCCESS through the error channel reads as noise later.
+     * Written by AppUpdater.recordSelfUpdateOnLaunch, which owns the correctness argument.
+     */
+    fun onAppUpdateCompleted(from: Long, to: Long, ours: Boolean, downgrade: Boolean) {
+        set("app_update_completed", "$from->$to")
+        set("app_update_completed_ours", ours)
+        if (downgrade) set("app_update_completed_downgrade", true)
     }
 
     /**

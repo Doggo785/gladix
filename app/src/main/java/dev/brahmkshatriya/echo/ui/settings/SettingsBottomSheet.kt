@@ -35,6 +35,7 @@ import dev.brahmkshatriya.echo.ui.extensions.login.LoginUserListViewModel
 import dev.brahmkshatriya.echo.ui.extensions.manage.ManageExtensionsFragment
 import dev.brahmkshatriya.echo.ui.main.HeaderAdapter.Companion.loadBigIcon
 import dev.brahmkshatriya.echo.ui.main.HeaderAdapter.Companion.setLoopedLongClick
+import dev.brahmkshatriya.echo.utils.AppUpdater
 import dev.brahmkshatriya.echo.utils.ContextUtils.appVersion
 import dev.brahmkshatriya.echo.utils.ContextUtils.copyToClipboard
 import dev.brahmkshatriya.echo.utils.ContextUtils.getArch
@@ -151,10 +152,23 @@ class SettingsBottomSheet : BottomSheetDialogFragment(R.layout.dialog_settings) 
 
         binding.version.run {
             val version = appVersion()
-            text = version
+            // ⚠⚠ THIS LINE IS THE INSTRUMENT, NOT DECORATION. Every field report about the
+            // self-updater is a FAILURE, structurally: a successful self-install kills the process
+            // before it can report anything, so the Crashlytics key written alongside this
+            // (app_update_completed) only ever arrives if the NEXT session happens to crash too.
+            // This view needs no report and no crash - it is here when someone goes looking, which is
+            // when they want it. Written by AppUpdater.recordSelfUpdateOnLaunch one launch after the
+            // replace; absent until the first one happens.
+            // ⚠️ A first-launch SNACKBAR was rejected for this: it competes with everything else
+            // at startup and is missed exactly when it matters. The layout allows it - this TextView is
+            // maxLines=3, wrap_content (dialog_settings.xml) - so a second line fits without clipping.
+            val updated = context.getSettings()
+                .getString(AppUpdater.KEY_LAST_UPDATE_SUMMARY, null)
+            text = if (updated != null) "$version\n$updated" else version
             setOnClickListener {
                 val info = buildString {
                     appendLine("Gladix Version: $version")
+                    if (updated != null) appendLine("Last update: $updated")
                     appendLine("Device: $BRAND $DEVICE")
                     appendLine("Architecture: ${getArch()}")
                     appendLine("OS Version: $CODENAME $RELEASE ($SDK_INT)")

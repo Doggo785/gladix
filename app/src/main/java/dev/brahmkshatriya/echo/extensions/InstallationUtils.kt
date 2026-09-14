@@ -26,6 +26,21 @@ import kotlin.coroutines.resume
 
 object InstallationUtils {
 
+    // Legacy install result codes, carried in EXTRA_INSTALL_RESULT on the deprecated
+    // ACTION_VIEW / ACTION_INSTALL_PACKAGE path that installApp uses.
+    // ⚠⚠ THESE ARE DECLARED HERE BECAUSE THEY CANNOT BE REFERENCED. They exist on
+    // android.content.pm.PackageManager but are @hide, so they are ABSENT FROM THE PUBLIC
+    // android.jar - confirmed 2026-09-14 by `javap -constants` on
+    // platforms/android-37.0/android.jar, which exports only INSTALL_REASON_* and
+    // INSTALL_SCENARIO_*. Values verified against AOSP
+    // frameworks/base/core/java/android/content/pm/PackageManager.java. Restating them is safe
+    // precisely because they are a frozen compatibility contract: the numbers are what old
+    // installers return and cannot be renumbered.
+    private const val INSTALL_FAILED_INSUFFICIENT_STORAGE = -4
+    private const val INSTALL_FAILED_UPDATE_INCOMPATIBLE = -7
+    private const val INSTALL_FAILED_VERIFICATION_FAILURE = -22
+    private const val INSTALL_FAILED_VERSION_DOWNGRADE = -25
+
     suspend fun installApp(activity: FragmentActivity, file: File) {
         val contentUri = FileProvider.getUriForFile(
             activity, "${activity.packageName}.provider", file
@@ -46,6 +61,17 @@ object InstallationUtils {
         // what is actually installed instead of branching on a value we know we cannot trust.
         // (On an app SELF-update we never reach this line at all — installing over ourselves kills
         // the process — so everything below is effectively the extension path.)
+        // ⚠⚠ [CORRECTED 2026-09-14] THAT PARENTHESIS IS FALSE, AND EVERYTHING BELOW IS REACHED
+        // BY THE APP PATH TOO. The process is killed only when the replace SUCCEEDS. A FAILED
+        // self-update kills nothing: the installer returns a result and execution continues straight
+        // to the throw. Kept rather than deleted because the reasoning is right for the success case
+        // and will be re-derived by whoever reads only that half.
+        // FIELD EVIDENCE, build 1100, Xiaomi 24069PC21G / Android 16:
+        //     Install failed - you may need to uninstall the existing version first
+        //     (resultCode=1, status=-22)   with app_update_stage=ready, app_update_gate_passed=true
+        // ⚠️ AND THAT COMBINATION IS A TRIAGE SIGNAL IN ITS OWN RIGHT: a process still alive to
+        // file a report while carrying app_update_stage=ready HAS ALREADY FAILED ITS SELF-INSTALL,
+        // precisely because a successful one would have killed it. See CrashKeys.onAppUpdateStage.
         val apk = activity.packageManager.getPackageArchiveInfo(file.path, 0)
         val pkg = apk?.packageName
         val installed = pkg?.let {
@@ -68,12 +94,72 @@ object InstallationUtils {
         // common signature-mismatch case but wrong for every other one, and wrong for the app. Key
         // it on the CONDITION rather than on the caller: the hint only applies when a copy is
         // already installed and did not advance, which is caller-agnostic and needs no flag.
+        // ⚠⚠ [SUPERSEDED 2026-09-14 - `installed != null` WAS TOO COARSE AND IS NO LONGER THE
+        // KEY.] It picked the signature-mismatch hint for every failure with a copy installed, and
+        // MOST OF THEM ARE NOT ONE. `status` was already in hand one line up and distinguishes them.
+        // WHAT FORCED THIS, build 1100 on a Xiaomi 24069PC21G / Android 16:
+        //     Install failed - you may need to uninstall the existing version first
+        //     (resultCode=1, status=-22)
+        // status=-22 IS NOT A SIGNATURE MISMATCH. It is INSTALL_FAILED_VERIFICATION_FAILURE; the
+        // signature case is -7. Two separate rounds of triage read -22 as -7 before the constant was
+        // checked, so it is written out here: VERIFY THE NUMBER, DO NOT RECALL IT.
+        // ⚠️ AND THE WRONG ADVICE WAS THE EXPENSIVE KIND. The report carried
+        // app_update_stage=ready, i.e. an APP SELF-UPDATE (see the corrected note above and
+        // CrashKeys.onAppUpdateStage) - so "uninstall the existing version first" was telling a user
+        // to DESTROY THEIR OWN APP DATA to work around a Play-Protect-style block that uninstalling
+        // would not have lifted. It reaches the screen, not just Crashlytics: ExtensionsViewModel's
+        // `awaitInstallation(appApk).getOrThrow()` sits in a runCatching whose getOrElse emits to
+        // app.throwFlow, i.e. a snackbar.
+        // ⚠️ NONE OF THIS WAS A REGRESSION ON THE EXTRA_RETURN_RESULT FIX - THAT FIX HELD. The
+        // version-code comparison above ran and correctly declined to return early (installed 1100
+        // was NOT >= the downloaded build), so the failure was REAL and only its EXPLANATION was
+        // wrong. Behaviour was never the defect here; do not go looking for one.
+        //
+        // ⚠️ `isSelf` IS DERIVED, NOT PASSED, AND THAT IS DELIBERATE - it keeps the
+        // caller-agnostic principle above rather than breaking it. installApp has ONE call site
+        // (ExtensionsViewModel's installFileFlow collector) serving BOTH the app self-updater and
+        // ImportType.App extensions, and the File it receives carries no hint of which. Comparing the
+        // archive's own packageName to ours answers it from the artifact itself, so no flag can be
+        // forgotten at a future second call site. It needs no null check: `installed != null` already
+        // implies `apk != null`, because installed is derived from apk.packageName.
+        // ⚠️ THE APP/EXTENSION SPLIT MATTERS ONLY ON THE -7 BRANCH, and it matters a lot there:
+        // "uninstall it first" is a shrug for an extension and DATA LOSS for the app. Say the cost.
+        // ⚠️ THE -22 TEXT NAMES TWO PLACES TO LOOK AND COMMITS TO NEITHER. The result code says
+        // a verifier refused; it does NOT say WHICH, and on an OEM build there may be two (Play
+        // Protect plus the vendor's own installer scan). Guessing one would send half the users who
+        // hit this to a setting that is not the one blocking them, so the message says both and says
+        // that it does not know. Do not "tighten" it to a single culprit without evidence that the
+        // code can distinguish them - it cannot.
+        // The codes go LAST in every branch so that snackbar truncation eats the diagnostics rather
+        // than the advice; the full text is always reachable through the snackbar's View action.
+        val codes = "(resultCode=${result.resultCode}" +
+            (status?.let { ", status=$it" } ?: "") + ")"
+        val isSelf = apk?.packageName == activity.packageName
         throw Exception(
-            if (installed != null)
-                "Install failed — you may need to uninstall the existing version first " +
-                    "(resultCode=${result.resultCode}" + (status?.let { ", status=$it" } ?: "") + ")"
-            else "Install failed (resultCode=${result.resultCode}" +
-                (status?.let { ", status=$it" } ?: "") + ")"
+            when {
+                status == INSTALL_FAILED_UPDATE_INCOMPATIBLE && isSelf ->
+                    "Update failed — this build is signed with a different key than the " +
+                        "installed app. Installing it means uninstalling first, which erases " +
+                        "the app's data. $codes"
+
+                status == INSTALL_FAILED_UPDATE_INCOMPATIBLE ->
+                    "Install failed — signed with a different key than the installed " +
+                        "version. Uninstall the existing extension first, then install again. $codes"
+
+                status == INSTALL_FAILED_VERIFICATION_FAILURE ->
+                    "Install blocked by a security check — usually Play Protect " +
+                        "(Play Store → profile → Play Protect), though some devices add " +
+                        "their own app scan in Settings. $codes"
+
+                status == INSTALL_FAILED_VERSION_DOWNGRADE ->
+                    "Install failed — the build offered is older than the one already " +
+                        "installed. $codes"
+
+                status == INSTALL_FAILED_INSUFFICIENT_STORAGE ->
+                    "Install failed — not enough free storage on the device. $codes"
+
+                else -> "Install failed $codes"
+            }
         )
     }
 

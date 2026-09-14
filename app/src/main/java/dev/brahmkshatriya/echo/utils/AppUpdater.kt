@@ -19,7 +19,10 @@
 package dev.brahmkshatriya.echo.utils
 
 import android.content.Context
+import android.content.SharedPreferences
 import android.os.Build
+import androidx.core.content.edit
+import androidx.core.content.pm.PackageInfoCompat
 import dev.brahmkshatriya.echo.BuildConfig
 import dev.brahmkshatriya.echo.R
 import dev.brahmkshatriya.echo.common.helpers.ContinuationCallback.Companion.await
@@ -40,6 +43,95 @@ import java.io.IOException
 import java.util.zip.ZipFile
 
 object AppUpdater {
+
+    // ⚠⚠ SELF-UPDATE EVIDENCE. THE ONLY PART OF THE UPDATE PATH WITH NO EVIDENCE AT ALL WAS
+    // THE PART THAT WORKS. Every field report about the self-updater is a FAILURE, and that is
+    // structural rather than bad luck: a SUCCESSFUL self-install kills this process to replace the
+    // package, so the success can never report itself. The same fact is why the comment at
+    // InstallationUtils.installApp claiming the app path could not reach its throw was wrong (only a
+    // SUCCEEDING replace kills us; a failing one returns a result) - see the correction there.
+    // The evidence exists one launch later, and that is what this reads.
+    private const val KEY_LAST_RUN_VERSION = "last_run_version_code"
+    private const val KEY_LAST_RUN_UPDATE_TIME = "last_run_update_time"
+    private const val KEY_PENDING_SELF_UPDATE = "pending_self_update_version"
+    const val KEY_LAST_UPDATE_SUMMARY = "last_update_summary"
+
+    /**
+     * Called once per process from MainApplication.initAfterUnlock. Compares the versionCode we last
+     * ran against the running one and, if we were replaced, records it.
+     *
+     * ⚠⚠ THE THREE-TERM `replaced` GATE IS NOT BELT-AND-BRACES, IT IS THE WHOLE CORRECTNESS
+     * ARGUMENT - BECAUSE THE STORED VALUE IS RESTORABLE ONTO A DIFFERENT DEVICE. AndroidManifest.xml
+     * declares no `allowBackup`, no `dataExtractionRules` and no `fullBackupContent`, and res/xml holds
+     * no rules file, so allowBackup defaults to TRUE and every SharedPreferences file - this one
+     * included - is eligible for cloud backup and device-to-device transfer. A restore onto a FRESH
+     * install brings back the old device's last_run_version_code, and a stored value lower than the
+     * running one reads EXACTLY like "we self-updated". The gate rejects it:
+     *   lastUpdateTime > firstInstallTime   a fresh install has them EQUAL - no in-place replace has
+     *                                       ever happened - so a restored value cannot pass
+     *   lastUpdateTime != storedUpdateTime  the replace happened SINCE OUR LAST RUN, not at some point
+     *   storedUpdateTime >= firstInstallTime  the stored timestamp belongs to THIS install; one
+     *                                       restored from another device predates it
+     * ⚠️ RESIDUAL, STATED SO NOBODY READS THE GATE AS AIRTIGHT: a restore followed later by a
+     * genuine update on the new device passes all three and reports a from-version that was never run
+     * HERE. The third term makes that require the old device's last update to postdate this install,
+     * which a restore-at-setup cannot do; a late D2D transfer could. Accepted - it mislabels a
+     * from-version, it does not invent an update.
+     * ⚠️ THE BACKUP BEHAVIOUR ITSELF IS ACCEPTED, NOT AN OPEN DEFECT - it is inherited from
+     * upstream Echo, it is opt-out platform default, and the restore it enables is what users expect.
+     * The full decision, what is eligible, and the conditions for reopening it are recorded at
+     * MainApplication.initAfterUnlock's call to this. THIS GATE IS NOT A MITIGATION OF THAT: it
+     * exists because a RESTORED VERSION-CODE WOULD BE FACTUALLY WRONG here - it would report an
+     * update that never happened on this device - which is a correctness problem in this function,
+     * not a security one in the backup.
+     *
+     * ⚠️ SharedPreferences RATHER THAN saveToCache, DELIBERATELY. saveToCache picks its folder
+     * from `T::class.java.simpleName`, so a Long and an Int of the same name land in DIFFERENT folders
+     * and read back as absent - which silently broke `last_update_check` for months. These values are
+     * versionCodes and timestamps, i.e. exactly the Int/Long confusion that trap is made of. The
+     * injected SharedPreferences is also ALREADY LOADED on this path (applyLocale(settings) reads it
+     * on the next line), so the read is an in-memory map lookup and costs no disk I/O.
+     * Cost beyond that: ONE getPackageInfo binder call, the same class as the one
+     * CrashKeys.recordInstallSource already makes on the main thread at onCreate.
+     */
+    fun recordSelfUpdateOnLaunch(context: Context, settings: SharedPreferences) {
+        runCatching {
+            val info = context.packageManager.getPackageInfo(context.packageName, 0)
+            val running = PackageInfoCompat.getLongVersionCode(info)
+            val stored = settings.getLong(KEY_LAST_RUN_VERSION, -1L)
+            val storedUpdateTime = settings.getLong(KEY_LAST_RUN_UPDATE_TIME, -1L)
+            val pending = settings.getLong(KEY_PENDING_SELF_UPDATE, -1L)
+            val replaced = info.lastUpdateTime > info.firstInstallTime &&
+                info.lastUpdateTime != storedUpdateTime &&
+                storedUpdateTime >= info.firstInstallTime
+            if (stored > 0L && stored != running && replaced) {
+                // `pending` is written at the "ready" stage below, naming the versionCode we handed to
+                // the installer. If we are now RUNNING that version, the replace was OURS - which is
+                // the one thing install_source cannot tell us: our ACTION_VIEW install and a user
+                // tapping an APK in a file manager are BOTH performed by the system package
+                // installer and report the same installer package. install_source still separates
+                // Play (com.android.vending) from either.
+                val ours = pending == running
+                val downgrade = running < stored
+                CrashKeys.onAppUpdateCompleted(stored, running, ours, downgrade)
+                settings.edit {
+                    putString(
+                        KEY_LAST_UPDATE_SUMMARY,
+                        "$stored → $running · " +
+                            (if (ours) "self-update" else "external") +
+                            (if (downgrade) " · downgrade" else "")
+                    )
+                }
+            }
+            // Unconditional, and the remove is part of it: a marker left by an install the user
+            // DECLINED (or that failed) must not survive to label an unrelated later replace as ours.
+            settings.edit {
+                putLong(KEY_LAST_RUN_VERSION, running)
+                putLong(KEY_LAST_RUN_UPDATE_TIME, info.lastUpdateTime)
+                remove(KEY_PENDING_SELF_UPDATE)
+            }
+        }
+    }
 
     private val client = OkHttpClient()
 
@@ -363,6 +455,18 @@ object AppUpdater {
             // arm change was worth its risk should weigh it against a confirmed failure, not a predicted
             // one.
             val apk = if (appType == "nightly") unzipApk(download) else download
+            // ⚠️ THE ONE putInt THAT MAKES A LATER SUCCESS ATTRIBUTABLE. Nothing the platform
+            // exposes separates "our updater launched the install" from "the user tapped an APK in a
+            // file manager" - both are performed by the system package installer. But WE know, here,
+            // that we are about to hand this exact versionCode over; recordSelfUpdateOnLaunch reads it
+            // back on the next launch. Written BEFORE installApp because a SUCCESSFUL install kills
+            // this process and no line after it would run.
+            runCatching {
+                val archive = app.context.packageManager.getPackageArchiveInfo(apk.path, 0)
+                if (archive != null) app.settings.edit {
+                    putLong(KEY_PENDING_SELF_UPDATE, PackageInfoCompat.getLongVersionCode(archive))
+                }
+            }
             CrashKeys.onAppUpdateStage("ready")
             apk
         }.getOrElse {
