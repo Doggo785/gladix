@@ -99,6 +99,19 @@ object ExtensionUtils {
 
     suspend inline fun <reified T> Extension<*>.isClient() = instance.value().getOrNull() is T
 
+    // ⚠⚠ [2026-09-13] THIS FUNCTION IS NOT THE BUG, AND A BOUNDED WAIT WAS PROPOSED ACROSS ALL
+    // ~31 OF ITS CALL SITES ON A DIAGNOSIS THAT NEVER CHECKED WHAT FEEDS IT. The claim was that
+    // `first { it.isNotEmpty() }` latches onto a built-ins-only list and `find` then misses the real
+    // extension. IT CANNOT: `CombinedRepository`'s flow is seeded `null` as an explicit sentinel (see
+    // the comment at that `stateIn`) and `ExtensionLoader.injected` maps null -> `.orEmpty()`, so the
+    // FIRST non-empty emission is already the loaded set. That sentinel fix was intact the whole time.
+    // ⚠️ THE REAL FAULT WAS A CALLER PASSING `""` - see `SearchViewModel.resolve`. An id that
+    // matches nothing returns null here with no error, which is correct for this function and a silent
+    // dead end for whoever passed it. SO IF A CALLER'S "EXTENSION NOT FOUND" LOOKS LIKE TIMING, CHECK
+    // THE ID IT PASSED BEFORE CHANGING ANYTHING HERE.
+    // ⚠️ The inference went from THE EXPRESSION'S SHAPE to a conclusion about ITS TRAFFIC without
+    // reading the producer - the sibling of "a symbol existing is not the same as it being reachable",
+    // one level up. One grep at the producer closed it.
     suspend fun <T : Extension<*>> Flow<List<T>>.getExtension(id: String?): T? {
         val list = first { it.isNotEmpty() }
         return list.find { it.id == id }

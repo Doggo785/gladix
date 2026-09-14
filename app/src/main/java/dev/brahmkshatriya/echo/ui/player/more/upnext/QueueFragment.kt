@@ -41,6 +41,21 @@ class QueueFragment : Fragment() {
     // position. REMOVE WITH THE QUEUEDRAG SET.
     private var dragStartTop: Int? = null
 
+    // ⚠⚠ TEMPORARY (2026-09-13) - REMOVE WITH THE QUEUEDRAG SET. THE FINGER, WHICH THE FIRST
+    // THREE CAPTURES NEVER RECORDED. The probe logged the TILE (nowTop) while ItemTouchHelper's auto-scroll
+    // trigger is computed from the FINGER: curY = mSelectedStartY + mDy, and mDy = e.y - e.y-at-DOWN
+    // (ItemTouchHelper.updateDxDy :1185, raw viewport coordinates, nothing in the
+    // onMove/onMoved/prepareForDrop chain offsets it). Those two bodies differ by `drift`, so three
+    // captures measured a quantity the trigger does not use.
+    // ⚠️ WHY NOT AN OnItemTouchListener, WHICH IS THE OBVIOUS HOOK: RecyclerView:3661 - once a
+    // listener LATCHES (mInterceptingOnItemTouchListener), ONLY that one receives subsequent events. During
+    // a drag ItemTouchHelper is latched, so an observer listener would log the DOWN and then go silent for
+    // the whole gesture - the ambiguous-silence trap again. A View.OnTouchListener runs inside
+    // View.dispatchTouchEvent BEFORE onTouchEvent, i.e. upstream of the item-touch dispatch entirely, so it
+    // sees every event regardless of who latched. Returning false keeps it behaviour-neutral.
+    private var fingerDownY = Float.NaN
+    private var fingerY = Float.NaN
+
     // ⚠⚠ A BOOLEAN, NOT PlaylistTrackAdapter'S pendingList, AND THE DIFFERENCE IS NOT STYLE.
     // There the observer CARRIES the value (`observe(vm.currentTracks) { ... pendingList = it }`), so the
     // deferred list has to be stored or it is lost - pendingList is NECESSARY there.
@@ -162,10 +177,19 @@ class QueueFragment : Fragment() {
                     val v = viewHolder.itemView
                     val start = dragStartTop
                     val nowTop = v.top
+                    // mDy and the two lib* values are the library's OWN expressions, evaluated on our
+                    // side: curY = startTop + mDy, then topDiff / bottomDiff exactly as
+                    // ItemTouchHelper.scrollIfNecessary :775-785 computes them. mTmpRect is 0 here (no
+                    // ItemDecoration on this list), so it drops out honestly.
+                    val dy = if (fingerDownY.isNaN()) Float.NaN else fingerY - fingerDownY
+                    val curY = (start ?: 0) + dy
                     android.util.Log.d(
                         "GladixQueue",
                         "QUEUEDRAG geom dir=${if (toPos < fromPos) "up" else "down"} " +
                             "startTop=$start nowTop=$nowTop drift=${start?.let { nowTop - it }} " +
+                            "mDy=${dy.toInt()} " +
+                            "libTopDiff=${(curY - recyclerView.paddingTop).toInt()} " +
+                            "libBottomDiff=${(curY + v.height - (recyclerView.height - recyclerView.paddingBottom)).toInt()} " +
                             "topFresh=${nowTop - recyclerView.paddingTop} " +
                             "bottomFresh=${nowTop + v.height - (recyclerView.height - recyclerView.paddingBottom)} " +
                             "tileH=${v.height} rvH=${recyclerView.height}"
@@ -293,6 +317,19 @@ class QueueFragment : Fragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         setupTransition(view, false, axis = MaterialSharedAxis.Y)
         val recyclerView = binding!!.root
+        @Suppress("ClickableViewAccessibility")
+        // TEMPORARY - REMOVE WITH THE QUEUEDRAG SET. Pure observer: always returns false, so the touch
+        // continues to the item-touch dispatch untouched. Records on EVERY down and move.
+        recyclerView.setOnTouchListener { _, e ->
+            when (e.actionMasked) {
+                android.view.MotionEvent.ACTION_DOWN -> { fingerDownY = e.y; fingerY = e.y }
+                android.view.MotionEvent.ACTION_MOVE -> fingerY = e.y
+                android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> {
+                    fingerDownY = Float.NaN; fingerY = Float.NaN
+                }
+            }
+            false
+        }
         recyclerView.adapter = queueAdapter
         // ⚠️ NO FAST SCROLLER HERE, AND THAT IS THE WHOLE STORY - NOT A BROKEN ONE, A
         // NEVER-WIRED ONE. Closing a parked "QueueFragment fast scroller" item 2026-09-12: this screen has

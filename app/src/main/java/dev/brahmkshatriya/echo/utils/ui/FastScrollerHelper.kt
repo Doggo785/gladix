@@ -144,6 +144,18 @@ object FastScrollerHelper {
      */
     private fun FastScrollerBuilder.applyEchoStyle(context: Context) {
         setTrackDrawable(AppCompatResources.getDrawable(context, R.drawable.fast_scroll_track)!!)
+        // ⚠⚠ THE GRAB REGION IS A NARROW RIGHT-EDGE STRIP, AND ITS NUMBERS ARE DERIVABLE BUT
+        // WERE NEVER WRITTEN DOWN. Salvaged 2026-09-13 from a deleted touch probe, because a capture
+        // full of x-coordinates is unreadable without it.
+        // FastScroller lays the thumb out at `viewWidth - padding.right - mThumbWidth` (see the RTL note
+        // above), the drawable declares android:width="40dp", and applyTo sets 8dp padding on all four
+        // sides. So on a 1080px-wide screen at density 3.0 the thumb occupies roughly x 936..1056, and a
+        // press at x=1077 is OUTSIDE IT - in the 8dp end padding, not on the thumb.
+        // ⚠️ SO AN x-SPREAD IN A TOUCH CAPTURE HAS TWO CAUSES, AND THEY LOOK ALIKE: presses
+        // outside ~936..1056 miss the thumb GEOMETRICALLY, while presses inside it can still miss
+        // because the thumb IS NOT RENDERED at that scroll position (see PixelFastScrollViewHelper's
+        // extrapolation note - mScrollbarEnabled rides the same estimate). Same failed grab, two
+        // mechanisms; separate them by x before reading anything else into a capture.
         setThumbDrawable(AppCompatResources.getDrawable(context, R.drawable.fast_scroll_thumb)!!)
     }
 

@@ -802,6 +802,14 @@ abstract class AndroidAutoCallback(
     //
     // Neither state crashes: the search runs and returns real results, just from the wrong extension. See
     // the frequency-drop trap recorded at onGetChildren's per-node dispatch — there is nothing to count.
+    // ⚠⚠ `aaEligible` IS AA-SPECIFIC AND MUST NOT BE FACTORED OUT AS A SHARED "which extension"
+    // PREDICATE. It vets lastBrowsedExtId, an untrusted id; a caller that reads `extensions.current`
+    // DIRECTLY has a different question and can get a WRONG answer from this one. Worked example,
+    // 2026-09-13: applying it in `SearchViewModel.resolve` was proposed and REJECTED, because search
+    // history is written per-extension by SearchFragment.feedData's UNGATED
+    // `music.getExtension(argId) ?: current.value!!` -> `saveInHistory`, so gating only the read would
+    // aim the read and the write at different SharedPreferences files. Unified is a LEGITIMATE answer
+    // there and an ineligible one here. Full reasoning at that symbol.
     protected open fun getCurrentExtension(): MusicExtension? {
         val aaEligible = { ext: MusicExtension ->
             ext.isEnabled && ext.id != UnifiedExtension.UNIFIED_ID

@@ -28,7 +28,6 @@ import dev.brahmkshatriya.echo.databinding.FragmentSearchBinding
 import dev.brahmkshatriya.echo.extensions.ExtensionUtils.getAs
 import dev.brahmkshatriya.echo.extensions.ExtensionUtils.getExtension
 import dev.brahmkshatriya.echo.extensions.cache.Cached
-import android.view.MotionEvent
 import androidx.recyclerview.widget.RecyclerView
 import dev.brahmkshatriya.echo.ui.common.GridAdapter.Companion.configureGridLayout
 import dev.brahmkshatriya.echo.ui.common.TvAwareRecyclerView
@@ -74,8 +73,12 @@ class SearchFragment : Fragment(R.layout.fragment_search) {
         runCatching { speechLauncher.launch(intent) }
     }
 
-    private var extensionId = ""
-
+    // ⚠⚠ `private var extensionId = ""` WAS HERE AND IS GONE - DO NOT BRING IT BACK. It was
+    // assigned in ONE place, `feedData`'s loaded lambda below, i.e. only after a network search feed
+    // returned, so every quick search before that ran with `""` and silently found no extension. Quick
+    // search now passes `argId` and lets `SearchViewModel.resolve` do what these feed lambdas already
+    // do; the full mechanism is recorded there. Anything on this screen needing the extension should
+    // ASK FOR IT, not read a field somebody else was supposed to have filled in.
     private val feedData by lazy {
         val vm by viewModel<FeedViewModel>()
         val id = "search"
@@ -98,7 +101,6 @@ class SearchFragment : Fragment(R.layout.fragment_search) {
                 app, curr, "$id-$query",
                 curr.getAs<SearchFeedClient, Feed<Shelf>> { loadSearchFeed(query) }.getOrThrow()
             )
-            extensionId = curr.id
             FeedData.State(curr.id, null, feed)
         }
     }
@@ -130,30 +132,6 @@ class SearchFragment : Fragment(R.layout.fragment_search) {
         val binding = FragmentSearchBinding.bind(view)
         val recyclerView = binding.recyclerView as RecyclerView
         setupTransition(view, false, MaterialSharedAxis.Y)
-        // ⚠⚠ TEMPORARY (2026-09-13) - REMOVE WITH trackGesture's `SCROLLTOUCH scroller` LINE.
-        // REGISTERED BEFORE applyInsets ON PURPOSE: RecyclerView.dispatchOnItemTouchIntercept walks
-        // listeners in REGISTRATION ORDER, so registering first means this sees every DOWN that reaches the
-        // RecyclerView's item-touch dispatch at all - including ones a later listener latches.
-        // BEHAVIOUR-NEUTRAL: it returns false always, and a listener that never returns true never latches
-        // the gesture, so nothing downstream changes.
-        // IT PRINTS ON EVERY DOWN, not only the failing ones - the whole point is that silence must be
-        // unambiguous. `child` names what is under the finger, which is how the POSITIONAL half is read:
-        // a nested RecyclerView there means the press was over a card row.
-        // REMOVAL CONDITION: delete once one capture separates the three outcomes below.
-        recyclerView.addOnItemTouchListener(object : RecyclerView.SimpleOnItemTouchListener() {
-            override fun onInterceptTouchEvent(rv: RecyclerView, e: MotionEvent): Boolean {
-                if (e.actionMasked == MotionEvent.ACTION_DOWN) {
-                    val child = rv.findChildViewUnder(e.x, e.y)
-                    android.util.Log.d(
-                        "GladixScroll",
-                        "SCROLLTOUCH observer x=${e.x.toInt()} y=${e.y.toInt()} " +
-                            "child=${child?.javaClass?.simpleName} " +
-                            "nested=${child is RecyclerView} w=${rv.width}"
-                    )
-                }
-                return false
-            }
-        })
         applyInsets(recyclerView, binding.appBarOutline) {
             binding.swipeRefresh.configure(it)
         }
@@ -205,7 +183,7 @@ class SearchFragment : Fragment(R.layout.fragment_search) {
                         .setNegativeButton(R.string.cancel, null)
                         .setPositiveButton(R.string.clear) { _, _ ->
                             searchViewModel.clearSearchHistory(
-                                extensionId, binding.quickSearchView.editText.text.toString()
+                                argId, binding.quickSearchView.editText.text.toString()
                             )
                         }
                         .show()
@@ -221,6 +199,21 @@ class SearchFragment : Fragment(R.layout.fragment_search) {
             searchAdapter.notifyItemChanged(0)
             binding.quickSearchView.setText(it)
         }
+        // ⚠⚠ [CORRECTED 2026-09-13] THIS IS A VISIBILITY FAULT, NOT A GRAB FAULT, AND IT IS THE
+        // SAME FAULT AS THE DRAG STOPPING TWO-THIRDS DOWN. THE THUMB IS NOT RENDERED over the card/tile
+        // sections - there is nothing to grab, and the scroller declining a press on a thumb that does
+        // not exist is CORRECT BEHAVIOUR, not the bug. Full mechanism at PixelFastScrollViewHelper's
+        // extrapolation note: `mScrollbarEnabled = scrollOffsetRange > 0` rides the same
+        // position-dependent computeVerticalScrollRange estimate, so a section that estimates the
+        // content as short renders no thumb.
+        // ⚠️ THE SCROLLTOUCH PROBE THAT ESTABLISHED THIS IS GONE (removed 2026-09-13), AND IT WAS
+        // NOT A DEAD END - worth saying, because a deleted probe reads like one. It eliminated gesture
+        // ARBITRATION and the nested CAROUSELS, and eliminating those is what left visibility as the
+        // only place to look. Its answer - the scroller is reached and declines - was CORRECT, and
+        // turned out to be DOWNSTREAM of the real question. What it cost was being built against a
+        // symptom description nobody had checked. Its geometry finding was salvaged to
+        // FastScrollerHelper's setThumbDrawable note before deletion.
+        // The original note follows, superseded in its framing but accurate on what was measured.
         // ⚠⚠ OPEN FAULT - CANNOT START A THUMB GRAB OVER THE CARD/TILE SECTIONS ON THIS SCREEN.
         // WHAT WAS SEEN: on the Search landing, an INITIAL TOUCH on the fast-scroll thumb over a card/tile
         // section does not take. The thumb IS visible there and drags through those sections fine if the
@@ -281,7 +274,7 @@ class SearchFragment : Fragment(R.layout.fragment_search) {
         if (view.context.isTv())
             binding.quickSearchView.editText.imeOptions = EditorInfo.IME_ACTION_SEARCH
         binding.quickSearchView.editText.doOnTextChanged { text, _, _, _ ->
-            searchViewModel.quickSearch(extensionId, text.toString())
+            searchViewModel.quickSearch(argId, text.toString())
         }
         binding.quickSearchView.editText.setOnEditorActionListener { textView, _, _ ->
             val query = textView.text.toString()
@@ -347,8 +340,10 @@ class SearchFragment : Fragment(R.layout.fragment_search) {
             }
         }
         observe(searchViewModel.quickFeed) { list ->
-            quickSearchAdapter.submitList(list.map {
-                QuickSearchAdapter.Item(extensionId, it)
+            // The id arrives WITH each item (see `SearchViewModel.quickFeed`) rather than from a field
+            // here - see the note at the removed `extensionId` field above.
+            quickSearchAdapter.submitList(list.map { (extId, item) ->
+                QuickSearchAdapter.Item(extId, item)
             })
         }
     }

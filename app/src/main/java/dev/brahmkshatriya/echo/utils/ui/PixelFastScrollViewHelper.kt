@@ -459,6 +459,69 @@ class PixelFastScrollViewHelper(
             // But it drifts IDENTICALLY for the thumb and for the content, because both now read the same
             // extrapolation — which is the property that matters. The estimate broke exactly that.
             //
+            // ⚠⚠ [2026-09-13, REVISED] TWO REPORTED SEARCH FAULTS ARE ONE FAULT - THIS ONE -
+            // IN OPPOSITE DIRECTIONS. They were investigated separately and ruled INDEPENDENT; that was
+            // wrong, and it was wrong because fault 1 had been described as a GRAB failure when it is a
+            // VISIBILITY failure. One quantity, position-dependent on a mixed feed, two symptoms:
+            //   ESTIMATE TOO LARGE where the drag starts -> each finger pixel buys too much scroll ->
+            //     travel exhausts before the content does -> THE DRAG STOPS ~TWO-THIRDS DOWN.
+            //     (est/live 1.69, 1.19, 1.60, measured on this screen.)
+            //   ESTIMATE TOO SMALL over the card/tile sections -> getScrollRange() - view.height <= 0 ->
+            //     FastScroller's `mScrollbarEnabled = scrollOffsetRange > 0` goes FALSE -> NO THUMB IS
+            //     RENDERED THERE AT ALL. Crossed and uncrossed as you scroll, which is what is seen.
+            // ⚠⚠ MEASURED ON DEVICE 2026-09-13, AND IT IS NOT "CARD SECTIONS BREAK IT" - IT IS
+            // "A WINDOW DOMINATED BY CARD ROWS BREAKS IT". Anyone fixing this by special-casing card
+            // layouts would be treating the wrong thing.
+            // THE SCREEN (Deezer Search landing, top to bottom):
+            //     Genres                        cards - 3 rows x 2 columns (6 items)
+            //     Categories                    cards - 3 rows x 2 columns (6 items)
+            //     Discover something new        carousel
+            //     Albums of the week            carousel
+            //     This week's freshest releases carousel
+            //     Today's hits                  carousel
+            //     Explore all                   cards - 3 rows x 2 columns (6 items)
+            // CARDS ARE GRIDS OF TILES; A CAROUSEL IS ONE OUTER-LIST ITEM HOLDING A ROW OF MANY CARDS.
+            // Those two were conflated in earlier analysis and the distinction is the whole mechanism:
+            // over cards a row height covers TWO items; over a carousel a row height covers ONE item and
+            // the row is much taller. PIXELS-PER-ITEM DIFFERS BY ROUGHLY 4-5x BETWEEN THEM - and
+            // pixels-per-item is exactly what ScrollbarHelper.computeScrollRange averages
+            // (laidOutArea / laidOutRange * itemCount).
+            // ⚠⚠ THE DECIDING OBSERVATION - SAME SECTION TYPE, OPPOSITE BEHAVIOUR: the thumb is
+            // MISSING over Genres and Categories at the top, and PRESENT AND GRABBABLE over "Explore
+            // all" at the bottom. Identical layout, so the section type cannot be the cause.
+            // What differs is the ATTACHED WINDOW. At the bottom the window still holds tall carousel
+            // rows above, pulling the average up and keeping the estimate over the threshold. At the top
+            // there is nothing tall above, the window is almost entirely two-up card rows, the average
+            // collapses, and scrollOffsetRange drops below zero.
+            // ⚠️ THIS IS BETTER EVIDENCE THAN THE est/live RATIOS ALONE: a measured
+            // position-dependence on a real screen, with a control (the same layout behaving both ways)
+            // rather than three numbers from one direction.
+            //
+            // ⚠️ SO VISIBILITY IS DRIVEN BY THIS ESTIMATE, NOT BY TOUCH AND NOT BY ALPHA. The
+            // threshold is documented in this file's header (the short-list paragraph) and needs no
+            // explicit gate. The library's auto-hide animates a thumb that EXISTS; this is the thumb not
+            // existing. Cross-reference the header's padding note - computeVerticalScrollExtent is
+            // getTotalSpace (height minus vertical padding) while getScrollOffsetRange subtracts the FULL
+            // height, so the range adds the padding back. mScrollbarEnabled sits on that same quantity.
+            //
+            // ⚠⚠ AND THE SEPTEMBER CHANGE IS ORTHOGONAL TO BOTH, NOT A PARTIAL FIX OF EITHER.
+            // Setting gestureSpan = librarySpan made the drag and the thumb share ONE SCALE - a
+            // CONSISTENCY property between two consumers of the estimate. Neither surviving symptom is a
+            // consistency problem: reachability needs the estimate STABLE DURING A DRAG, visibility needs
+            // it to EXCEED THE VIEWPORT AT EVERY POSITION, and sharing a scale supplies neither (both
+            // consumers simply agree there is no thumb). BOTH REMAINING SYMPTOMS ARE THE SAME UNTOUCHED
+            // RESIDUAL.
+            //
+            // ⚠️ THIS IS A KNOWN UPSTREAM DEFECT, NOT OUR MISTAKE - WHICH CHANGES WHAT A FIX WOULD
+            // MEAN. The September session found the library's own RecyclerViewHelper has the SAME defect,
+            // with TWO OPEN UPSTREAM ISSUES against it. So some of the original symptoms were never
+            // introduced by this app, and any fix here is a WORKAROUND for something the maintainers have
+            // not solved either - judge it by that standard, not as correcting our own error.
+            // ⚠️ THOSE TWO ISSUES ARE UNCHARACTERISED IN THE RECORD - nobody has written down
+            // whether they describe REACHABILITY, VISIBILITY, or something else. Reading them is the
+            // closest thing to a lead that exists, and it costs one look at the tracker. Do that before
+            // designing anything.
+            //
             // ⚠⚠ [2026-09-13] THAT DISMISSAL DOES NOT COVER REACHABILITY, AND A REPORTED FAULT
             // SITS IN THE GAP. SYMPTOM: on the Search landing, grabbing the thumb at the very top and
             // dragging down STOPS ABOUT TWO-THIRDS OF THE WAY AND WILL NOT REACH THE BOTTOM.
@@ -578,20 +641,6 @@ class PixelFastScrollViewHelper(
      * until the following ACTION_MOVE, so it is seeded by the NaN check instead.
      */
     private fun trackGesture(event: MotionEvent, consumed: Boolean) {
-        // ⚠⚠ TEMPORARY (2026-09-13) - REMOVE WITH THE `SCROLLTOUCH observer` LINE IN
-        // SearchFragment; the two are one instrument and neither reads alone.
-        // THIS IS THE SCROLLER'S OWN VERDICT. `consumed` is the library's Predicate result - the listener
-        // object is OURS (addOnTouchEventListener below builds the SimpleOnItemTouchListener) but the
-        // decision is AndroidFastScroll's, so this observes its answer without wrapping or altering it.
-        // Prints on EVERY DOWN that reaches this listener, not only refusals, so silence here means
-        // "this listener was not called" and nothing else.
-        // REMOVAL CONDITION: delete once one capture shows which of the three outcomes occurs over a card
-        // row. It answers one question and has no value after.
-        if (event.actionMasked == MotionEvent.ACTION_DOWN) android.util.Log.d(
-            "GladixScroll",
-            "SCROLLTOUCH scroller tag=$traceTag consumed=$consumed " +
-                "x=${event.x.toInt()} y=${event.y.toInt()}"
-        )
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> if (consumed) gestureActive = true
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
