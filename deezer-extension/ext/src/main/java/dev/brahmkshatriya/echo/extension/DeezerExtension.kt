@@ -721,6 +721,27 @@ class DeezerExtension : HomeFeedClient, TrackClient, LikeClient, RadioClient,
 
     //<============= Utils =============>
 
+    /**
+     * ⚠⚠ A GUARD WAS NEARLY SHIPPED HERE AND WOULD HAVE COMPILED AND NEVER FIRED. Recorded
+     * because the thing that pointed at this function was a RECORD ENTRY, and the entry was right
+     * about the gap it described and wrong about where the fix went. Tracing the caller is what
+     * caught it: makeUser() calls callApi("deezer.getUserData") and never getArlByEmail, so the
+     * exception the guard would have caught cannot arrive on this path. A citation naming a site is
+     * a LEAD, not a location - check the callers before building on it, including the user's own
+     * notes, which is exactly the case this instance covers.
+     *
+     * ⚠⚠ NOTHING CATCHES A REFUSED RE-LOGIN HERE, AND ADDING ONE WOULD BE INERT. The
+     * credentials-present branch below calls makeUser(), which NEVER calls getArlByEmail - it
+     * calls callApi("deezer.getUserData"). A re-login is only reached by coming back through
+     * callApi's invalid-CSRF branch, where DeezerAuthRejectedException is already converted to
+     * ClientException.LoginRequired. A guard here would look correct, compile, and never fire.
+     * ⚠️ AND THE RECORDED "LoginRequired CARRIES NOTHING" GAP IS ABOUT THE `else if
+     * (isArlExpired)` BRANCH ONLY - the one where credentials are ABSENT, so "user must sign in"
+     * and "internal token went stale, no user action possible" genuinely cannot be told apart.
+     * It does NOT cover this whole function, and reading it that way is what made the third state
+     * (credentials present, used, and REFUSED) look unfixable. That state is distinguishable where
+     * it happens; see the note at DeezerApi.callApi's CSRF branch.
+     */
     suspend fun handleArlExpiration() {
         val creds = session.credentials
         val isArlExpired = session.arlExpired || creds.arl.isEmpty()

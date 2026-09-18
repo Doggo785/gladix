@@ -310,6 +310,8 @@ class PlayerService : MediaLibraryService() {
                 isAndroidAutoConnected = { isAndroidAutoConnected },
                 requestAudioFocus = { audioFocusListener.requestFocus() },
                 activeLoadCount = { state.activeLoadCount.get() },
+                // Epoch ms of the current load episode's start, 0 when idle - stuck_detail's loadAge.
+                loadEpisodeStartMs = { state.loadEpisodeStartMs.get() },
                 // Clears the resumption marker once the queue lands (timeline non-empty) — the success
                 // clear for onPlaybackResumption; on Main, since Player.Listener fires on the app looper.
                 onQueueApplied = { state.resumptionApplying = false },

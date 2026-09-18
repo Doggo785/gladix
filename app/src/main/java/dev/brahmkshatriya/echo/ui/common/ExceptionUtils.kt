@@ -12,6 +12,7 @@ import dev.brahmkshatriya.echo.download.exceptions.DownloaderExtensionNotFoundEx
 import dev.brahmkshatriya.echo.download.tasks.BaseTask.Companion.getTitle
 import dev.brahmkshatriya.echo.extensions.db.models.UserEntity
 import dev.brahmkshatriya.echo.extensions.exceptions.AppException
+import dev.brahmkshatriya.echo.extensions.exceptions.capMessage
 import dev.brahmkshatriya.echo.extensions.exceptions.ExtensionLoadException
 import dev.brahmkshatriya.echo.extensions.exceptions.ExtensionLoaderException
 import dev.brahmkshatriya.echo.extensions.exceptions.ExtensionNotFoundException
@@ -196,19 +197,34 @@ object ExceptionUtils {
     data class Data(val title: String, val trace: String)
 
     fun Throwable.toData(context: Context) = run {
-        val title = context.getFinalTitle(this) ?: context.getString(
+        // Same cap, same reasoning as getMessage above. Safe here because the FULL text is still
+        // reachable: Data carries the trace alongside the title, and getStackTrace appends
+        // getFinalDetails, which inlines the raw payload (bounded separately by TRACE_CHAR_CAP).
+        val title = (context.getFinalTitle(this) ?: context.getString(
             R.string.error_x,
             message ?: this::class.run { simpleName ?: java.name }
-        )
+        )).capMessage()
         Data(title, getStackTrace(this))
     }
 
 
+    // ⚠⚠ THE CAP IS APPLIED HERE, AND DELIBERATELY NOT IN getTitle/getFinalTitle. Those two
+    // are under a standing constraint to stay BYTE-FOR-BYTE UNTOUCHED (the phone snackbar path), which
+    // the classify() work has respected since. Capping the RESULT at the construction site honours it
+    // and is also strictly better placed: getFinalTitle WALKS THE CAUSE CHAIN to find the real reason,
+    // and a cap inside that walk would risk changing which cause is chosen rather than only how much
+    // of it is shown.
+    // ⚠️ AND CAPPING getFinalTitle WOULD NOT HAVE FIXED THE WORSE HALF ANYWAY, which is the
+    // reason this placement is not a compromise. The Crashlytics issue TITLE comes from the exception's
+    // own `message` - AppException.Other.message, built by deepestMessage() - and never passes through
+    // this file at all. That path is capped at its own source; see AppException.capMessage.
+    // Truncating from the END keeps the attribution: getTitle renders Other as
+    // "<extension name>: <cause>", so the name survives and only the payload is cut.
     fun FragmentActivity.getMessage(throwable: Throwable, view: View?): Message {
-        val title = getFinalTitle(throwable) ?: getString(
+        val title = (getFinalTitle(throwable) ?: getString(
             R.string.error_x,
             throwable.message ?: throwable::class.run { simpleName ?: java.name }
-        )
+        )).capMessage()
         val root = throwable.rootCause
         return Message(
             message = title,

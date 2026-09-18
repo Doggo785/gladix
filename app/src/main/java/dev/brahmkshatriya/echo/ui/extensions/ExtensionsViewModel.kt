@@ -26,6 +26,8 @@ import dev.brahmkshatriya.echo.ui.extensions.list.ExtensionListViewModel
 import dev.brahmkshatriya.echo.utils.AppUpdater
 import dev.brahmkshatriya.echo.utils.AppUpdater.downloadUpdate
 import dev.brahmkshatriya.echo.utils.AppUpdater.getUpdateFileUrl
+import dev.brahmkshatriya.echo.utils.AppUpdater.githubRateLimitReset
+import dev.brahmkshatriya.echo.utils.AppUpdater.isGithubRateLimit
 import dev.brahmkshatriya.echo.utils.AppUpdater.updateApp
 import dev.brahmkshatriya.echo.utils.CacheUtils.getFromCache
 import dev.brahmkshatriya.echo.utils.CacheUtils.saveToCache
@@ -131,12 +133,42 @@ class ExtensionsViewModel(
             } else {
                 var anyUpdateFound = false
                 var anyFailed = false
-                extensionLoader.all.value.forEach {
-                    when (updateExt(it)) {
+                var rateLimited: Throwable? = null
+                // ⚠⚠ `for` WITH A `break`, NOT forEach - THE LOOP MUST BE ABLE TO STOP. Once
+                // GitHub has rate-limited the IP every remaining request is guaranteed to fail, and
+                // continuing spends quota that other apps on the same IP also need, turns one cause
+                // into N identical reports, and delays the reset for nothing.
+                for (ext in extensionLoader.all.value) {
+                    // announce = force: an automatic pass records check failures without interrupting.
+                    when (val result = updateExt(ext, announce = force)) {
                         ExtUpdate.Updated -> anyUpdateFound = true
                         ExtUpdate.Failed -> anyFailed = true
                         ExtUpdate.UpToDate -> Unit
+                        is ExtUpdate.RateLimited -> {
+                            rateLimited = result.error
+                            break
+                        }
                     }
+                }
+                // ONE message for the pass. Always shown, even on an automatic check: unlike "all
+                // extensions up to date", this is the answer to "why has nothing updated in months",
+                // and the user cannot ask a question they do not know they have.
+                // Raw text, not an R.string: the message is BUILT in AppUpdater.githubHttpError
+                // from GitHub's X-RateLimit-Reset header, so the concrete time is the whole point
+                // and a static resource could not carry it. (R.string.error does not exist; do not
+                // reach for it.)
+                if (rateLimited != null) {
+                    message(
+                        rateLimited.message ?: "GitHub rate limit reached, try again later"
+                    )
+                    // ⚠⚠ EXACTLY ONE NON-FATAL PER PASS, AND THE COUNT IS THE POINT. Zero would
+                    // be wrong: this issue sat MUTED SINCE MAY and rose to 8 events on build 1106
+                    // alone, and a silent fix would remove the only evidence that it is still
+                    // happening. Eight per pass is what caused the mute. One per pass keeps the trend
+                    // readable at a rate nobody needs to mute.
+                    // silentThrowFlow, not throwFlow: the user has already been told by the message()
+                    // above, and a second snackbar for the same event is the noise being removed.
+                    app.silentThrowFlow.emit(rateLimited)
                 }
                 // Only claim "up to date" when we actually found out AND the user asked. Two
                 // separate gates:
@@ -146,7 +178,38 @@ class ExtensionsViewModel(
                 //    own snackbar via throwFlow.
                 //  - force: an unprompted background check that finds nothing says NOTHING. A manual
                 //    check still confirms the result, because the user asked and deserves an answer.
-                if (anyFailed) app.context.saveToCache("last_update_check", 0L)
+                // ⚠⚠ THE ZEROING STAYS FOR ORDINARY FAILURES AND MUST NOT FIRE ON A RATE
+                // LIMIT. Its intent is right - a transient failure should not cost 24 hours of not
+                // checking - but it cannot tell a transient failure from a SELF-INFLICTED one, and
+                // for a rate limit "retry sooner" is exactly backwards.
+                // ⚠⚠ THE LOOP IT CLOSED, WHICH IS WHY THIS MATTERS: a rate-limited pass fails
+                // every extension -> anyFailed -> throttle zeroed -> the NEXT LAUNCH runs a full pass
+                // -> rate-limited again. The failure removed the only thing preventing the failure.
+                // ⚠️ NEITHER HALF WAS A MISTAKE ON ITS OWN, AND THE RECORD SHOULD NOT READ AS
+                // ONE. Both landed in the same August 2026 session ("last_update_check zeroed on
+                // failure and fixed (0L), throttle restored to 24h, automatic pass silenced"). The
+                // zeroing was INTENDED; it had simply never taken effect, because saveToCache picks
+                // its folder from T::class.java.simpleName and the old `0` Int literal wrote to int/
+                // while this reads getFromCache<Long> out of long/ - silent in both directions, which
+                // is exactly why the zeroing looked harmless when it was written. Fixing the folder
+                // made a deliberate change live, and the two together made a loop. Neither change
+                // considered the rate-limit case.
+                // ⚠️ AND "CHECKS ON EVERY COLD START" HAS NOW BEEN REACHED TWICE BY TWO ROUTES.
+                // The same session had it from a throttle wrongly set to 2h on the strength of a bad
+                // summary note. Same user-visible outcome, unrelated mechanism - so a report of
+                // over-frequent checking does NOT identify its own cause.
+                if (rateLimited != null) {
+                    // Back off until the limit actually resets rather than for a full day: line ~109
+                    // already stamped `now`, so subtracting the window and adding the wait lands the
+                    // next eligible check just after the reset. No reset time -> leave the 24h stamp.
+                    val waitMs = rateLimited.githubRateLimitReset()
+                        ?.let { it * 1000 - System.currentTimeMillis() }
+                        ?.coerceIn(0L, updateTime.toLong())
+                    if (waitMs != null) app.context.saveToCache(
+                        "last_update_check",
+                        System.currentTimeMillis() - updateTime + waitMs + 60_000L
+                    )
+                } else if (anyFailed) app.context.saveToCache("last_update_check", 0L)
                 else if (!anyUpdateFound && force)
                     message(app.context.getString(R.string.all_extensions_up_to_date))
             }
@@ -231,11 +294,24 @@ class ExtensionsViewModel(
     // is what let update() report "all extensions up to date" straight after a failed check or a
     // failed download. Failed also covers a failed INSTALL, which previously returned `true` — it
     // suppressed the up-to-date message correctly but for the wrong reason, and reported nothing.
-    private enum class ExtUpdate { Updated, UpToDate, Failed }
+    // ⚠⚠ RateLimited IS NOT "Failed WITH A NICER NAME" - IT SELECTS A DIFFERENT PASS-LEVEL
+    // BEHAVIOUR AND CARRIES THE ERROR TO DO IT. A normal failure is per-extension: report it, keep
+    // going, the next repo may be fine. A rate limit is IP-wide: every remaining repo is guaranteed
+    // to fail, so the pass stops, reports ONCE, and backs off until the limit resets. The throwable
+    // rides along because only it knows the reset time (X-RateLimit-Reset).
+    private sealed interface ExtUpdate {
+        data object Updated : ExtUpdate
+        data object UpToDate : ExtUpdate
+        data object Failed : ExtUpdate
+        data class RateLimited(val error: Throwable) : ExtUpdate
+    }
 
-    private suspend fun updateExt(ext: Extension<*>, show: Boolean = false): ExtUpdate {
-        val file = getExtensionUpdate(ext, show).getOrElse { return ExtUpdate.Failed }
-            ?: return ExtUpdate.UpToDate
+    private suspend fun updateExt(
+        ext: Extension<*>, show: Boolean = false, announce: Boolean = true,
+    ): ExtUpdate {
+        val file = getExtensionUpdate(ext, show, announce).getOrElse {
+            return if (it.isGithubRateLimit()) ExtUpdate.RateLimited(it) else ExtUpdate.Failed
+        } ?: return ExtUpdate.UpToDate
         val type = ext.metadata.importType
         if (type == ImportType.File) {
             installPromptFlow.emit(file)
@@ -324,18 +400,45 @@ class ExtensionsViewModel(
     // Result<File?> rather than File?, so the caller can tell the two null cases apart:
     // success(null) = nothing to update, failure = we never found out. Both already emit to
     // throwFlow; only the return value was lossy.
+    /**
+     * @param announce whether a FAILURE OF THE CHECK may interrupt the user. True for a pass the user
+     *   started; false for the automatic startup pass, where the failure is recorded but not shown.
+     *
+     * ⚠⚠ IT GATES ONLY THE FIRST FAILURE SITE, AND THE LINE IS THE `downloading update for X`
+     * MESSAGE BELOW - NOT `force`. Everything before that emit happened without the user being told
+     * anything, so staying silent costs them nothing. Everything AFTER it follows a progress message
+     * they have already seen, and suppressing those failures would leave "downloading update for
+     * Spotify" on screen with no outcome, forever. That progress emit is ungated on purpose (see the
+     * note in update()): it fires only when work is genuinely under way.
+     */
     private suspend fun getExtensionUpdate(
         extension: Extension<*>,
-        show: Boolean = false
+        show: Boolean = false,
+        announce: Boolean = true,
     ): Result<File?> {
         val currentVersion = extension.version
         val updateUrl = extension.metadata.updateUrl ?: return Result.success(null)
         val url = runCatching {
-            getUpdateFileUrl(currentVersion, updateUrl, client).getOrThrow()
+            getUpdateFileUrl(currentVersion, updateUrl, client, app.context).getOrThrow()
         }.getOrElse {
             if (it is CancellationException) throw it
             val e = it.named(extension.name)
-            app.throwFlow.emit(e)
+            // ⚠⚠ A RATE LIMIT DOES NOT EMIT HERE. throwFlow has TWO collectors - App.kt's
+            // recordException AND setupExceptionHandler's snackbar - so an emission per extension
+            // is a snackbar AND a Crashlytics non-fatal per extension, all from ONE cause. That is
+            // what produced eight identical MissingFieldExceptions within one second from three
+            // unrelated repos. The pass reports it once instead; see update().
+            // ⚠️ AND THIS PATH WAS NEVER "SILENCED" BY THE force GATE. That gate covers only
+            // the status messages ("checking for extension updates", "all extensions up to date");
+            // failures emitted unconditionally, so an AUTOMATIC background pass has been showing
+            // users snackbars for a check they never asked for.
+            // A rate limit is reported ONCE for the whole pass (see update()), never per extension.
+            // Anything else goes to the screen only if the user asked; it is RECORDED either way, via
+            // App.silentThrowFlow - suppressing the emit entirely would suppress the Crashlytics
+            // report too, and that is how a rising signal disappears.
+            if (!e.isGithubRateLimit()) {
+                if (announce) app.throwFlow.emit(e) else app.silentThrowFlow.emit(e)
+            }
             return Result.failure(e)
         }
         if (url == null) {
@@ -344,12 +447,18 @@ class ExtensionsViewModel(
             )
             return Result.success(null)
         }
+        // ⚠⚠ THIS EMIT IS THE LINE `announce` IS DRAWN AT. Everything above it happened
+        // without the user being told anything; everything below follows THIS message.
         message(app.context.getString(R.string.downloading_update_for_x, extension.name))
         val file = runCatching {
             downloadUpdate(app.context, url, client).getOrThrow()
         }.getOrElse {
             if (it is CancellationException) throw it
             val e = it.named(extension.name)
+            // ⚠️ DELIBERATELY IGNORES `announce` - DO NOT "FINISH" THE GATING BY ADDING IT.
+            // The user has just been told "downloading update for X" on ANY pass, automatic
+            // included. Silence after that is not quiet, it is a hang: the message stays on screen
+            // and nothing ever resolves it. Same reasoning at updateExt's install() failure.
             app.throwFlow.emit(e)
             return Result.failure(e)
         }

@@ -69,6 +69,43 @@ class DeezerGatewayException(
     override fun toString() = "DeezerGatewayException(method=$method, error=$errorText)"
 }
 
+/**
+ * Deezer accepted the request and REFUSED THE CREDENTIALS: HTTP 200 whose body carries an explicit
+ * `error`. Thrown only from getArlByEmail, only when Deezer said why.
+ *
+ * ⚠⚠ A TYPE, NOT A STRING MATCH ON "authenticate user failed", and that is the whole design.
+ * Matching the sentence would break on any rewording by Deezer and would then SILENTLY STOP routing
+ * to the login prompt - the user would be back to an unexplained playback error with nothing to
+ * indicate the guard had stopped firing. Same caution as requireJsonObject in this file: test for
+ * what we require (an explicit error from Deezer) rather than sniffing for what we do not want.
+ * ⚠️ THE MESSAGE IS DELIBERATELY BYTE-IDENTICAL TO THE Exception IT REPLACES
+ * ("Login failed: <error>"), so the existing Crashlytics issue keeps its grouping and its history
+ * rather than forking into a new one at the moment the behaviour changes.
+ * ⚠️ NOT thrown for "no access_token in response" / "no ARL in response". Those are SHAPE
+ * surprises, not refusals - Deezer said nothing - so they stay plain Exceptions and stay retryable.
+ *
+ * ⚠⚠ THE LOAD-BEARING ASSUMPTION IS "AUTH ERRORS ARRIVE AS HTTP 200 WITH A POPULATED `error`
+ * OBJECT", AND IT IS ESTABLISHED RATHER THAN ASSUMED HERE. Two independent supports:
+ *   ⚠️ ESTABLISHED JUNE 2026, not inferred from this report: "Deezer signals auth via a
+ *     populated error JSON object on HTTP 200, already handled by the CSRF/ARL-refresh path - proven
+ *     safe because the existing isSuccessful-before-errorObj ordering works today, WHICH MEANS AUTH
+ *     ERRORS MUST BE 200." That is a proof from working behaviour, not a reading of a sample.
+ *   ⚠️ AND THIS FILE'S OWN CONTROL FLOW AGREES: getToken throws ClientException.LoginRequired
+ *     on 403 and "Unexpected code" on every other non-2xx, so the string this type replaces was only
+ *     ever reachable on a 200. Rate limits, captcha walls, endpoint changes and network failures
+ *     cannot produce it.
+ * ⚠️ WHAT IS *NOT* ESTABLISHED, AND MUST NOT BE READ AS SETTLED: the exhaustive account-side
+ * MEANING of a given error string. "authenticate user failed" is assumed to be a wrong password, but
+ * a suspended account, a forced password reset or a region block could plausibly share it -
+ * user_auth.php is undocumented, and deezer-py and GitHub code search were both unreachable when this
+ * was written, so nothing confirms it. It does not change the handling: every one of those variants
+ * means "your stored credentials no longer work, sign in again". It would change a message that
+ * tried to name the cause - so do not write one.
+ */
+class DeezerAuthRejectedException(
+    val errorText: String,
+) : Exception("Login failed: $errorText")
+
 class DeezerApi(private val session: DeezerSession) {
 
     companion object {
@@ -273,7 +310,58 @@ class DeezerApi(private val session: DeezerSession) {
                         throw Exception("Please re-login (Best use User + Pass method)")
                     } else {
                         session.isArlExpired(false)
-                        val userList = DeezerExtension().onLogin("userPass", mapOf(Pair("email", email), Pair("pass", pass)))
+                        // ⚠⚠ THE ENCLOSING CSRF BRANCH IS PROTECTED BY TWO PRIOR SESSIONS - DO
+                        // NOT DELETE IT ON THE COMPILER'S ADVICE. K2 flags
+                        // `result["error"] is JsonObject` as always-false; it was SUPPRESSED rather
+                        // than removed, because Deezer genuinely returns a JsonObject for CSRF
+                        // VALID_TOKEN_REQUIRED errors and "removing it would silently break session
+                        // re-auth". The conversion below now DEPENDS on this branch executing, so a
+                        // deletion would take the login prompt with it - and the symptom would be the
+                        // old one returning: an unexplained playback error instead of a sign-in.
+                        //
+                        // ⚠⚠ THIS IS WHERE A SILENT RE-LOGIN ACTUALLY HAPPENS, AND THEREFORE
+                        // WHERE A REFUSED ONE MUST BE TRANSLATED. Traced from a real report rather
+                        // than assumed: build 1106, cold start, 80-track queue restoring, surfacing as
+                        //     IOException: Login failed: authenticate user failed error in Deezer
+                        //       at StreamableMediaSource.maybeThrowSourceInfoRefreshError
+                        //     Caused by: ... at DeezerApi.getArlByEmail
+                        // getArlByEmail's ONLY non-recursive caller is onLogin, and onLogin is reached
+                        // from exactly two places: the login screen, and THIS line. So a playback-time
+                        // refusal can only have come through here - loadTrack -> callApi -> stale CSRF
+                        // -> silent re-login -> refused.
+                        // ⚠️ DO NOT PUT THIS GUARD ON handleArlExpiration's makeUser() BRANCH
+                        // INSTEAD - IT WOULD BE INERT THERE. That branch calls makeUser(), which never
+                        // calls getArlByEmail; it reaches a re-login only by coming back through THIS
+                        // line, where the conversion has already happened. A guard there would look
+                        // correct, compile, and never fire.
+                        // WHAT THE USER GETS: ClientException.LoginRequired is wrapped by the host into
+                        // AppException.LoginRequired, which ExceptionUtils.getTitle renders as a
+                        // LOCALIZED message naming the extension, with a SIGN IN action attached by
+                        // getMessage. A raw ClientException has no branch there and would render as
+                        // "Error: LoginRequired" with only a View button - so throwing the wrapped form
+                        // is what produces the prompt, not a hope about how it renders.
+                        // ⚠️ AND IT NEEDS NO CHANGE TO LoginRequired's CONTRACT. The recorded gap
+                        // - that LoginRequired carries nothing, so it cannot separate "user must sign
+                        // in" from "internal token went stale, no user action possible" - is about
+                        // handleArlExpiration's `else if (isArlExpired)` branch, where credentials are
+                        // ABSENT. THIS IS A DIFFERENT BRANCH: reaching here proves email and pass were
+                        // present, were used, and were refused. That is unambiguously "sign in again",
+                        // which is the one case where carrying nothing is fine - there is nothing left
+                        // to disambiguate. So the ABI problem that blocked the host-layer fix (a new
+                        // LoginRequired subtype is additive and binary-compatible, but an optional
+                        // field with a default is binary-INCOMPATIBLE because Kotlin compiles the
+                        // zero-arg <init>()V away - and adoption is a behavioural change per
+                        // extension, not a recompile) does not arise: this throws the EXISTING type.
+                        // The September conclusion was right about the HOST layer and wrong to read as
+                        // closing the question - the extension could already express it.
+                        val userList = try {
+                            DeezerExtension().onLogin(
+                                "userPass", mapOf(Pair("email", email), Pair("pass", pass))
+                            )
+                        } catch (_: DeezerAuthRejectedException) {
+                            session.isArlExpired(true)
+                            throw ClientException.LoginRequired()
+                        }
                         DeezerExtension().setLoginUser(userList.first())
                         return@withContext callApi(method, paramsBuilder, gatewayInput)
                     }
@@ -486,7 +574,10 @@ class DeezerApi(private val session: DeezerSession) {
                 ?: run {
                     val errMsg = (apiResponse["error"] as? JsonPrimitive)?.contentOrNull
                         ?: (apiResponse["error"] as? JsonObject)?.get("message")?.jsonPrimitive?.contentOrNull
-                    throw Exception(if (errMsg != null) "Login failed: $errMsg" else "Login failed: no access_token in response")
+                    // An explicit error = a REFUSAL (typed, non-retryable). No error at all = a shape
+                    // surprise, which stays a plain Exception and stays retryable.
+                    if (errMsg != null) throw DeezerAuthRejectedException(errMsg)
+                    throw Exception("Login failed: no access_token in response")
                 }
             session.updateCredentials(token = accessToken)
 
@@ -495,10 +586,21 @@ class DeezerApi(private val session: DeezerSession) {
             val arl = (arlObject["results"] as? JsonPrimitive)?.contentOrNull
                 ?: run {
                     val errMsg = (arlObject["error"] as? JsonObject)?.get("message")?.jsonPrimitive?.contentOrNull
-                    throw Exception(if (errMsg != null) "Login failed: $errMsg" else "Login failed: no ARL in response")
+                    if (errMsg != null) throw DeezerAuthRejectedException(errMsg)
+                    throw Exception("Login failed: no ARL in response")
                 }
             session.updateCredentials(arl = arl)
         } catch (e: Exception) {
+            // ⚠⚠ A REFUSAL IS DETERMINISTIC - DO NOT RETRY IT. This is independent of the
+            // message work above and would be worth doing on its own. The catch used to take every
+            // Exception, so a rejected password was RE-SENT THREE TIMES to a shared-account endpoint.
+            // The June 2026 backoff (1.5s/3s, added because all three attempts fired within
+            // milliseconds and risked Deezer rate-limiting the account) SLOWS that and does not stop
+            // it - and a rate limit is exactly the outcome the backoff exists to avoid, so retrying a
+            // known-bad credential makes the very risk it was added for WORSE. Two extra attempts buy
+            // nothing: Deezer has already answered, and the answer will not change.
+            // Transient failures (network, non-2xx, shape surprises) still retry, unchanged.
+            if (e is DeezerAuthRejectedException) throw e
             if (remainingAttempts > 1) {
                 delay(1500L * (4 - remainingAttempts))
                 getArlByEmail(mail, password, remainingAttempts - 1)

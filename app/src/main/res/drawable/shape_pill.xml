@@ -13,10 +13,41 @@
      down each side. The neighbouring timestamps do not collide only because they have no background, so
      their 12dp padding hides the overlap. Shrinking the layout box instead would cost the tap target;
      buying the clearance from the Slider's paddingVertical would cost 2dp of block height per 1dp of
-     gap. This costs neither. -->
+     gap. This costs neither.
+
+     ⚠⚠ [RETUNED 2026-09-17: 6/6 -> 10/2.] TUNING A VALUE CHOSEN FOR THIS EXACT PROBLEM, NOT A
+     NEW LEVER. The August pass introduced the 6dp insets precisely "so the drawn pill clears the 44dp
+     thumb while the 40dp touch target is unchanged", alongside minHeight 48dp -> 40dp. 4dp was what
+     6/6 produced and was judged sufficient then; on device it reads as nearly touching, so the
+     judgement is revised by observation, not by a new finding.
+     WHY ASYMMETRIC IS BETTER RATHER THAN MERELY DIFFERENT - THE TWO GAPS ARE NOT EQUIVALENT, WHICH IS
+     WHAT THE SYMMETRIC 6/6 IMPLICITLY ASSUMED:
+       ABOVE abuts the THUMB - 44dp, and it MOVES, sweeping the full width as the track plays.
+       BELOW abuts the FrameLayout's bottom edge, past which the transport ConstraintLayout's own
+         marginTop=8dp already separates everything. The bottom inset buys NOTHING visually.
+     So 10/2 spends a gap that does no work on the only one that does: drawn pill 90-118dp, 8dp clear
+     of the thumb (was 4dp), and still 2 + 8 = 10dp of real space below.
+     ⚠️ RAISING THE SLIDER'S paddingVertical IS NOT AN ALTERNATIVE AND WAS ALREADY REJECTED:
+     padding is additive to widgetThickness and only HALF of any increase becomes clearance, so 8dp of
+     gap would cost 16dp of block height.
+
+     ⚠⚠ WHAT THIS DOES NOT FIX, SO NOBODY READS IT AS HAVING FIXED IT: THE TOUCH OVERLAP.
+     trackSubtitle IS TAPPABLE (PlayerFragment opens QualitySelectionBottomSheet on it), it is a
+     SIBLING of the seek FrameLayout rather than a child - both are children of the outer FrameLayout -
+     and the Slider is 120dp tall and match_parent wide (paddingVertical 38 + thumbHeight 44). The
+     pill's 40dp BOX therefore overlays THE ENTIRE BOTTOM THIRD OF THE SLIDER (80-120dp) across its own
+     width, and its elevation=1dp means it is dispatched first and consumes the DOWN. So a seek drag
+     cannot START anywhere in that band. INSETS ONLY MOVE WHAT IS DRAWN - the box stays 80-120 whatever
+     they are, so this overlap is untouched by the retune and predates it.
+     Why it is survivable today: the thumb's grab region is minTouchTargetSize=90dp centred on the thumb
+     (~15-105dp) and users drag on the wave at 48-72dp, which is clear of the pill. The neighbouring
+     timestamps overlay the Slider too but have NO click listener, so they return false and the touch
+     falls through - only the pill consumes. The real cost is that the bottom of the thumb's grab
+     region is dead for seeking wherever the pill sits. Fixing that is a separate decision (the pill
+     would need a smaller touch box, which is the tap target August deliberately protected). -->
 <inset xmlns:android="http://schemas.android.com/apk/res/android"
-    android:insetBottom="6dp"
-    android:insetTop="6dp">
+    android:insetBottom="2dp"
+    android:insetTop="10dp">
     <shape>
         <corners android:radius="100dp" />
     </shape>

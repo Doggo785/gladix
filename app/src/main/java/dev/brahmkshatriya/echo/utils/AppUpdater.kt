@@ -28,6 +28,8 @@ import dev.brahmkshatriya.echo.R
 import dev.brahmkshatriya.echo.common.helpers.ContinuationCallback.Companion.await
 import dev.brahmkshatriya.echo.common.models.Message
 import dev.brahmkshatriya.echo.di.App
+import dev.brahmkshatriya.echo.utils.CacheUtils.getFromCache
+import dev.brahmkshatriya.echo.utils.CacheUtils.saveToCache
 import dev.brahmkshatriya.echo.utils.ContextUtils.appVersion
 import dev.brahmkshatriya.echo.utils.ContextUtils.getTempFile
 import dev.brahmkshatriya.echo.utils.Serializer.toData
@@ -38,6 +40,9 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
+import java.text.DateFormat
+import java.util.Date
 import java.io.File
 import java.io.IOException
 import java.util.zip.ZipFile
@@ -245,7 +250,8 @@ object AppUpdater {
                 "release" -> {
                     val currentVersion = version.substringBefore('_')
                     val updateUrl = "https://api.github.com/repos/$githubRepo/releases"
-                    getGithubUpdateUrl(currentVersion, updateUrl, client) ?: return null
+                    getGithubUpdateUrl(currentVersion, updateUrl, client, app.context)
+                        ?: return null
                 }
 
                 // UPSTREAM'S CHANNEL, NOT BUILT HERE — kept so a stable build would still work if one were
@@ -253,7 +259,8 @@ object AppUpdater {
                 "stable" -> {
                     val currentVersion = version.substringBefore('_')
                     val updateUrl = "https://api.github.com/repos/$githubRepo/releases"
-                    getGithubUpdateUrl(currentVersion, updateUrl, client) ?: return null
+                    getGithubUpdateUrl(currentVersion, updateUrl, client, app.context)
+                        ?: return null
                 }
 
                 "nightly" -> {
@@ -486,10 +493,115 @@ object AppUpdater {
     // https://github.com/<user>/<repo> and any suffix (/, /releases, /releases/latest, /releases/tag/…),
     // with optional http/www. `[^/]+` stops at the next slash so trailing paths/slashes are ignored.
     private val githubBrowserRegex = Regex("^https?://(?:www\\.)?github\\.com/([^/]+)/([^/]+)")
+    /**
+     * GitHub refused us for the whole IP, not for one repo.
+     *
+     * ⚠⚠ ITS WHOLE PURPOSE IS TO BE RECOGNISABLE AT THE PASS LEVEL, because the right response
+     * is to STOP, and "stop" is a decision only the caller looping over extensions can take.
+     * Unauthenticated api.github.com allows 60 requests/hour/IP and one update pass spends 1 (the app
+     * check) + 1 per installed extension with an updateUrl - across ALL extension types, not just
+     * music. A user with eight extensions spends nine per pass.
+     */
+    class GithubRateLimitException(
+        message: String, val resetEpochSec: Long?
+    ) : Exception(message)
+
+    /**
+     * ⚠⚠ WALKS THE WHOLE CAUSE CHAIN, AND MUST. This exception is wrapped at least twice before
+     * any caller sees it - getUpdateFileUrl's runIOCatching, then getExtensionUpdate's
+     * `it.named(extension.name)` - so an `is` test against the throwable, or against its ROOT cause,
+     * silently never matches. That exact pattern has produced three dead branches in this codebase
+     * already; see the wrong-node type-check record. Do not "simplify" this to `this is ...` or to
+     * `rootCause is ...`.
+     */
+    fun Throwable.isGithubRateLimit(): Boolean {
+        var t: Throwable? = this
+        while (t != null) {
+            if (t is GithubRateLimitException) return true
+            t = t.cause
+        }
+        return false
+    }
+
+    /** The rate-limit reset, if GitHub told us one. Same chain-walk reasoning as above. */
+    fun Throwable.githubRateLimitReset(): Long? {
+        var t: Throwable? = this
+        while (t != null) {
+            if (t is GithubRateLimitException) return t.resetEpochSec
+            t = t.cause
+        }
+        return null
+    }
+
+    // GitHub's error body. EVERY non-200 returns this shape - {"message": ..., "documentation_url":
+    // ...} - and it is precisely what produced four months of MissingFieldException: it parses as an
+    // object and has NONE of tag_name/created_at/assets, so kotlinx reports "required ... missing at
+    // path: $" and the STATUS never appears anywhere in the report.
+    @Serializable
+    data class GithubErrorResponse(val message: String? = null)
+
+    // ETag + the release it belongs to. A conditional request that 304s DOES NOT COUNT against the
+    // rate limit, which is why this is the fix for the CAUSE rather than for the symptom: a repeat
+    // pass over unchanged repos becomes nearly free instead of spending the quota again.
+    @Serializable
+    data class CachedRelease(val etag: String, val response: GithubReleaseResponse)
+
+    // Explicit folder name, NOT the T::class.java.simpleName default - see the saveToCache folder
+    // trap (an Int literal wrote to int/ while the reader looked in long/, silent in both
+    // directions, and it broke last_update_check for months). Naming it here removes the class from
+    // the path entirely, so a future rename of CachedRelease cannot orphan the cache.
+    private const val GITHUB_RELEASE_CACHE = "github_release"
+
+    /**
+     * Turns a non-200 into an exception that says WHAT HAPPENED.
+     *
+     * ⚠️ THE 403 SPLIT IS NOT COSMETIC: a rate limit and a genuine refusal need OPPOSITE
+     * responses (stop the pass and wait vs. this repo is not reachable), so they must not share a
+     * branch. X-RateLimit-Remaining == "0" is what separates them; 429 is treated as a rate limit
+     * outright.
+     * The reset TIME comes from the X-RateLimit-Reset header, not from the message body - GitHub's
+     * rate-limit text says "try again later" and never names a time, so the body alone cannot make
+     * the advice concrete.
+     */
+    private fun githubHttpError(user: String, repo: String, response: Response): Exception {
+        val body = runCatching { response.body.string() }.getOrNull().orEmpty()
+        val apiMessage = runCatching { body.toData<GithubErrorResponse>().getOrThrow().message }
+            .getOrNull()?.takeIf { it.isNotBlank() }
+        val suffix = apiMessage?.let { ": $it" } ?: ""
+        val remaining = response.header("X-RateLimit-Remaining")
+        val resetSec = response.header("X-RateLimit-Reset")?.toLongOrNull()
+        val rateLimited = response.code == 429 ||
+            (response.code == 403 && remaining == "0")
+        return when {
+            rateLimited -> GithubRateLimitException(
+                "GitHub rate limit reached" + (resetSec?.let {
+                    " " + EM_DASH + " try again after " +
+                        DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(it * 1000))
+                } ?: " " + EM_DASH + " try again later"),
+                resetSec
+            )
+
+            response.code == 403 ->
+                Exception("GitHub refused the request for $user/$repo (403)$suffix")
+
+            response.code == 404 -> Exception(
+                "No releases found for $user/$repo " + EM_DASH +
+                    " it may have no releases, or may no longer exist"
+            )
+
+            else -> Exception("GitHub returned HTTP ${response.code} for $user/$repo$suffix")
+        }
+    }
+
+    private const val EM_DASH = "—"
+
     suspend fun getGithubUpdateUrl(
         currentVersion: String,
         updateUrl: String,
-        client: OkHttpClient
+        client: OkHttpClient,
+        // Enables ETag caching. Optional so AddViewModel's one-off add flow needs no change; every
+        // looping caller SHOULD pass it, since the loop is what spends the quota.
+        context: Context? = null,
     ) = run {
         // Every message below names the repo. This function has TWO callers — updateApp (the APP
         // update, repo = app_github_repo) and getUpdateFileUrl (the EXTENSION update, repo = that
@@ -500,12 +612,46 @@ object AppUpdater {
         val (user, repo) = githubRegex.find(updateUrl)?.destructured
             ?: throw Exception("Invalid Github URL: $updateUrl")
         val url = "https://api.github.com/repos/$user/$repo/releases/latest"
-        val request = Request.Builder().url(url).build()
+        // ⚠⚠ THE STATUS IS CHECKED BEFORE THE BODY IS DESERIALISED. IT WAS NOT, FOR FOUR
+        // MONTHS, AND THAT IS THE WHOLE BUG: the old body read `it.body.string().toData<...>()`
+        // unconditionally, so 403 rate-limit, 403 refusal, 404 no-releases, 404 repo-gone, 401 and
+        // every 5xx collapsed into ONE MissingFieldException naming three absent fields. The error
+        // was muted in May and rose to 8 events on build 1106 alone; three unrelated repos failed
+        // identically within one second, which is what proved the REQUESTS were failing rather than
+        // the repos having lost their releases.
+        val cacheKey = "$user/$repo"
+        val cached = context?.getFromCache<CachedRelease>(cacheKey, GITHUB_RELEASE_CACHE, true)
+        val request = Request.Builder().url(url)
+            .apply { cached?.let { header("If-None-Match", it.etag) } }
+            .build()
         val res = runCatching {
-            client.newCall(request).await().use {
-                it.body.string().toData<GithubReleaseResponse>()
-            }.getOrThrow()
+            client.newCall(request).await().use { response ->
+                when {
+                    // 304 carries NO BODY - the cached copy is the answer, and this request cost
+                    // nothing against the hourly limit.
+                    response.code == 304 -> cached?.response ?: throw Exception(
+                        "GitHub returned 304 for $user/$repo with no cached release"
+                    )
+
+                    response.isSuccessful -> response.body.string()
+                        .toData<GithubReleaseResponse>().getOrThrow()
+                        .also { parsed ->
+                            response.header("ETag")?.let { tag ->
+                                context?.saveToCache(
+                                    cacheKey, CachedRelease(tag, parsed), GITHUB_RELEASE_CACHE, true
+                                )
+                            }
+                        }
+
+                    else -> throw githubHttpError(user, repo, response)
+                }
+            }
         }.getOrElse {
+            // ⚠️ A RATE LIMIT IS RETHROWN UNWRAPPED, DELIBERATELY. The wrapper below exists to
+            // attribute a failure to a REPO, and a rate limit is not about the repo - it is about the
+            // IP, and the next repo would fail identically. Wrapping it would also make the
+            // pass-level test depend on the chain walk surviving one more layer than necessary.
+            if (it is GithubRateLimitException) throw it
             throw Exception("Failed to fetch latest release for $user/$repo", it)
         }
         // ⚠️ STRING INEQUALITY, AND IT MUST STAY THAT WAY — THIS FUNCTION IS SHARED BY THREE CALLERS WITH
@@ -636,7 +782,9 @@ object AppUpdater {
     suspend fun getUpdateFileUrl(
         currentVersion: String,
         updateUrl: String,
-        client: OkHttpClient
+        client: OkHttpClient,
+        // Passed through purely to enable the ETag cache; see getGithubUpdateUrl.
+        context: Context? = null,
     ) = runIOCatching {
         if (updateUrl.isEmpty()) return@runIOCatching null
         // Accept the api.github.com/repos/ form directly; normalize a github.com BROWSER url
@@ -652,7 +800,7 @@ object AppUpdater {
         // "nothing to download" (silent on auto-checks; a benign "no update available" only when
         // user-triggered), so an unsupported-host extension no longer emits a recurring "error
         // updating extension" via throwFlow.emit on every silent auto-check.
-        apiUrl?.let { getGithubUpdateUrl(currentVersion, it, client) }
+        apiUrl?.let { getGithubUpdateUrl(currentVersion, it, client, context) }
     }
 
     private suspend fun <T> runIOCatching(

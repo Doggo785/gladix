@@ -87,6 +87,10 @@ class PlayerEventListener(
     // Live PlayerState.activeLoadCount (>0 ⇒ a stream resolution is in flight). Wired from
     // PlayerService where PlayerState is in scope; this listener is not given PlayerState directly.
     private val activeLoadCount: () -> Int = { 0 },
+    // Live PlayerState.loadEpisodeStartMs (epoch ms of the 0 -> 1 edge, 0 when nothing is
+    // outstanding). Wired from PlayerService alongside activeLoadCount. PROBE - remove with
+    // stuck_detail's loadAge field.
+    private val loadEpisodeStartMs: () -> Long = { 0L },
     // Invoked when the timeline becomes non-empty (a queue was applied, from any source) — the success
     // clear for PlayerState.resumptionApplying. Fires on the app looper (Main), preserving that invariant.
     private val onQueueApplied: () -> Unit = {},
@@ -974,6 +978,46 @@ class PlayerEventListener(
      * What was true when media3's StuckPlayerDetector gave up. Read alongside probeDetail's fields, which
      * are appended verbatim.
      *
+     * ⚠⚠ [2026-09-16] FIRST POPULATED REPORT. THE FINDING IS A CONTRADICTION INSIDE THE
+     * FIELD SET, AND IT LEADS BECAUSE EVERYTHING ELSE BELOW IS NOW SETTLED CONTEXT FOR IT:
+     *   type=buffering-no-progress to=60000 wd=live pwr=true state=1 items=3132 next=yes
+     *   bufAhead=0 totalBuf=0 loads=1 graceAge=101900 wdRetries=0 errRetries=0
+     *   dur=? opens=0 bytes=0
+     * READ: RESOLVE_GRACE_MS is 25_000, so at graceAge=101900 the resolve-in-flight suppression
+     * gate at armBufferingWatchdog (`activeLoadCount() > 0 && graceAge < RESOLVE_GRACE_MS`) was
+     * FALSE. The body should have fallen through to the retry branch, which sets
+     * retriedWatchdogCount = 1. With BUFFERING_WATCHDOG_MS at 5_000 and 102s of grace age that
+     * should have happened about fifteen times over. wdRetries=0 says it never happened ONCE.
+     * Two candidates, NEITHER SEPARABLE FROM THIS FIELD SET:
+     *   (a) A PLAYLIST_CHANGED DURING THE STALL. READ: onTimelineChanged resets retriedMediaId and
+     *       retriedWatchdogCount to 0 on TIMELINE_CHANGE_REASON_PLAYLIST_CHANGED and cancels the
+     *       watchdog, WHILE resolveGraceStart keeps running - it is rekeyed on the current mediaId
+     *       CHANGING, not on the timeline. That asymmetry produces exactly wdRetries=0 beside a
+     *       large graceAge. INFERRED: that it actually fired here. items=3132 makes a queue rebuild
+     *       plausible and nothing in the field set records one.
+     *   (b) THE BODY WAS STARVED - the watchdog's `withContext(Dispatchers.Main)` never ran, so the
+     *       Job stayed active (wd=live) with its body unexecuted. WEAKENED BUT NOT KILLED: the
+     *       detector itself fires on the main looper and did fire, so the thread was alive.
+     * WHAT WOULD SEPARATE THEM: a PLAYLIST_CHANGED count, or the age of the last watchdog arm.
+     * Neither exists yet - do not add both blind, pick after reading loadAge on the next report.
+     *
+     * ⚠️ AND state=1 (STATE_IDLE) IS NOT A CLUE - DO NOT SPEND A ROUND ON IT. Any playback
+     * error transitions ExoPlayer to STATE_IDLE and StuckPlayerException arrives through the error
+     * path, so the state has already moved by the time this samples. pwr=true also means
+     * ShufflePlayer.getPlaybackState's fake-READY masking (IDLE && items>0 && !playWhenReady) did
+     * not apply, so this is the real state. (The error -> IDLE transition is INFERRED from media3's
+     * documented behaviour, not re-read from ExoPlayerImpl for this report.)
+     *
+     * ⚠️ THE 60s THRESHOLD AND graceAge=102s ARE NOT IN CONFLICT, and the reconciliation an
+     * older record asked for is DONE, NOT OPEN: PlayerService sets
+     * setStuckBufferingDetectionTimeoutMs(60_000) with the reasoning at that call site - 60s was
+     * chosen to clear BOTH RESOLVE_GRACE_MS (25_000) and StreamableLoader's withTimeout(30_000), so
+     * a 30s threshold would race two error paths onto one item. The two numbers measure DIFFERENT
+     * THINGS FROM DIFFERENT ORIGINS: graceAge is time-since-this-item-became-current, while the
+     * detector counts time-since-buffered-position-last-changed AND RESTARTS ITS CLOCK on any change
+     * of period uid or buffered position. An item can be current for 102s and have last progressed
+     * 60s ago. Anything that still reads "600s -> ~30s proposed, not built" is stale.
+     *
      * ⚠️ STATE THE EXPECTED VALUES BEFORE READING THE FIRST REPORT, or the numbers are data rather than
      * evidence. The question this exists to settle is WHY OUR OWN 5s WATCHDOG DID NOT ACT — both
      * 2026-09-05 reports were 600s of unchanged buffered position, and BUFFERING_WATCHDOG_MS is 5_000,
@@ -986,6 +1030,17 @@ class PlayerEventListener(
      *   wd=live pwr=true   -> the watchdog WAS running and did not fix it. Arming is fine; the fault is
      *                         inside the watchdog body — most likely the resolve-in-flight re-arm at
      *                         armBufferingWatchdog, in which case loads>0 will corroborate.
+     *                         ⚠⚠ THIS BRANCH WAS SELECTED [2026-09-16], WITH ITS OWN STATED
+     *                         CORROBORATION: wd=live AND loads=1. The prediction above was written
+     *                         before any report existed and picked both the branch and its secondary
+     *                         signal, so read it as settled rather than as an open question.
+     *                         WHAT IT RULES OUT: (i) ARMING - no arm site failed, and the
+     *                         BUFFERING -> BUFFERING non-event at onPlayWhenReadyChanged is not the
+     *                         mechanism; (ii) THE END-OF-QUEUE BRANCH, twice over - next=yes and
+     *                         items=3132, where BOTH September reports had one-item timelines;
+     *                         (iii) the model itself - pwr=true, so the "impossible" branch did not
+     *                         appear. The live fault is in the BODY; see the contradiction at the
+     *                         top of this block for where it now sits.
      *   pwr=false          -> IMPOSSIBLE as written, and its appearance falsifies the model rather than
      *                         the code: StuckBufferingDetector.update (media3 1.11.0) requires
      *                         playWhenReady before it will count at all. Seeing it means the flag changed
@@ -993,6 +1048,31 @@ class PlayerEventListener(
      * `next` is the other half of the pair: both reports had a ONE-ITEM timeline, and next=no is the
      * input that makes the watchdog's end-of-queue branch reachable. next=yes with wd=null would rule
      * that branch out entirely.
+     *
+     * ⚠⚠ loadAge - ADDED 2026-09-16 BECAUSE `loads` ALONE CANNOT DECIDE ANYTHING. loads=1
+     * says a resolve is outstanding and says NOTHING about how long, so it is equally consistent with
+     * "the loader's withTimeout(30_000) has not had a chance yet" and "the timeout should have fired
+     * and did not" - OPPOSITE CONCLUSIONS FROM THE SAME OUTPUT, which is what stopped the first
+     * populated report from being decisive. loadAge is ms since PlayerState.loadEpisodeStartMs, the
+     * 0 -> 1 edge of activeLoadCount, and -1 when nothing is outstanding.
+     * STATED BEFORE THE FIRST READING, so the next report is evidence rather than data:
+     *   loadAge=-1 with loads=0    -> nothing outstanding; the stall is NOT in resolution and the
+     *                                 whole resolve line is the wrong place to look.
+     *   loadAge < 30000            -> A LATE-STARTED LOAD. The timeout is FINE and simply has not
+     *                                 expired; the fault is that a new resolve began this late into
+     *                                 the stall, which points back at the watchdog contradiction
+     *                                 above rather than at StreamableLoader.
+     *   loadAge > 30000            -> THE TIMEOUT DID NOT FIRE, AND THAT IS A DEFECT IN OUR CODE.
+     *                                 withTimeout is COOPERATIVE - it throws only at a suspension
+     *                                 point - so a resolve blocking without one holds past 30s with
+     *                                 the cancellation pending. Note the count itself already proves
+     *                                 the timeout had not fired at sample time: StreamableMediaSource
+     *                                 wraps the call in runCatching, which catches Throwable
+     *                                 including TimeoutCancellationException, and its finally
+     *                                 decrements - so loads could not still read 1 afterwards.
+     *   loadAge > 60000            -> the same defect, and it alone explains the whole stall.
+     * loadAge dates the EPISODE, not one load - see PlayerState.loadEpisodeStartMs for why, and for
+     * the over-reporting direction that choice deliberately accepts.
      *
      * Raw numbers are fine here — this string feeds a Crashlytics key, not report()'s dedupe signature.
      */
@@ -1013,6 +1093,7 @@ class PlayerEventListener(
             "items=${player.mediaItemCount} next=${if (player.hasNextMediaItem()) "yes" else "no"} " +
             "bufAhead=${player.bufferedPosition - player.currentPosition} " +
             "totalBuf=${player.totalBufferedDuration} loads=${activeLoadCount()} " +
+            "loadAge=${loadEpisodeStartMs().let { if (it == 0L) -1L else System.currentTimeMillis() - it }} " +
             "graceAge=$graceAge wdRetries=$retriedWatchdogCount errRetries=$currentRetries " +
             probeDetail()
     }

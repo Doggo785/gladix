@@ -73,7 +73,9 @@ class StreamableMediaSource(
         Log.d("GladixPlayback", "prepareSourceInternal: ${mediaItem.mediaId} \"${mediaItem.mediaMetadata.title}\"")
         val handler = Util.createHandlerForCurrentLooper()
         loadJob = scope.launch {
-            state.activeLoadCount.incrementAndGet()
+            // 0 -> 1 edge only - see PlayerState.loadEpisodeStartMs for why not every increment.
+            if (state.activeLoadCount.incrementAndGet() == 1)
+                state.loadEpisodeStartMs.set(System.currentTimeMillis())
             try {
                 var (new, serv) = runCatching { loader.load(mediaItem) }.getOrElse {
                     error = it
@@ -128,7 +130,8 @@ class StreamableMediaSource(
                     }
                 }
             } finally {
-                state.activeLoadCount.decrementAndGet()
+                if (state.activeLoadCount.decrementAndGet() == 0)
+                    state.loadEpisodeStartMs.set(0L)
             }
         }
     }

@@ -26,6 +26,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -46,7 +47,42 @@ data class App(
     // hanging the caller that produced it. Nothing depends on the back-pressure: both subscribers are
     // fire-and-forget (Crashlytics record, snackbar) and getOrThrow discards the result either way.
     // Do not remove the buffer to "not lose reports" — losing a report is the trade being made.
+    // ⚠⚠ TWO SUBSCRIBERS, AND THEY DO NOT BEHAVE THE SAME - NEITHER CALL SITE SHOWS THIS, and
+    // it is why a Crashlytics count and what a user actually saw can differ:
+    //   App.init (just below)                 UNGATED - runs on App.scope, always collecting, so
+    //                                         EVERY emission becomes a Crashlytics non-fatal.
+    //   MainActivity.setupExceptionHandler    LIFECYCLE-GATED - ContextUtils.observe is
+    //                                         flowWithLifecycle(lifecycle), i.e. STARTED, so the
+    //                                         snackbar only appears while the Activity is started.
+    // ⚠️ AND THE BUFFER DOES NOT CLOSE THAT GAP. replay = 0: extraBufferCapacity stops emit
+    // SUSPENDING for a SLOW collector; it does NOT hold values for an ABSENT one. An emission while the
+    // Activity is stopped is recorded and never seen.
+    // ⚠️ SO A COUNT ON A CRASHLYTICS ISSUE IS AN UPPER BOUND ON WHAT THE USER SAW, NOT A MATCH.
+    // Do not read "8 events" as "8 snackbars" when reasoning about someone's experience.
     val throwFlow = MutableSharedFlow<Throwable>(
+        extraBufferCapacity = 64, onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+
+    /**
+     * Record-only sibling of [throwFlow]: reaches Crashlytics, NEVER the screen.
+     *
+     * ⚠⚠ IT EXISTS BECAUSE "REPORT IT BUT DO NOT INTERRUPT" IS UNEXPRESSIBLE ON ONE FLOW. Both
+     * of throwFlow's subscribers read the same emissions, so suppressing the snackbar by skipping the
+     * emit ALSO suppresses the report - which is how a rising signal becomes invisible. (That is not
+     * hypothetical: the extension-update MissingFieldException was muted in May precisely because it
+     * was too noisy, and the noise and the signal were the same emission.)
+     *
+     * ⚠️ IT IS COLLECTED BY MERGING INTO App.init's EXISTING COLLECTOR, not by a second
+     * recordException call site, DELIBERATELY. That collector sets six CrashKeys plus
+     * onReportRecorded(); a parallel call site would have to duplicate all of them and would drift -
+     * see the note at HealthMonitor's recordException, which is the OTHER site and already has to be
+     * kept in step by hand.
+     *
+     * USE IT FOR: a failure the user did not ask about and cannot act on (a background update check).
+     * DO NOT use it for anything the user is waiting on, or for anything that follows a progress
+     * message already shown - silence there reads as a hang.
+     */
+    val silentThrowFlow = MutableSharedFlow<Throwable>(
         extraBufferCapacity = 64, onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
 
@@ -181,7 +217,8 @@ data class App(
 
     init {
         scope.launch {
-            throwFlow.collectLatest {
+            // merge, so silentThrowFlow gets the SAME key-setting and recordException as throwFlow.
+            merge(throwFlow, silentThrowFlow).collectLatest {
                 it.printStackTrace()
                 // BuildConfig.HAS_FIREBASE is a compile-time boolean (no Firebase type referenced),
                 // so in no-json builds this branch is dead and FirebaseCrashlytics is never loaded.

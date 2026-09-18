@@ -85,6 +85,13 @@ object ResumptionUtils {
      * Introduced by 92af04f5 (2026-07-26), whose own comment says "toSlim dropping streamables/extras/
      * nested" — the loss was stated and never traced. de6d344b (2026-08-10) only re-routed the surviving
      * copy and is innocent.
+     * ⚠️ [CLARIFIED 2026-09-16] READ "THE LOSS" ABOVE AS THE `extras` HALF ONLY. That sentence is
+     * about the extension stamp and is correct for it. It has ALREADY misled one reading into treating the
+     * dropped `streamables` as an untraced loss too, and they are not: dropping them is DELIBERATE (a
+     * CursorWindow crash at row 53, plus a cold-start crash for three users - see the note at
+     * HistoryEntity.toSlim), and the contract is that each extension repopulates them in loadTrack. A
+     * `streamables` problem is therefore a loadTrack problem in ONE extension, and never a reason to
+     * change toSlim. OfflineExtension was the violator; fixed 2026-09-16.
      *
      * WHAT THE MISSING STAMP BROKE: UnifiedExtension resolves a sub-extension from `track.extras`, so a
      * restored track threw ExtensionNotFoundException(null) in radio() (the reported non-fatal, via

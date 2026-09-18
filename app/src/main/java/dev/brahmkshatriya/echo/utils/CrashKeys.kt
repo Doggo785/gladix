@@ -292,6 +292,17 @@ object CrashKeys {
      * takes the app branch and the extension branch as an if/else, never both in one pass.
      * First used this way on a build 1100 report (resultCode=1, status=-22); the comment at
      * installApp that claimed the app path could never reach its throw was falsified by it.
+     * ⚠⚠ [2026-09-17] ANOTHER WAY THIS PATH PRODUCES NOTHING WITH NOTHING WRONG: A GITHUB
+     * RATE LIMIT. api.github.com allows 60 requests/hour/IP unauthenticated, and one update pass
+     * spends 1 (the app check) + 1 per installed extension. A rate-limited user gets NO APP UPDATES
+     * either, and it presents as app_update_gate_passed = true with THIS KEY ABSENT - the run never
+     * reaches "offered", because getGithubUpdateUrl failed before a release could be resolved.
+     * That is the SAME OBSERVABLE as the normal "no update was on offer" state documented above, so
+     * the absence of this key does NOT distinguish them. Read it alongside any
+     * GithubRateLimitException in the same session.
+     * ⚠️ The app check runs FIRST in the pass (ExtensionsViewModel.update calls updateApp
+     * before the extension loop), so it usually gets the first draw from whatever quota remains -
+     * but that is ORDERING, NOT PROTECTION. A pass that starts already exhausted fails it too.
      * "downloaded" as the last value means the step between download and installer failed — which for
      * builds 1072-1078 was the unzip branch running on a plain release APK (fixed 2026-09-05). Without
      * this key that failure was only distinguishable by hunting for a companion non-fatal.

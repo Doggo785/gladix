@@ -40,6 +40,21 @@ data class HistoryEntity(
 // because the radio work depends on them, and is the single source of truth for that. So the precedent is
 // PRESERVE WHAT MATTERS, not empty the map; there is no argument that wholesale stripping is required.
 // Before adding a fourth consumer of an extras key, ask whether the track could have come through here.
+// ⚠⚠ DROPPING `streamables` HERE IS DELIBERATE AND LOAD-BEARING. DO NOT PUT THEM BACK.
+// July 2026: History was storing a full serialized Track + context JSON (covers, artists, album
+// objects, streamables, tokens, extras) when it needs a fraction of that, and the bulk blew the
+// CursorWindow - a crash at row 53. The same slimming fixed a cold-start crash for three users.
+// `encodeDefaults` is unset (defaults false), CONFIRMED at the time, so the now-default-valued
+// streamables do not serialize at all. Empty streamables in a persisted queue is the INTENDED,
+// VERIFIED design, not a loss.
+// ⚠️ THE OTHER HALF OF THE CONTRACT IS loadTrack, AND THAT IS WHERE BUGS FROM THIS LIVE.
+// Each extension is expected to repopulate streamables in loadTrack (Deezer rebuilds them from
+// track.extras["TRACK_TOKEN"]; network extensions get them back by re-fetching). An extension
+// whose loadTrack does not is in VIOLATION, and the symptom lands far from here - as a
+// TrackUnavailableException out of StreamableLoader.loadServer on a restored queue.
+// OfflineExtension.loadTrack was the identity function and did exactly that; see the note there.
+// So: a "no playable source" report on a restored queue is a question about that extension's
+// loadTrack. It is NOT a reason to revisit this line.
 fun Track.toSlim(): Track = copy(
     streamables = emptyList(),
     extras = emptyMap(),

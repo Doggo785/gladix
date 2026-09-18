@@ -151,6 +151,12 @@ class OfflineExtension(
     private suspend fun find(playlist: Playlist) =
         getLibrary().playlistList.find { it.id == playlist.id.toLong() }
 
+    // String compare, not toLong(): Track.id is the MediaStore _id rendered as a String at
+    // MediaStoreUtils' Track construction (`id = id.toString()`), and a persisted queue round-trips
+    // that String. Matching on it avoids a parse that could silently miss on anything non-numeric.
+    private suspend fun find(track: Track) =
+        getLibrary().songList.find { it.id == track.id }
+
     // The MediaStore ids resolved by find() can come from PERSISTED items (restored queue, history, saved
     // playlists) captured before a library re-scan, so a lookup can legitimately miss (the album/artist/
     // playlist was removed or re-indexed). UI load paths surface that miss as this readable exception instead
@@ -208,7 +214,86 @@ class OfflineExtension(
         )
     }
 
-    override suspend fun loadTrack(track: Track, isDownload: Boolean): Track = track
+    /**
+     * ⚠⚠ RE-RESOLVES FROM MEDIASTORE BECAUSE OF A CONTRACT EVERY OTHER EXTENSION ALREADY
+     * HONOURS, AND THIS ONE DID NOT. THE BODY WAS `= track`, THE IDENTITY FUNCTION.
+     *
+     * THE CONTRACT: a persisted queue stores `Track.toSlim()`, which sets `streamables = emptyList()`.
+     * loadTrack is where an extension puts them back. Deezer does it by rebuilding streamables from
+     * `track.extras["TRACK_TOKEN"]`; every network extension does it implicitly by re-fetching. This
+     * one returned its input unchanged, so a slim track stayed slim.
+     *
+     * ⚠️ DO NOT "FIX" THIS AT toSlim BY PUTTING streamables BACK - SEE THE NOTE THERE. The
+     * dropping is DELIBERATE and load-bearing: it was the July 2026 fix for a CursorWindow crash at
+     * row 53, and the same slimming fixed a cold-start crash for three users. Restoring the bulk
+     * reintroduces two crashes to repair one extension.
+     *
+     * WHAT IT LOOKED LIKE: `TrackUnavailableException` from StreamableLoader.loadServer on a cold
+     * start restoring an offline queue (echo-offline, 19 items, ~4MB heap - a process that had done
+     * nothing else). Chain: slim track -> Cached.loadMedia(preferCache = true) MISSES (fresh process,
+     * empty media cache) -> falls through to this function -> slim track returned -> `servers` empty
+     * -> selectServerIndex returns -1 -> `servers.getOrNull(-1)` is null -> throw. The cache hit is
+     * why it is intermittent rather than constant.
+     *
+     * ⚠️ `?: track` RATHER THAN `?: notInLibrary("track", ...)`, DELIBERATELY. The other find()
+     * callers throw on a miss, and doing that here would ALSO convert every dangling MediaStore id
+     * (file moved, deleted, SD card unmounted) from its current failure into a readable throw. That
+     * may well be the better behaviour, but IT IS A SEPARATE DECISION AND MUST NOT ARRIVE AS A SIDE
+     * EFFECT OF THIS ONE - it is parked, deliberately, not overlooked. Falling back to the input
+     * leaves all four cases where they are today except the one being fixed:
+     *   slim + in library   -> streamables restored (THE FIX)
+     *   slim + dangling id  -> input returned; surfaces as "no playable source" at loadServer
+     *   full + in library   -> unchanged
+     *   full + dangling id  -> input returned; still fails at FileDataSource open, exactly as today
+     * Note this function does NOT stat the file and never has, so a missing file cannot be detected
+     * here anyway - only a missing LIBRARY ENTRY can.
+     *
+     * ⚠⚠ WHY REPOPULATING streamables HERE IS SUFFICIENT AND NOT INERT - the non-obvious half,
+     * and unreadable from this function alone. MediaItemUtils.build bakes
+     * `serverIndex = selectServerIndex(...)` into the item at RESTORE time, and for a slim track that
+     * returns -1 (PlayerService.selectServerIndex: empty streamables and no downloads -> -1; it returns
+     * a VALUE, it does not throw, which is also why a slim track builds fine and the restore count does
+     * not drop it). If that -1 stuck, putting streamables back here would change nothing and loadServer
+     * would still do `getOrNull(-1)`.
+     * IT DOES NOT STICK: `toMetaData`'s `serverIndex` is a PARAMETER defaulting to null, NOT a read of
+     * the existing bundle, and MediaItemUtils.buildLoaded calls it without passing one - so the index is
+     * RECOMPUTED against the streamables this function just restored. StreamableLoader.load then calls
+     * loadServer on that rebuilt item, not the original. Check this before assuming any other
+     * loadTrack-side repopulation takes effect.
+     *
+     * ⚠⚠ THE runCatching IS LOAD-BEARING AND IS NOT DEFENSIVE PADDING - `?: track` ALONE DOES NOT
+     * DELIVER THE "ZERO BEHAVIOUR CHANGE" THIS FIX WAS ARGUED ON. `?: track` catches a MISS. It never
+     * catches a FAILURE, and those are different things here: getLibrary() does not return null when the
+     * scan fails, it PROPAGATES getAllSongs' throw - and `_library` stays null, so every subsequent call
+     * retries the failing scan rather than settling. The old body was `= track`, the identity function,
+     * which CANNOT throw; without this wrap the fix would convert a library-load failure into a playback
+     * error on the very path it exists to repair (the cold restore - a UI-initiated play is safe, since
+     * the user seeing the track means _library is already populated).
+     * ⚠️ AND THAT FAILURE IS OBSERVED, NOT HYPOTHETICAL. July 2026: MediaStoreUtils.createPlaylist's
+     * "Failed to build unique file" for the Liked playlist ABORTED THE ENTIRE OFFLINE LIBRARY LOAD. That
+     * site was hardened with its own runCatching, but it is the SHAPE that matters here - a single
+     * MediaProvider fault anywhere in getAllSongs takes the whole scan down, and this function is now
+     * downstream of it.
+     *
+     * ⚠⚠ KNOWN CONSEQUENCE, ACCEPTED RATHER THAN OPEN: THIS MOVED A ONE-TIME MEDIASTORE SCAN ONTO
+     * THE PLAYBACK PATH. loadTrack previously touched nothing. getLibrary() memoizes behind a Mutex, so
+     * there is NO per-track scan and the songList lookup is a microsecond-scale linear walk (no song map
+     * exists; artistMap is keyed but songs are not - correctly not worth indexing). But on a COLD
+     * HEADLESS RESTORE of an Offline queue - resume with no UI opened, Android Auto - the FIRST track's
+     * loadTrack is now what pays for the full getAllSongs scan, which walks every audio row and does a
+     * contentResolver.openInputStream(uri)!!.close() album-art probe per entry. Previously that cost was
+     * paid when the Library tab was opened.
+     * ⚠️ IT LANDS INSIDE THE BUFFERING WINDOW, WHERE TWO TIMERS ARE ARMED: PlayerEventListener's 5s
+     * BUFFERING_WATCHDOG_MS (suppressed only while activeLoadCount > 0 AND within RESOLVE_GRACE_MS =
+     * 25_000) and media3's 60s stuck-buffering detector.
+     * ⚠️ UNMEASURED - no timing has been taken on a large library, so this is a named risk, not a
+     * known defect. IF A COLD-START OFFLINE STALL IS EVER REPORTED, THIS IS THE FIRST CANDIDATE, and the
+     * alternative is PRE-WARMING the library at service start so the scan happens outside the buffering
+     * window. Written down because that stall would otherwise have to be re-derived from scratch, and a
+     * whole session has already gone into one stall nobody could explain.
+     */
+    override suspend fun loadTrack(track: Track, isDownload: Boolean): Track =
+        runCatching { find(track) }.getOrNull() ?: track
 
     override suspend fun loadStreamableMedia(streamable: Streamable, isDownload: Boolean) =
         Uri.fromFile(File(streamable.id)).toString().toSource(isLive = false).toMedia()

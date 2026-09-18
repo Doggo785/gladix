@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import java.util.Collections
 import java.util.LinkedHashMap
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 data class PlayerState(
     val current: MutableStateFlow<Current?> = MutableStateFlow(null),
@@ -24,6 +25,21 @@ data class PlayerState(
         Collections.synchronizedMap(LinkedHashMap())
     val serverChanged = MutableSharedFlow<Unit>(replay = 1)
     val activeLoadCount = AtomicInteger(0)
+
+    // PROBE (2026-09-16) - epoch ms at which activeLoadCount last rose from 0, or 0 when nothing is
+    // outstanding. Feeds stuck_detail's `loadAge`; see the field's note at
+    // PlayerEventListener.stuckDetail for what a reading means. REMOVE WITH THAT FIELD.
+    // ⚠️ IT DATES THE LOAD EPISODE, NOT AN INDIVIDUAL LOAD, and that distinction is the whole
+    // reason it is written on the 0 -> 1 EDGE rather than on every increment. Concurrent loads exist
+    // (a preload of the next item overlaps the current one), so a per-increment write would report the
+    // YOUNGEST outstanding load and could hide an old one behind a new one - the exact failure the
+    // field is built to expose. On the edge it answers "the player has had at least one load
+    // outstanding CONTINUOUSLY for this long", which is the quantity a hang question turns on.
+    // Residual, stated rather than hidden: across 1 -> 2 -> 1 the timestamp still dates the episode,
+    // so it OVER-reports the age of the load actually outstanding. That direction is deliberate - it
+    // can send someone looking for a defect that is not there, which is recoverable, where
+    // under-reporting would dismiss one that is.
+    val loadEpisodeStartMs = AtomicLong(0L)
 
     // Single cold-start restore: the queue is read from disk ONCE at service creation
     // (PlayerService.onCreate) into this Deferred, and shared by every consumer — so no path runs its own

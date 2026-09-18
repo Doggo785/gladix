@@ -32,6 +32,7 @@ import android.util.Log
 import androidx.lifecycle.withResumed
 import androidx.appcompat.content.res.AppCompatResources
 import androidx.core.content.res.ResourcesCompat
+import androidx.core.graphics.ColorUtils
 import androidx.core.graphics.drawable.toBitmap
 import androidx.core.net.toUri
 import androidx.core.view.doOnLayout
@@ -1243,8 +1244,11 @@ class PlayerFragment : Fragment() {
                 // the answer if the tinting is ever missed.
                 //
                 // ⚠️ SCOPE: THIS ROW ONLY. PlayerColors.accent is untouched and still tints the
-                // blurred background, the codec pill, the heart when checked, the playing indicator, the
-                // collapsed mini-player, MainActivity's system chrome and TV's root background.
+                // blurred background, the heart when checked, the playing indicator, the collapsed
+                // mini-player, MainActivity's system chrome and TV's root background.
+                // [CORRECTED 2026-09-17] THIS LIST USED TO INCLUDE "the codec pill". IT NEVER TOOK
+                // ACCENT - it took PlayerColors.background, as the note at trackSubtitle below has
+                // always said. The two comments contradicted each other; this one was wrong.
                 val seekNeutral = ContextCompat.getColor(requireContext(), R.color.amoled_fg)
                 seekWaveBar.setIndicatorColor(seekNeutral)
                 // The heart is the one control here that shows a persistent CHOICE, so it gets the
@@ -1254,10 +1258,32 @@ class PlayerFragment : Fragment() {
                     arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
                     intArrayOf(colors.accent, colors.onBackground)
                 )
-                // Pill takes `background`, NOT accent: it sits between the two timestamps and must read
-                // as a container behind them rather than competing with them.
-                trackSubtitle.backgroundTintList = ColorStateList.valueOf(colors.background)
-                trackSubtitle.setTextColor(colors.onBackground)
+                // ⚠⚠ THE PILL IS NEUTRAL, NOT ARTWORK-TINTED, AND BOTH HALVES COME FROM THE SAME
+                // TOKEN AS THE WAVE AND THUMB. It used to take PlayerColors.background with
+                // onBackground text - correct while the wave and thumb were artwork-tinted too, and
+                // wrong the moment they went neutral, because it left the pill as the ONLY coloured
+                // element in the seek row. It is also the least important thing in that row (a
+                // secondary affordance opening QualitySelectionBottomSheet), so it was pulling the
+                // most attention for the least reason. Softening the artwork colour would have left
+                // it the odd one out, only quieter; making it neutral answers the actual complaint.
+                //
+                // ⚠⚠ 0x1F IS 12%, AND 0x33 (20%) IS THE CEILING. THE REASON IS NOT TASTE -
+                // THE FILL AND THE TEXT ARE NOW THE SAME TOKEN, so raising the alpha moves the
+                // backdrop TOWARD the text colour and CONTRAST FALLS AS ALPHA RISES. That is the
+                // opposite of the usual intuition ("more opaque = more readable"), which is exactly
+                // how someone would discover it by making it worse. Written down so nobody has to.
+                // ⚠️ AND IT IS THE ONE NUMBER HERE THAT NEEDS A LOOK ON DEVICE RATHER THAN A
+                // DERIVATION: this is a scrim, so its apparent strength depends on the dimmed blurred
+                // cover behind it - 12% over a busy bright cover reads differently than over a flat
+                // dark one. If it reads too faint, 0x33 and stop.
+                // ⚠️ WHAT THIS BUYS BESIDES THE LOOK: the Palette coupling is gone. The old
+                // pairing was onBackground = bgSwatch.bodyTextColor, a contrast Palette computes
+                // AGAINST bgSwatch.rgb - so any change to the fill silently invalidated the
+                // guarantee, and how badly depended on the artwork. Two fixed tokens cannot drift,
+                // per device or per track.
+                val pillScrim = ColorUtils.setAlphaComponent(seekNeutral, 0x1F)
+                trackSubtitle.backgroundTintList = ColorStateList.valueOf(pillScrim)
+                trackSubtitle.setTextColor(seekNeutral)
                 // The thumb MUST match the wave: it reads as the LEADING EDGE of the played portion, and
                 // a coloured thumb over a neutral track is not a pattern any shipping player uses.
                 seekBar.thumbTintList = ColorStateList.valueOf(seekNeutral)

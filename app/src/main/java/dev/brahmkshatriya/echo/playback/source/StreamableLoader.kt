@@ -115,8 +115,24 @@ class StreamableLoader(
                 // feed a sub-extension rate-limit spiral). Throw the NON-retryable TrackUnavailableException so
                 // onPlayerError skips this track ONCE (the "not available" skip family), with no re-resolution,
                 // bounded by consecutiveUnavailableSkips — consistent with the 0-sources case just below.
-                val streamable = servers.getOrNull(index)
-                    ?: throw TrackUnavailableException("Server not found")
+                // ⚠⚠ TWO DIFFERENT FAULTS, SPLIT 2026-09-16 - THEY SHARED ONE STRING AND ONE OF
+                // THEM WAS BEING MISREAD BECAUSE OF IT. The old text was "Server not found", which is
+                // both WRONG for local playback (the Offline extension plays files; there is no server)
+                // and jargon for everyone else. The word is gone from both branches.
+                //   EMPTY         the track arrived carrying no playable sources at all. On a RESTORED
+                //                 queue this is the toSlim contract being violated by that extension's
+                //                 loadTrack - see the notes at HistoryEntity.toSlim and
+                //                 OfflineExtension.loadTrack. Investigate THAT, not this line.
+                //   OUT OF RANGE  the deterministic build-time index mismatch described above: the
+                //                 freshly loaded track exposes fewer servers than the index chosen at
+                //                 build time. Re-resolving can never fix it.
+                // Both stay TrackUnavailableException (non-retryable) - the split is the MESSAGE and the
+                // diagnosis, NOT the behaviour. Do not make either retryable without re-reading the
+                // burst/rate-limit reasoning above.
+                val streamable = servers.getOrNull(index) ?: throw TrackUnavailableException(
+                    if (servers.isEmpty()) "No playable source for this track"
+                    else "Playable source no longer available"
+                )
                 loadStreamableMedia(
                     app, it, mediaItem.track, streamable
                 ).getOrThrow() as Streamable.Media.Server
