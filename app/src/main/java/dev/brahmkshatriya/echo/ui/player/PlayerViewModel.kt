@@ -30,7 +30,9 @@ import dev.brahmkshatriya.echo.extensions.ExtensionUtils.getExtension
 import dev.brahmkshatriya.echo.extensions.ExtensionUtils.isClient
 import dev.brahmkshatriya.echo.extensions.MediaState
 import dev.brahmkshatriya.echo.playback.MediaItemUtils
+import dev.brahmkshatriya.echo.playback.MediaItemUtils.isPlayNext
 import dev.brahmkshatriya.echo.playback.MediaItemUtils.serverWithDownloads
+import dev.brahmkshatriya.echo.ui.feed.SwipeToQueue
 import dev.brahmkshatriya.echo.playback.MediaItemUtils.sourceIndex
 import dev.brahmkshatriya.echo.playback.MediaItemUtils.track
 import dev.brahmkshatriya.echo.playback.PlayerCommands.addToNextCommand
@@ -777,7 +779,12 @@ class PlayerViewModel(
         // announced by playback itself. Every other case confirms (unlike addToQueue, which always
         // confirms — queueing is never playback).
         if (!(browser.value?.mediaItemCount == 0 && item is Track)) app.messageFlow.emit(
-            Message(app.context.getString(R.string.adding_x_to_next, item.title))
+            Message(
+                app.context.getString(R.string.adding_x_to_next, item.title),
+                Message.Action(app.context.getString(R.string.undo)) {
+                    undoAddToNext(item)
+                }
+            )
         )
         withBrowser {
             it.sendCustomCommand(addToNextCommand, Bundle().apply {
@@ -786,6 +793,25 @@ class PlayerViewModel(
                 putBoolean("loaded", loaded)
             })
         }
+    }
+
+    // Undo for [addToNext] (swipe-to-queue snackbar and Play Next menu alike).
+    // Index math lives in SwipeToQueue.undoIndex (unit-tested); this only resolves
+    // the queue into id lists and removes what it returns.
+    // KNOWN LIMITATION: removes exactly one item. A menu-driven addToNext of an Album or
+    // Playlist inserts N tracks and undo leaves N-1 behind; likewise a rapid double-swipe
+    // of the same track collapses to one snackbar (SnackBarHandler dedupeKey) whose undo
+    // removes one copy. Single-remove is per spec for the swipe path; widening it to a
+    // contiguous isPlayNext run is a follow-up, not this change.
+    private fun undoAddToNext(item: EchoMediaItem) {
+        val index = SwipeToQueue.undoIndex(
+            mediaIds = queue.map { it.mediaId },
+            isPlayNext = queue.map { it.isPlayNext },
+            trackIds = queue.map { it.track?.id },
+            currentMediaId = playerState.current.value?.mediaItem?.mediaId,
+            targetTrackId = (item as? Track)?.id
+        ) ?: return
+        removeQueueItem(index)
     }
 
     val progress = MutableStateFlow(0L to 0L)
