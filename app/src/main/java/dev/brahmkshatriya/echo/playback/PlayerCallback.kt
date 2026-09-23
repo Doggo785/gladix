@@ -1042,7 +1042,8 @@ class PlayerCallback(
             playWhenReady = true
             addMediaItems(mediaItems)
         } else {
-            addMediaItems(currentMediaItemIndex + 1, mediaItems)
+            // LIFO front-insert — see UserBlock.playNextInsertIndex.
+            addMediaItems(UserBlock.playNextInsertIndex(currentMediaItemIndex), mediaItems)
         }
     }
 

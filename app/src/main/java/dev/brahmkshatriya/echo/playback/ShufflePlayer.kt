@@ -192,21 +192,14 @@ class ShufflePlayer(
 
     // Keeps `original` (the unshuffle reference) consistent with a timeline insert: unshuffled,
     // the item sits where the user put it instead of falling to the end of the restored order.
-    // Unshuffled, timeline == original (see the moveMediaItem sync note), so the same index applies
-    // directly. Shuffled, the anchor is the timeline predecessor mapped back via getItemAt; a missing
-    // anchor (index 0, stale index, dupe ambiguity) falls back to append.
+    // Position math lives in UserBlock.unshuffledInsertIndex (unit-tested); this only resolves the
+    // anchor — the timeline predecessor mapped back via getItemAt.
     private fun insertIntoOriginal(index: Int, mediaItems: List<MediaItem>) {
-        if (!isShuffled) {
-            original = original.toMutableList().apply {
-                addAll(index.coerceIn(0, size), mediaItems)
-            }
-            return
-        }
-        val anchor = if (index > 0) getItemAt(index - 1) else null
-        original = original.toMutableList().apply {
-            val at = anchor?.let { indexOf(it) }?.takeIf { it != -1 }
-            if (at == null) addAll(mediaItems) else addAll(at + 1, mediaItems)
-        }
+        val anchor = if (isShuffled && index > 0) {
+            getItemAt(index - 1)?.let { original.indexOf(it).takeIf { at -> at != -1 } }
+        } else null
+        val at = UserBlock.unshuffledInsertIndex(isShuffled, index, original.size, anchor)
+        original = original.toMutableList().apply { addAll(at, mediaItems) }
     }
 
     // Maps a timeline index to its `original` entry by mediaId. Returns null (not throwing) when the
@@ -284,7 +277,7 @@ class ShufflePlayer(
         // later inserts still anchor on block boundaries, but nothing re-sorts the user's hand order.
         val target = newIndex.coerceIn(0, mediaItemCount - 1)
         val moved = runCatching { player.getMediaItemAt(target) }.getOrNull()
-        if (moved != null && !moved.isUserQueued) {
+        if (moved != null && UserBlock.shouldPromoteOnMove(moved.isUserQueued)) {
             replaceMediaItem(target, moved.withUserQueued(USER_QUEUED_QUEUE))
         }
     }

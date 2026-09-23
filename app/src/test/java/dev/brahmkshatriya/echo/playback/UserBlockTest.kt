@@ -37,6 +37,83 @@ class UserBlockTest {
         assertEquals(3, UserBlock.queueInsertIndex(0, listOf(true, true)))
     }
 
+    // 1. Play Next LIFO: two taps land at current+1 both times, so the second plays first.
+    @Test
+    fun `play next taps stack lifo after current`() {
+        val order = mutableListOf("C")
+        var current = 0
+        // Tap A.
+        order.add(UserBlock.playNextInsertIndex(current), "A")
+        // Tap B.
+        order.add(UserBlock.playNextInsertIndex(current), "B")
+        assertEquals(listOf("C", "B", "A"), order)
+    }
+
+    // 2. Queue FIFO across a drag-interleaved block: Q3 lands after the last flagged item.
+    @Test
+    fun `queue fifo survives a drag-interleaved block`() {
+        // [C, Q1, R1, Q2, R2] as flags; a count would say 1+2=3 and split Q1/Q2.
+        val insert = UserBlock.queueInsertIndex(0, listOf(true, false, true, false))
+        assertEquals(4, insert)
+    }
+
+    @Test
+    fun `queue fifo appends successive adds in tap order`() {
+        val flags = mutableListOf<Boolean>()
+        val at1 = UserBlock.queueInsertIndex(0, flags)
+        flags.add(at1 - 1, true) // Q1 lands at 1.
+        val at2 = UserBlock.queueInsertIndex(0, flags)
+        flags.add(at2 - 1, true) // Q2 lands at 2.
+        assertEquals(1, at1)
+        assertEquals(2, at2)
+    }
+
+    // 3. Shuffle pin: only the identical current instance is excluded; a value-equal
+    // duplicate of it is an ordinary entry and must survive.
+    @Test
+    fun `partition excludes only the identical current instance`() {
+        data class Row(val id: String, val flagged: Boolean)
+
+        val current = Row("same", false)
+        val dupe = Row("same", false)
+        val items = listOf(current, dupe, Row("n", true))
+        val (head, pinned, rest) =
+            UserBlock.partition(items, { it === current }, { it.flagged })
+        assertEquals(current, head)
+        assertEquals(listOf("n"), pinned.map { it.id })
+        assertEquals(listOf("same"), rest.map { it.id })
+    }
+
+    // 4. Drag promotion: an unflagged moved item joins the block; a flagged one is untouched.
+    @Test
+    fun `drag promotes only unflagged items`() {
+        assertEquals(true, UserBlock.shouldPromoteOnMove(false))
+        assertEquals(false, UserBlock.shouldPromoteOnMove(true))
+    }
+
+    @Test
+    fun `promoted drag extends the block for the next queue add`() {
+        // [C, R] then R is dragged (promoted) -> [C, U]; next Queue add lands at 2.
+        val flags = mutableListOf(false)
+        if (UserBlock.shouldPromoteOnMove(flags[0])) flags[0] = true
+        assertEquals(2, UserBlock.queueInsertIndex(0, flags))
+    }
+
+    // 5. Unshuffle mirror: unshuffled applies the timeline index, shuffled follows the anchor.
+    @Test
+    fun `unshuffled insert applies timeline index clamped`() {
+        assertEquals(2, UserBlock.unshuffledInsertIndex(false, 2, 5, anchorOriginalIndex = 4))
+        assertEquals(5, UserBlock.unshuffledInsertIndex(false, 9, 5, anchorOriginalIndex = null))
+        assertEquals(0, UserBlock.unshuffledInsertIndex(false, -3, 5, anchorOriginalIndex = null))
+    }
+
+    @Test
+    fun `shuffled insert follows anchor or appends`() {
+        assertEquals(3, UserBlock.unshuffledInsertIndex(true, 7, 5, anchorOriginalIndex = 2))
+        assertEquals(5, UserBlock.unshuffledInsertIndex(true, 7, 5, anchorOriginalIndex = null))
+        assertEquals(5, UserBlock.unshuffledInsertIndex(true, 0, 5, anchorOriginalIndex = 99))
+    }
+
     // partition: current head, pinned in order, rest in order, duplicates distinct.
 
     @Test
