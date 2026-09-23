@@ -10,6 +10,7 @@ import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.ShuffleOrder
+import dev.brahmkshatriya.echo.playback.MediaItemUtils.isUserQueued
 
 @Suppress("unused")
 @OptIn(UnstableApi::class)
@@ -110,8 +111,19 @@ class ShufflePlayer(
     override fun setShuffleModeEnabled(enabled: Boolean) {
         if (enabled) original = getQueue()
         isShuffled = enabled
-        changeQueue(if (enabled) original.shuffled() else original)
+        changeQueue(if (enabled) original.withUserBlockPinned() else original)
         player.shuffleModeEnabled = enabled
+    }
+
+    // Session user block (Play Next + Queue) stays pinned right after the current track when
+    // shuffling; only generated radio/context items are shuffled (Spotify model). Referential
+    // equality (`!= current`) keeps duplicates intact — at most the playing instance is excluded.
+    // changeQueue() still pulls current to physical index 0, so the pinned block lands at 1..n.
+    private fun List<MediaItem>.withUserBlockPinned(): List<MediaItem> {
+        val current = currentMediaItem
+        val userOrdered = filter { it.isUserQueued && it != current }
+        val rest = filter { !it.isUserQueued && it != current }.shuffled()
+        return listOfNotNull(current) + userOrdered + rest
     }
 
     // CrossfadePlayer must override setAudioAttributes() to broadcast to both internal players.
@@ -161,13 +173,32 @@ class ShufflePlayer(
     }
 
     override fun addMediaItem(index: Int, mediaItem: MediaItem) {
-        original = original + mediaItem
+        insertIntoOriginal(index, listOf(mediaItem))
         player.addMediaItem(index, mediaItem)
     }
 
     override fun addMediaItems(index: Int, mediaItems: MutableList<MediaItem>) {
-        original = original + mediaItems
+        insertIntoOriginal(index, mediaItems)
         player.addMediaItems(index, mediaItems)
+    }
+
+    // Keeps `original` (the unshuffle reference) consistent with a timeline insert: unshuffled,
+    // the item sits where the user put it instead of falling to the end of the restored order.
+    // Unshuffled, timeline == original (see the moveMediaItem sync note), so the same index applies
+    // directly. Shuffled, the anchor is the timeline predecessor mapped back via getItemAt; a missing
+    // anchor (index 0, stale index, dupe ambiguity) falls back to append.
+    private fun insertIntoOriginal(index: Int, mediaItems: List<MediaItem>) {
+        if (!isShuffled) {
+            original = original.toMutableList().apply {
+                addAll(index.coerceIn(0, size), mediaItems)
+            }
+            return
+        }
+        val anchor = if (index > 0) getItemAt(index - 1) else null
+        original = original.toMutableList().apply {
+            val at = anchor?.let { indexOf(it) }?.takeIf { it != -1 }
+            if (at == null) addAll(mediaItems) else addAll(at + 1, mediaItems)
+        }
     }
 
     // Maps a timeline index to its `original` entry by mediaId. Returns null (not throwing) when the
