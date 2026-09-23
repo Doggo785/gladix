@@ -427,8 +427,10 @@ class FeedAdapter(
                 override fun getMovementFlags(
                     recyclerView: RecyclerView, viewHolder: RecyclerView.ViewHolder,
                 ): Int {
-                    if (viewHolder !is MediaViewHolder) return 0
-                    if (viewHolder.feed?.item !is Track) return 0
+                    // Track media rows only — albums, artists, etc. never arm.
+                    val isMediaRow = viewHolder is MediaViewHolder
+                    val isTrack = (viewHolder as? MediaViewHolder)?.feed?.item is Track
+                    if (!SwipeToQueue.isSwipeable(isMediaRow, isTrack)) return 0
                     return makeMovementFlags(0, ItemTouchHelper.END)
                 }
 
@@ -439,39 +441,29 @@ class FeedAdapter(
                         if (hapticPending) buzz(viewHolder.itemView)
                         listener.onTrackSwiped(viewHolder.itemView, feed.extensionId, track)
                     }
-                    // Snap-back: each position accessor is paired with its OWN adapter.
-                    // bindingAdapterPosition is relative to bindingAdapter; absolute and
-                    // layout positions are relative to the RecyclerView's (concat) adapter.
-                    // Mixing them rebinds the wrong row on concat-backed screens. The old
-                    // code notified synchronously with a possibly stale position, leaving
-                    // the row off-screen; posting lets ItemTouchHelper finish its swipe
-                    // cleanup first so the recover animation brings the row home.
+                    // Snap-back: posted so ItemTouchHelper finishes its swipe cleanup
+                    // first and the recover animation brings the row home instead of
+                    // fighting the rebind. Target picked by SwipeToQueue.restoreTarget.
                     val recyclerView = viewHolder.itemView.parent as? RecyclerView
-                    val bindingPos = viewHolder.bindingAdapterPosition
-                    if (bindingPos != RecyclerView.NO_POSITION) {
-                        val adapter = viewHolder.bindingAdapter
-                        if (recyclerView != null) recyclerView.post {
-                            adapter?.notifyItemChanged(bindingPos)
-                        } else adapter?.notifyItemChanged(bindingPos)
-                        return
-                    }
-                    // bindingAdapterPosition is NO_POSITION (row recycled mid-gesture by
-                    // a paging refresh): fall back to global positions against the
-                    // RecyclerView's adapter. If those are dead too the row no longer
-                    // exists and there is nothing to rebind — no notifyDataSetChanged:
-                    // it would discard the paging adapter's diff state for nothing.
-                    val absolutePos = viewHolder.absoluteAdapterPosition
-                    if (absolutePos != RecyclerView.NO_POSITION && recyclerView != null) {
-                        recyclerView.post {
-                            recyclerView.adapter?.notifyItemChanged(absolutePos)
+                    when (val target = SwipeToQueue.restoreTarget(
+                        viewHolder.bindingAdapterPosition,
+                        viewHolder.absoluteAdapterPosition,
+                        viewHolder.layoutPosition
+                    )) {
+                        is SwipeToQueue.RestoreTarget.BindingAdapter -> {
+                            val adapter = viewHolder.bindingAdapter
+                            if (recyclerView != null) recyclerView.post {
+                                adapter?.notifyItemChanged(target.position)
+                            } else adapter?.notifyItemChanged(target.position)
                         }
-                        return
-                    }
-                    val layoutPos = viewHolder.layoutPosition
-                    if (layoutPos != RecyclerView.NO_POSITION && recyclerView != null) {
-                        recyclerView.post {
-                            recyclerView.adapter?.notifyItemChanged(layoutPos)
+
+                        is SwipeToQueue.RestoreTarget.RecyclerAdapter -> {
+                            if (recyclerView != null) recyclerView.post {
+                                recyclerView.adapter?.notifyItemChanged(target.position)
+                            }
                         }
+
+                        SwipeToQueue.RestoreTarget.None -> Unit
                     }
                 }
 
@@ -489,10 +481,13 @@ class FeedAdapter(
                     ) {
                         ensureDecor(recyclerView.context)
                         val itemView = viewHolder.itemView
-                        if (hapticPending && isCurrentlyActive &&
-                            dX >= getSwipeThreshold(viewHolder) * itemView.width
+                        if (SwipeToQueue.shouldBuzz(
+                                hapticPending, isCurrentlyActive, dX, itemView.width
+                            )
                         ) buzz(itemView)
-                        val right = (itemView.left + dX.toInt()).coerceAtMost(itemView.right)
+                        val right = SwipeToQueue.backgroundRight(
+                            itemView.left, itemView.right, dX
+                        )
                         // Plain null checks, not ?.let: let captures locals into a
                         // Function1 per touch frame; this runs on every frame of the
                         // gesture and must not allocate.
@@ -503,8 +498,7 @@ class FeedAdapter(
                         }
                         val ic = icon
                         if (ic != null) {
-                            val progress = (dX / itemView.width).coerceIn(0f, 1f)
-                            ic.alpha = (80 + 175 * progress).toInt()
+                            ic.alpha = SwipeToQueue.iconAlpha(dX, itemView.width)
                             val top = itemView.top + (itemView.height - iconSize) / 2
                             val left = itemView.left + iconMargin
                             ic.setBounds(left, top, left + iconSize, top + iconSize)
@@ -517,7 +511,8 @@ class FeedAdapter(
                     )
                 }
 
-                override fun getSwipeThreshold(viewHolder: RecyclerView.ViewHolder) = 0.25f
+                override fun getSwipeThreshold(viewHolder: RecyclerView.ViewHolder) =
+                    SwipeToQueue.SWIPE_THRESHOLD
                 override fun onMove(
                     recyclerView: RecyclerView,
                     viewHolder: RecyclerView.ViewHolder,

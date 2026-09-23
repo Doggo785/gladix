@@ -32,6 +32,7 @@ import dev.brahmkshatriya.echo.extensions.MediaState
 import dev.brahmkshatriya.echo.playback.MediaItemUtils
 import dev.brahmkshatriya.echo.playback.MediaItemUtils.isPlayNext
 import dev.brahmkshatriya.echo.playback.MediaItemUtils.serverWithDownloads
+import dev.brahmkshatriya.echo.ui.feed.SwipeToQueue
 import dev.brahmkshatriya.echo.playback.MediaItemUtils.sourceIndex
 import dev.brahmkshatriya.echo.playback.MediaItemUtils.track
 import dev.brahmkshatriya.echo.playback.PlayerCommands.addToNextCommand
@@ -794,24 +795,22 @@ class PlayerViewModel(
         }
     }
 
-    // Undo for [addToNext] (swipe-to-queue snackbar and Play Next menu alike). Play Next
-    // front-inserts LIFO right after current, so the just-added item should be the first
-    // Play Next past current with this track id. Matched by track id rather than a stored
-    // index because the insert resolves asynchronously — the index is unknowable at tap time.
-    // No-op when the item hasn't landed yet (tapped instantly) or was already consumed.
+    // Undo for [addToNext] (swipe-to-queue snackbar and Play Next menu alike).
+    // Index math lives in SwipeToQueue.undoIndex (unit-tested); this only resolves
+    // the queue into id lists and removes what it returns.
     // KNOWN LIMITATION: removes exactly one item. A menu-driven addToNext of an Album or
     // Playlist inserts N tracks and undo leaves N-1 behind; likewise a rapid double-swipe
     // of the same track collapses to one snackbar (SnackBarHandler dedupeKey) whose undo
     // removes one copy. Single-remove is per spec for the swipe path; widening it to a
     // contiguous isPlayNext run is a follow-up, not this change.
     private fun undoAddToNext(item: EchoMediaItem) {
-        val targetId = (item as? Track)?.id
-        val currentId = playerState.current.value?.mediaItem?.mediaId
-        val currentIndex = queue.indexOfFirst { it.mediaId == currentId }
-        val from = if (currentIndex == -1) 0 else currentIndex + 1
-        val index = queue.drop(from).indexOfFirst { media ->
-            media.isPlayNext && (targetId == null || media.track?.id == targetId)
-        }.takeIf { it != -1 }?.plus(from) ?: return
+        val index = SwipeToQueue.undoIndex(
+            mediaIds = queue.map { it.mediaId },
+            isPlayNext = queue.map { it.isPlayNext },
+            trackIds = queue.map { it.track?.id },
+            currentMediaId = playerState.current.value?.mediaItem?.mediaId,
+            targetTrackId = (item as? Track)?.id
+        ) ?: return
         removeQueueItem(index)
     }
 
