@@ -57,7 +57,11 @@ import dev.brahmkshatriya.echo.extensions.ExtensionUtils.getExtensionOrThrow
 import dev.brahmkshatriya.echo.extensions.ExtensionUtils.isClient
 import dev.brahmkshatriya.echo.extensions.MediaState
 import dev.brahmkshatriya.echo.playback.MediaItemUtils
+import dev.brahmkshatriya.echo.playback.MediaItemUtils.USER_QUEUED_NEXT
+import dev.brahmkshatriya.echo.playback.MediaItemUtils.USER_QUEUED_QUEUE
 import dev.brahmkshatriya.echo.playback.MediaItemUtils.extensionId
+import dev.brahmkshatriya.echo.playback.MediaItemUtils.userQueuedKind
+import dev.brahmkshatriya.echo.playback.MediaItemUtils.withUserQueued
 import dev.brahmkshatriya.echo.utils.CrashKeys
 import dev.brahmkshatriya.echo.playback.MediaItemUtils.track
 import dev.brahmkshatriya.echo.playback.ResumptionUtils.recoverCurrentId
@@ -998,6 +1002,22 @@ class PlayerCallback(
         SessionResult(RESULT_SUCCESS)
     }
 
+    // Sizes of the session user block sitting after the current track: (playNext, queue).
+    // Counts every flagged item after current (not just a contiguous run) so a drag-interleaved
+    // timeline still inserts inside the block rather than inside the radio. Main-thread only —
+    // every caller invokes it inside player.with.
+    private fun Player.userBlockAfterCurrent(): Pair<Int, Int> {
+        var next = 0
+        var queued = 0
+        for (i in currentMediaItemIndex + 1 until mediaItemCount) {
+            when (runCatching { getMediaItemAt(i).userQueuedKind }.getOrNull()) {
+                USER_QUEUED_NEXT -> next++
+                USER_QUEUED_QUEUE -> queued++
+            }
+        }
+        return next to queued
+    }
+
     private fun addToQueue(player: Player, args: Bundle) = scope.future {
         val error = SessionResult(SessionError.ERROR_UNKNOWN)
         val extId = args.getString("extId") ?: return@future bug("add_to_queue", "missing extId")
@@ -1033,6 +1053,8 @@ class PlayerCallback(
         // P5: give added tracks a source label so they don't show a blank header when reached. A
         // collection (Album/Playlist/Artist/Radio) is its own source; a lone track gets the display-only
         // "<track> Radio" placeholder (stripped in PlayerRadio), consistent with a bare-track play.
+        // Stamped USER_QUEUED_QUEUE: part of the session user block, played FIFO after any Play Next
+        // items and before generated radio (Spotify model). Session-only — never persisted.
         val addedContext = item.takeUnless { it is Track }
         val mediaItems = tracks.map { track ->
             MediaItemUtils.build(
@@ -1041,7 +1063,7 @@ class PlayerCallback(
                 MediaState.Unloaded(extId, track),
                 addedContext ?: MediaItemUtils.trackRadioPlaceholder(track)
             )
-        }
+        }.withUserQueued(USER_QUEUED_QUEUE)
         player.with {
             if (queueEpochOrZero != epoch) {
                 Log.d(
@@ -1050,14 +1072,17 @@ class PlayerCallback(
                 )
                 return@with
             }
-            addMediaItems(mediaItems)
+            if (mediaItemCount == 0) {
+                addMediaItems(mediaItems)
+            } else {
+                val (nextCount, queueCount) = userBlockAfterCurrent()
+                addMediaItems(currentMediaItemIndex + 1 + nextCount + queueCount, mediaItems)
+            }
             prepare()
         }
         SessionResult(RESULT_SUCCESS)
     }
 
-    private var next = 0
-    private var nextJob: Job? = null
     private fun addToNext(player: Player, args: Bundle) = scope.future {
         val error = SessionResult(SessionError.ERROR_UNKNOWN)
         val extId = args.getString("extId") ?: return@future bug("add_to_next", "missing extId")
@@ -1068,10 +1093,9 @@ class PlayerCallback(
         val loaded = args.getBoolean("loaded", false)
         val extension = extensions.music.getExtension(extId)
             ?: return@future notFound(R.string.extension)
-        nextJob?.cancel()
         // ⚠️ WORSE THAN A PLAIN APPEND IF STALE: the insert position below is computed from the
-        // LIVE queue (currentMediaItemIndex + 1 + next), with `next` a running offset across recent adds, so
-        // a stale insert lands at an index that means nothing in the queue it arrives in.
+        // LIVE queue (currentMediaItemIndex + 1), so a stale insert lands at an index that means
+        // nothing in the queue it arrives in. The epoch check inside player.with drops it.
         val epoch = player.queueEpochOrZero
         val tracks = listTracks(extension, item, loaded).getOrElse {
             if (it is CancellationException) throw it
@@ -1091,6 +1115,8 @@ class PlayerCallback(
             return@future error
         }
         // P5: same source-label treatment as addToQueue — collection context, else track-radio placeholder.
+        // Stamped USER_QUEUED_NEXT: front of the session user block, LIFO — the newest Play Next is
+        // always THE next track. Session-only — never persisted.
         val addedContext = item.takeUnless { it is Track }
         val mediaItems = tracks.map { track ->
             MediaItemUtils.build(
@@ -1099,8 +1125,7 @@ class PlayerCallback(
                 MediaState.Unloaded(extId, track),
                 addedContext ?: MediaItemUtils.trackRadioPlaceholder(track)
             )
-        }
-        var inserted = false
+        }.withUserQueued(USER_QUEUED_NEXT)
         player.with {
             if (queueEpochOrZero != epoch) {
                 Log.d(
@@ -1109,22 +1134,13 @@ class PlayerCallback(
                 )
                 return@with
             }
-            if (mediaItemCount == 0) playWhenReady = true
-            // Current index so "play next" inserts right after the CURRENT track.
-            val fullIndex = currentMediaItemIndex
-            addMediaItems(fullIndex + 1 + next, mediaItems)
+            if (mediaItemCount == 0) {
+                playWhenReady = true
+                addMediaItems(mediaItems)
+            } else {
+                addMediaItems(currentMediaItemIndex + 1, mediaItems)
+            }
             prepare()
-            inserted = true
-        }
-        // Only advance the running offset if the insert actually happened - otherwise `next` drifts past a
-        // drop and the FOLLOWING add lands too far out. (It self-heals after nextJob's 5s reset, but a
-        // silently wrong position in that window is the kind of thing that gets reported as "play next put
-        // it in the wrong place".)
-        if (!inserted) return@future error
-        next += mediaItems.size
-        nextJob = scope.launch {
-            delay(5000)
-            next = 0
         }
         SessionResult(RESULT_SUCCESS)
     }
