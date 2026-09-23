@@ -587,6 +587,30 @@ class DeezerParser(private val session: DeezerSession) {
         )
     }
 
+    // FALLBACK-graft for favorites/liked TRACKS — identical shape to the inline graft in
+    // DeezerPlaylistClient.loadTracks: favorite_song.getList pre-substitutes an unavailable
+    // original with a playable-but-dead/mis-attributed track at TOP-LEVEL and moves the CORRECT
+    // catalog data into a full FALLBACK object. When a FALLBACK exists, take DISPLAY fields
+    // (artists/album/cover/background) from it while keeping the top-level SNG_ID as the id for
+    // STREAMING. No FALLBACK → top-level as-is. (Confirmed on-device: karaoke → correct artist;
+    // P.J. Proby → live/openable album; fb=no favorites unchanged.) Play-time art is preserved by
+    // DeezerTrackClient.loadTrack's merge, so grafted favorites carry through to the
+    // player/fullscreen. Shared here because both DeezerLibraryClient (Tracks shelf) and
+    // DeezerPlaylistClient (virtual Favorite Tracks playlist) parse this endpoint.
+    fun graftFavTrack(entry: JsonObject): Track {
+        val d = entry.unwrap()
+        val top = d.toTrack()
+        val fb = d["FALLBACK"] as? JsonObject
+        if (fb == null) return top
+        val fbTrack = fb.toTrack()
+        return top.copy(
+            artists = fbTrack.artists,
+            album = fbTrack.album,
+            cover = fbTrack.cover,
+            background = fbTrack.background
+        )
+    }
+
     fun JsonObject.toTrack(): Track {
         val data = unwrap()
         val md5 = data.str("ALB_PICTURE")

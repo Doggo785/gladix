@@ -2,6 +2,7 @@ package dev.brahmkshatriya.echo.extension.clients
 
 import dev.brahmkshatriya.echo.common.models.Feed
 import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeedData
+import dev.brahmkshatriya.echo.common.models.Playlist
 import dev.brahmkshatriya.echo.common.models.Shelf
 import dev.brahmkshatriya.echo.common.models.Tab
 import dev.brahmkshatriya.echo.common.models.Track
@@ -80,6 +81,8 @@ class DeezerLibraryClient(
                     val grafted = items.mapNotNull { el -> (el as? JsonObject)?.let { graftFavTrack(it) } }
                     grafted.takeIf { it.isNotEmpty() }
                         ?.let { Shelf.Lists.Items(id = cfg.title, title = cfg.title, list = it) }
+                } else if (cfg.id == TabId.PLAYLISTS) {
+                    withFavoritesCard(cfg.title, parser.run { items.toShelfItemsList(cfg.title) })
                 } else parser.run { items.toShelfItemsList(cfg.title) }
             }
         }.awaitAll().filterNotNull()
@@ -90,9 +93,11 @@ class DeezerLibraryClient(
         deezerExtension.handleArlExpiration()
         val json = cfg.request(api)
         val arr = cfg.extractor(json) ?: return emptyList()
-        return if (id == TabId.TRACKS.id)
-            arr.mapNotNull { el -> (el as? JsonObject)?.let { graftFavTrack(it).toShelf() } }
-        else parser.run { arr.mapNotNull { it.jsonObject.toEchoMediaItem()?.toShelf() } }
+        if (id == TabId.TRACKS.id)
+            return arr.mapNotNull { el -> (el as? JsonObject)?.let { graftFavTrack(it).toShelf() } }
+        val items = parser.run { arr.mapNotNull { it.jsonObject.toEchoMediaItem()?.toShelf() } }
+        if (id == TabId.PLAYLISTS.id) return prependCardToPlaylists(items)
+        return items
     }
 
     private fun JsonObject.results(): JsonObject? = this["results"]?.jsonObject
@@ -101,26 +106,46 @@ class DeezerLibraryClient(
     private fun JsonObject.tabDataArray(tabId: String): JsonArray? =
         results()?.get("TAB")?.jsonObject?.get(tabId)?.jsonObject?.get("data")?.jsonArray
 
-    // FALLBACK-graft for favorites/liked TRACKS — identical to DeezerPlaylistClient.loadTracks:
-    // favorite_song.getList pre-substitutes an unavailable original with a playable-but-dead/mis-attributed
-    // track at TOP-LEVEL and moves the CORRECT catalog data into a full FALLBACK object. When a FALLBACK
-    // exists, take DISPLAY fields (artists/album/cover/background) from it while keeping the top-level SNG_ID
-    // as the id for STREAMING. No FALLBACK → top-level as-is. (Confirmed on-device: karaoke → correct artist;
-    // P.J. Proby → live/openable album; fb=no favorites unchanged.) Play-time art is preserved by
-    // DeezerTrackClient.loadTrack's merge, so grafted favorites carry through to the player/fullscreen.
-    private fun graftFavTrack(entry: JsonObject): Track = parser.run {
-        val d = entry.unwrap()
-        val top = d.toTrack()
-        val fb = d["FALLBACK"] as? JsonObject
-        if (fb == null) top
-        else {
-            val fbTrack = fb.toTrack()
-            top.copy(
-                artists = fbTrack.artists,
-                album = fbTrack.album,
-                cover = fbTrack.cover,
-                background = fbTrack.background
-            )
+    // FALLBACK-graft for favorites/liked TRACKS — now DeezerParser.graftFavTrack (shared
+    // with DeezerPlaylistClient's virtual Favorite Tracks playlist). Kept as a one-line
+    // delegate rather than inlining the call sites so both shelves keep reading identically.
+    private fun graftFavTrack(entry: JsonObject): Track = parser.graftFavTrack(entry)
+
+    companion object {
+        // Virtual "Favorite Tracks" playlist: Deezer's tab_playlist no longer carries the
+        // favorites pseudo-playlist the real app shows, so the library synthesizes the card
+        // at the head of the Playlists shelf (All tab and Playlists tab alike, even when the
+        // user owns zero playlists). The routing key is DeezerPlaylistClient.FAVORITES_EXTRA
+        // (same precedent as SMART_TRACKLIST_EXTRA); the id is non-numeric so it can never
+        // collide with a real playlist id. Opening the card yields a Playlist context, so
+        // taps play the likes in order via the existing ordered-collection path — no
+        // tap-logic change needed.
+        const val FAVORITES_ID = "favorites"
+        const val FAVORITES_TITLE = "Favorite Tracks"
+
+        fun favoritesCard(): Playlist = Playlist(
+            id = FAVORITES_ID,
+            title = FAVORITES_TITLE,
+            isEditable = false,
+            // Not a real playlist: nothing to save/follow/share, and radio has no id
+            // Deezer could resolve. Ordered playback (the card's whole job) needs none.
+            isRadioSupported = false,
+            isFollowable = false,
+            isSaveable = false,
+            isShareable = false,
+            extras = mapOf(DeezerPlaylistClient.FAVORITES_EXTRA to "1")
+        )
+
+        // Head-of-shelf placement for both Playlists surfaces. Internal for tests;
+        // loadAll (All tab carousel) and prependCardToPlaylists (Playlists tab rows)
+        // are the only callers.
+        internal fun withFavoritesCard(title: String, shelf: Shelf?): Shelf? {
+            val card = favoritesCard()
+            val list = (shelf as? Shelf.Lists.Items)?.list.orEmpty()
+            return Shelf.Lists.Items(id = title, title = title, list = listOf(card) + list)
         }
+
+        internal fun prependCardToPlaylists(items: List<Shelf>): List<Shelf> =
+            listOf(favoritesCard().toShelf()) + items
     }
 }

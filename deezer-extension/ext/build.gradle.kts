@@ -18,6 +18,7 @@ dependencies {
     implementation(project(":common"))
     compileOnly("org.jetbrains.kotlin:kotlin-stdlib:${libs.versions.kotlin.get()}")
     compileOnly(libs.okhttp)
+    testImplementation(libs.junit)
 }
 
 val extType = "music"
