@@ -10,7 +10,9 @@ import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.ShuffleOrder
+import dev.brahmkshatriya.echo.playback.MediaItemUtils.USER_QUEUED_QUEUE
 import dev.brahmkshatriya.echo.playback.MediaItemUtils.isUserQueued
+import dev.brahmkshatriya.echo.playback.MediaItemUtils.withUserQueued
 
 @Suppress("unused")
 @OptIn(UnstableApi::class)
@@ -260,6 +262,15 @@ class ShufflePlayer(
             }
         }
         player.moveMediaItem(currentIndex, newIndex)
+        // Promotion auto (Spotify model): moveMediaItem's only caller is the queue drag
+        // (PlayerViewModel.moveQueueItems), so a moved item is by definition hand-placed and joins
+        // the session user block as Queue. Via the replaceMediaItem override so `original` follows.
+        // No-op when already flagged, and guarded against a timeline that shifted mid-drag.
+        val target = newIndex.coerceIn(0, mediaItemCount - 1)
+        val moved = runCatching { player.getMediaItemAt(target) }.getOrNull()
+        if (moved != null && !moved.isUserQueued) {
+            replaceMediaItem(target, moved.withUserQueued(USER_QUEUED_QUEUE))
+        }
     }
 
     override fun replaceMediaItem(index: Int, mediaItem: MediaItem) {
