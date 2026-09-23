@@ -227,7 +227,19 @@ class DeezerExtension : HomeFeedClient, TrackClient, LikeClient, RadioClient,
     override suspend fun onExtensionSelected() {
         session.settings?.let { setSettings(it) }
         runCatching { handleArlExpiration() }.getOrElse {
-            if (it is ClientException.LoginRequired) throw it
+            // Rethrow EXCEPT on a never-logged-in session. With no credentials at all (no
+            // email/pass, no ARL) and no recorded refusal, nothing is "required" - the user
+            // simply never signed in - and throwing here is not just noisy, it is FATAL:
+            // this runs inside the Injectable injection block, and a throwing block is never
+            // cleared, so EVERY later value() re-runs it and re-throws. That bricks the login
+            // screen itself (LoginViewModel.init maps the failed capability query to
+            // "Login is not supported") AND any later onLogin (same value() path) - login can
+            // never complete. A session holding credentials, or a latched refusal, still throws,
+            // so the rejected-sign-in prompt this rethrow was added for is preserved.
+            val creds = session.credentials
+            val neverLoggedIn = !session.credentialsRejected &&
+                creds.email.isEmpty() && creds.pass.isEmpty() && creds.arl.isEmpty()
+            if (!neverLoggedIn && it is ClientException.LoginRequired) throw it
         }
     }
 

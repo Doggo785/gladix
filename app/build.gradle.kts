@@ -98,11 +98,14 @@ android {
     defaultConfig {
         applicationId = "dev.rschwertley.gladix.auto"
         minSdk = 24
-        targetSdk = 37
-        // Note: versionCode only increments on git commits. 
+        targetSdk = 37        // Note: versionCode only increments on git commits. 
         // For local development, consider committing frequently to update the version.
         versionCode = gitCount
         versionName = "v${version}_$gitHash${if (isDirty) "-dirty" else ""}($gitCount)"
+        // Launcher label goes through a manifest placeholder so the debug variant below can carry a
+        // distinct name ("Gladix Debug") without duplicating @string/app_name — a resValue with the
+        // same name would clash with strings.xml.
+        manifestPlaceholders["appLabel"] = "Gladix"
         // True only when google-services.json is present. Compile-time constant used to guard
         // every Firebase call site so no-JSON builds never load the (compileOnly) Firebase classes.
         buildConfigField("boolean", "HAS_FIREBASE", "$hasGoogleServices")
@@ -171,6 +174,16 @@ android {
     // ⚠️ SIGNING KEY: release is signed with the DEBUG keystore, on purpose. See the signingConfig note on
     // the release block.
     buildTypes {
+        // ── DEBUG = LOCAL DEV ONLY, SIDE-BY-SIDE WITH THE DAILY DRIVER. applicationIdSuffix makes
+        // this a SEPARATE install (...gladix.auto.debug), so flashing a dev build over USB never
+        // touches the upstream-release install or its data (Room history, downloads, extension
+        // logins — all in their own sandbox). The distinct launcher label is the visual guard.
+        // :deezer-extension (plain android library) and :common both have a debug variant, so no
+        // matchingFallbacks are needed here. Release stays the untouched, shippable variant.
+        debug {
+            applicationIdSuffix = ".debug"
+            manifestPlaceholders["appLabel"] = "Gladix Debug"
+        }
         release {
             // ⚠⚠ THE ONLY PROJECT-LEVEL LEVER OVER STUDIO'S SELECTED BUILD VARIANT. Studio
             // intermittently reopens on `debug` after `release` was selected. The selection is IDE state,
