@@ -63,6 +63,28 @@ object MediaItemUtils {
         return this is EchoMediaItem.Lists && this !is Radio
     }
 
+    // Marker on a manually queued item that means "session-only user block, not radio".
+    // Spotify model: Play Next (LIFO) + Queue (FIFO) play right after the current track,
+    // before the generated radio. Session-only by design (like Spotify): ResumptionUtils
+    // never persists it, so the distinction dies on cold restore and the queue is flat again.
+    // Plain String extra (not serialized object) so old/new builds interop and a missing
+    // key simply means "radio/context item".
+    const val USER_QUEUED = "user_queued"
+    const val USER_QUEUED_NEXT = "next"
+    const val USER_QUEUED_QUEUE = "queue"
+
+    fun MediaItem.withUserQueued(kind: String): MediaItem {
+        val bundle = Bundle().apply {
+            mediaMetadata.extras?.let(::putAll)
+            putString(USER_QUEUED, kind)
+        }
+        val item = buildUpon()
+        item.setMediaMetadata(mediaMetadata.buildUpon().setExtras(bundle).build())
+        return item.build()
+    }
+
+    fun List<MediaItem>.withUserQueued(kind: String) = map { it.withUserQueued(kind) }
+
     // Marker on a seed's context that means "display-only radio label, not a real radio to generate".
     // PlayerRadio strips a context carrying this before calling extension.radio(), so radio GENERATION
     // is unchanged (it still receives null exactly as before) — this exists purely so the now-playing
@@ -383,6 +405,7 @@ object MediaItemUtils {
     val Bundle?.unloadedCover
         get() = this?.getSerialized<ImageHolder?>("unloadedCover")?.getOrNull()
     val Bundle?.downloaded get() = this?.getSerialized<List<String>>("downloaded")?.getOrNull()
+    val Bundle?.userQueuedKind get() = this?.getString(USER_QUEUED)
 
     val MediaItem.state get() = mediaMetadata.extras.state
     val MediaItem.track get() = mediaMetadata.extras.track
@@ -399,6 +422,9 @@ object MediaItemUtils {
     val MediaItem.retries get() = mediaMetadata.extras.retries
     val MediaItem.unloadedCover get() = mediaMetadata.extras.unloadedCover
     val MediaItem.downloaded get() = mediaMetadata.extras.downloaded
+    val MediaItem.userQueuedKind get() = mediaMetadata.extras.userQueuedKind
+    val MediaItem.isUserQueued get() = userQueuedKind != null
+    val MediaItem.isPlayNext get() = userQueuedKind == USER_QUEUED_NEXT
 
     private fun Streamable.SubtitleType.toMimeType() = when (this) {
         Streamable.SubtitleType.VTT -> MimeTypes.TEXT_VTT

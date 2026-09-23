@@ -10,6 +10,9 @@ import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.ShuffleOrder
+import dev.brahmkshatriya.echo.playback.MediaItemUtils.USER_QUEUED_QUEUE
+import dev.brahmkshatriya.echo.playback.MediaItemUtils.isUserQueued
+import dev.brahmkshatriya.echo.playback.MediaItemUtils.withUserQueued
 
 @Suppress("unused")
 @OptIn(UnstableApi::class)
@@ -110,8 +113,19 @@ class ShufflePlayer(
     override fun setShuffleModeEnabled(enabled: Boolean) {
         if (enabled) original = getQueue()
         isShuffled = enabled
-        changeQueue(if (enabled) original.shuffled() else original)
+        changeQueue(if (enabled) original.withUserBlockPinned() else original)
         player.shuffleModeEnabled = enabled
+    }
+
+    // Session user block (Play Next + Queue) stays pinned right after the current track when
+    // shuffling; only generated radio/context items are shuffled (Spotify model). Identity
+    // comparison (`!== current`) keeps duplicates intact — at most the playing instance is excluded.
+    // changeQueue() still pulls current to physical index 0, so the pinned block lands at 1..n.
+    private fun List<MediaItem>.withUserBlockPinned(): List<MediaItem> {
+        val current = currentMediaItem
+        val (head, pinned, rest) =
+            UserBlock.partition(this, { it === current }, { it.isUserQueued })
+        return listOfNotNull(head) + pinned + rest.shuffled()
     }
 
     // CrossfadePlayer must override setAudioAttributes() to broadcast to both internal players.
@@ -125,13 +139,19 @@ class ShufflePlayer(
         isFreshShuffle = false
         // Degrade to a no-op reorder rather than crash if current isn't in `list` (transient divergence);
         // the same NoSuchElementException family as the getItemAt tap-to-jump crash.
-        val currentItem = list.firstOrNull { it.mediaId == currentMediaItem?.mediaId } ?: return
+        // Identity first, mediaId fallback: a duplicate of the playing track must survive — `list - item`
+        // removes by equals() and would drop every value-equal copy.
+        val playing = currentMediaItem
+        val currentIndex = list.indexOfFirst { it === playing }
+            .takeIf { it != -1 }
+            ?: list.indexOfFirst { it.mediaId == playing?.mediaId }
+        if (currentIndex == -1) return
+        val after = list.filterIndexed { i, _ -> i != currentIndex }
         // Current+upcoming model: current stays at index 0 with NOTHING before it; everything else
         // follows as upcoming. (The old before/after split placed ~half the shuffled tracks above
         // current, stranding them — G3.) The removeMediaItems(0, currentIndex) below also heals any
         // pre-existing stranded-above state by pulling current back to index 0. Uses the inner
         // player.* calls (not the overrides), so `original` and `backStack` are left untouched.
-        val after = list - currentItem
         isRearranging = true
         try {
             if (player.currentMediaItemIndex > 0)
@@ -161,13 +181,25 @@ class ShufflePlayer(
     }
 
     override fun addMediaItem(index: Int, mediaItem: MediaItem) {
-        original = original + mediaItem
+        insertIntoOriginal(index, listOf(mediaItem))
         player.addMediaItem(index, mediaItem)
     }
 
     override fun addMediaItems(index: Int, mediaItems: MutableList<MediaItem>) {
-        original = original + mediaItems
+        insertIntoOriginal(index, mediaItems)
         player.addMediaItems(index, mediaItems)
+    }
+
+    // Keeps `original` (the unshuffle reference) consistent with a timeline insert: unshuffled,
+    // the item sits where the user put it instead of falling to the end of the restored order.
+    // Position math lives in UserBlock.unshuffledInsertIndex (unit-tested); this only resolves the
+    // anchor — the timeline predecessor mapped back via getItemAt.
+    private fun insertIntoOriginal(index: Int, mediaItems: List<MediaItem>) {
+        val anchor = if (isShuffled && index > 0) {
+            getItemAt(index - 1)?.let { original.indexOf(it).takeIf { at -> at != -1 } }
+        } else null
+        val at = UserBlock.unshuffledInsertIndex(isShuffled, index, original.size, anchor)
+        original = original.toMutableList().apply { addAll(at, mediaItems) }
     }
 
     // Maps a timeline index to its `original` entry by mediaId. Returns null (not throwing) when the
@@ -188,7 +220,13 @@ class ShufflePlayer(
         // out-of-range → no-op instead of IndexOutOfBounds. Guard FIRST so neither `original` nor the
         // player is half-updated. Mirrors jumpForwardTo.
         if (index !in 0 until mediaItemCount) return
-        getItemAt(index)?.let { original = original - it }
+        // By index, not by value: `original - item` removes by equals() and would drop every
+        // value-equal duplicate of the departing track (same defect family as the range overload's
+        // multiplicity fix below — a short `original` loses a track on the next unshuffle).
+        getItemAt(index)?.let { existing ->
+            val at = original.indexOf(existing)
+            if (at != -1) original = original.toMutableList().apply { removeAt(at) }
+        }
         player.removeMediaItem(index)
     }
 
@@ -216,8 +254,10 @@ class ShufflePlayer(
     // current guard that keeps current at index 0 lives in QueueFragment (movement flags / onMove).
     override fun moveMediaItem(currentIndex: Int, newIndex: Int) {
         // Stale queue-drag: a source position captured against a snapshot, arriving after the timeline
-        // shifted → out-of-range → no-op. Guard FIRST so neither `original` nor the player is half-updated.
+        // shifted → out-of-range → no-op instead of IndexOutOfBounds. Guard FIRST so neither `original` nor the
+        // player is half-updated. Both ends guarded: the target comes from the same snapshot as the source.
         if (currentIndex !in 0 until mediaItemCount) return
+        if (newIndex !in 0 until mediaItemCount) return
         val item = if (!isShuffled) getItemAt(currentIndex) else null
         if (item != null) {
             original = original.toMutableList().apply {
@@ -229,6 +269,17 @@ class ShufflePlayer(
             }
         }
         player.moveMediaItem(currentIndex, newIndex)
+        // Promotion auto (Spotify model): moveMediaItem's only caller is the queue drag
+        // (PlayerViewModel.moveQueueItems), so a moved item is by definition hand-placed and joins
+        // the session user block as Queue. Via the replaceMediaItem override so `original` follows.
+        // No-op when already flagged, and guarded against a timeline that shifted mid-drag.
+        // Drag order is authoritative (I3): a drop that inverts Next-before-Queue is kept as dropped —
+        // later inserts still anchor on block boundaries, but nothing re-sorts the user's hand order.
+        val target = newIndex.coerceIn(0, mediaItemCount - 1)
+        val moved = runCatching { player.getMediaItemAt(target) }.getOrNull()
+        if (moved != null && UserBlock.shouldPromoteOnMove(moved.isUserQueued)) {
+            replaceMediaItem(target, moved.withUserQueued(USER_QUEUED_QUEUE))
+        }
     }
 
     override fun replaceMediaItem(index: Int, mediaItem: MediaItem) {

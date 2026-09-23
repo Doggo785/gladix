@@ -365,13 +365,13 @@
 
     <string name="save_to_playlist">Save to playlist</string>
     <string name="delete_playlist">Delete playlist</string>
-    <string name="add_to_next">Add to next</string>
+    <string name="add_to_next">Play next</string>
     <string name="queue">Queue</string>
     <string name="add_to_queue">Add to queue</string>
     <string name="loading_radio_for_x">Loading radio for %1$s</string>
     <string name="playing_x">Playing %1$s</string>
     <string name="adding_x_to_queue">Adding %1$s to queue</string>
-    <string name="adding_x_to_next">Adding %1$s to next</string>
+    <string name="adding_x_to_next">Playing %1$s next</string>
     <string name="background_gradient">Background Gradient</string>
     <string name="background_gradient_summary">A gradient color tint in  background depending on the context</string>
     <string name="all">All</string>
