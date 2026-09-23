@@ -1,21 +1,35 @@
 package dev.brahmkshatriya.echo.ui.feed
 
+import android.R.attr.colorPrimary
 import android.app.Activity
 import android.app.UiModeManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.Drawable
+import android.os.Build
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.provider.Settings
 import android.speech.RecognizerIntent
 import android.view.LayoutInflater
+import android.view.View
 import android.view.ViewGroup
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
+import androidx.core.graphics.drawable.DrawableCompat
+import androidx.core.view.HapticFeedbackConstantsCompat
 import androidx.core.view.isVisible
 import androidx.fragment.app.Fragment
 import androidx.paging.LoadState
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.ItemTouchHelper
 import androidx.recyclerview.widget.RecyclerView
+import com.google.android.material.color.MaterialColors
 import dev.brahmkshatriya.echo.R
 import dev.brahmkshatriya.echo.common.models.Feed
 import dev.brahmkshatriya.echo.common.models.Track
@@ -43,6 +57,7 @@ import dev.brahmkshatriya.echo.ui.feed.viewholders.VideoViewHolder
 import dev.brahmkshatriya.echo.ui.player.PlayerViewModel
 import dev.brahmkshatriya.echo.utils.ContextUtils.observe
 import dev.brahmkshatriya.echo.utils.ui.AnimationUtils.animatedWithAlpha
+import dev.brahmkshatriya.echo.utils.ui.UiUtils.dpToPx
 import dev.brahmkshatriya.echo.utils.ui.scrolling.ScrollAnimPagingAdapter
 import kotlinx.coroutines.flow.combine
 import org.koin.androidx.viewmodel.ext.android.activityViewModel
@@ -333,21 +348,173 @@ class FeedAdapter(
             return adapter
         }
 
+        // Swipe a track RIGHT (END in LTR, Spotify/Deezer direction) to play it next.
+        // The row always snaps back: swiping is an action, not a removal.
         fun getTouchHelper(listener: FeedClickListener) = ItemTouchHelper(
-            object : ItemTouchHelper.SimpleCallback(0, ItemTouchHelper.START) {
+            object : ItemTouchHelper.SimpleCallback(0, ItemTouchHelper.END) {
+                // Cached across frames: resolving the theme color and loading the icon
+                // on every onChildDraw call would allocate per touch frame.
+                private var bg: ColorDrawable? = null
+                private var icon: Drawable? = null
+                private var iconSize = 0
+                private var iconMargin = 0
+
+                private fun ensureDecor(context: Context) {
+                    if (bg != null) return
+                    // User's app color (custom theme color -> colorPrimary), like
+                    // Spotify's green but themed.
+                    val color = MaterialColors.getColor(context, colorPrimary, Color.BLACK)
+                    bg = ColorDrawable(color)
+                    icon = ContextCompat.getDrawable(context, R.drawable.ic_queue_music)?.let {
+                        DrawableCompat.wrap(it).mutate().apply {
+                            DrawableCompat.setTint(this, Color.WHITE)
+                        }
+                    }
+                    iconSize = 24.dpToPx(context)
+                    iconMargin = 24.dpToPx(context)
+                }
+
+                // Exactly-once haptic per swipe: fired when the gesture crosses the
+                // trigger threshold (Spotify-style immediate confirmation), or on
+                // release for a fast fling that never drew a past-threshold frame.
+                private var hapticPending = true
+
+                override fun onSelectedChanged(
+                    viewHolder: RecyclerView.ViewHolder?, actionState: Int
+                ) {
+                    super.onSelectedChanged(viewHolder, actionState)
+                    if (actionState == ItemTouchHelper.ACTION_STATE_SWIPE) hapticPending = true
+                }
+
+                private fun buzz(view: View) {
+                    hapticPending = false
+                    view.isHapticFeedbackEnabled = true
+                    if (view.performHapticFeedback(HapticFeedbackConstantsCompat.CONFIRM)) return
+                    // View-level feedback refused (detached row, OEM quirk): short
+                    // direct vibration instead — unless the user cut system haptics.
+                    // VIBRATE permission is already declared; one 35ms one-shot per
+                    // swipe is negligible for battery.
+                    val context = view.context
+                    val systemHaptics = try {
+                        Settings.System.getInt(
+                            context.contentResolver,
+                            Settings.System.HAPTIC_FEEDBACK_ENABLED, 1
+                        ) == 1
+                    } catch (_: Exception) {
+                        true
+                    }
+                    if (!systemHaptics) return
+                    try {
+                        val vibrator = context.getSystemService(Vibrator::class.java)
+                            ?: @Suppress("DEPRECATION")
+                            (context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator)
+                            ?: return
+                        if (!vibrator.hasVibrator()) return
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            vibrator.vibrate(
+                                VibrationEffect.createOneShot(
+                                    35, VibrationEffect.DEFAULT_AMPLITUDE
+                                )
+                            )
+                        } else {
+                            @Suppress("DEPRECATION")
+                            vibrator.vibrate(35)
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+
                 override fun getMovementFlags(
                     recyclerView: RecyclerView, viewHolder: RecyclerView.ViewHolder,
                 ): Int {
                     if (viewHolder !is MediaViewHolder) return 0
                     if (viewHolder.feed?.item !is Track) return 0
-                    return makeMovementFlags(0, ItemTouchHelper.START)
+                    return makeMovementFlags(0, ItemTouchHelper.END)
                 }
 
                 override fun onSwiped(viewHolder: RecyclerView.ViewHolder, direction: Int) {
-                    val feed = (viewHolder as MediaViewHolder).feed ?: return
-                    val track = feed.item as? Track ?: return
-                    listener.onTrackSwiped(viewHolder.itemView, feed.extensionId, track)
-                    viewHolder.bindingAdapter?.notifyItemChanged(viewHolder.bindingAdapterPosition)
+                    val feed = (viewHolder as? MediaViewHolder)?.feed
+                    val track = feed?.item as? Track
+                    if (track != null) {
+                        if (hapticPending) buzz(viewHolder.itemView)
+                        listener.onTrackSwiped(viewHolder.itemView, feed.extensionId, track)
+                    }
+                    // Snap-back: each position accessor is paired with its OWN adapter.
+                    // bindingAdapterPosition is relative to bindingAdapter; absolute and
+                    // layout positions are relative to the RecyclerView's (concat) adapter.
+                    // Mixing them rebinds the wrong row on concat-backed screens. The old
+                    // code notified synchronously with a possibly stale position, leaving
+                    // the row off-screen; posting lets ItemTouchHelper finish its swipe
+                    // cleanup first so the recover animation brings the row home.
+                    val recyclerView = viewHolder.itemView.parent as? RecyclerView
+                    val bindingPos = viewHolder.bindingAdapterPosition
+                    if (bindingPos != RecyclerView.NO_POSITION) {
+                        val adapter = viewHolder.bindingAdapter
+                        if (recyclerView != null) recyclerView.post {
+                            adapter?.notifyItemChanged(bindingPos)
+                        } else adapter?.notifyItemChanged(bindingPos)
+                        return
+                    }
+                    // bindingAdapterPosition is NO_POSITION (row recycled mid-gesture by
+                    // a paging refresh): fall back to global positions against the
+                    // RecyclerView's adapter. If those are dead too the row no longer
+                    // exists and there is nothing to rebind — no notifyDataSetChanged:
+                    // it would discard the paging adapter's diff state for nothing.
+                    val absolutePos = viewHolder.absoluteAdapterPosition
+                    if (absolutePos != RecyclerView.NO_POSITION && recyclerView != null) {
+                        recyclerView.post {
+                            recyclerView.adapter?.notifyItemChanged(absolutePos)
+                        }
+                        return
+                    }
+                    val layoutPos = viewHolder.layoutPosition
+                    if (layoutPos != RecyclerView.NO_POSITION && recyclerView != null) {
+                        recyclerView.post {
+                            recyclerView.adapter?.notifyItemChanged(layoutPos)
+                        }
+                    }
+                }
+
+                override fun onChildDraw(
+                    c: Canvas,
+                    recyclerView: RecyclerView,
+                    viewHolder: RecyclerView.ViewHolder,
+                    dX: Float,
+                    dY: Float,
+                    actionState: Int,
+                    isCurrentlyActive: Boolean
+                ) {
+                    if (actionState == ItemTouchHelper.ACTION_STATE_SWIPE &&
+                        dX > 0f && viewHolder is MediaViewHolder
+                    ) {
+                        ensureDecor(recyclerView.context)
+                        val itemView = viewHolder.itemView
+                        if (hapticPending && isCurrentlyActive &&
+                            dX >= getSwipeThreshold(viewHolder) * itemView.width
+                        ) buzz(itemView)
+                        val right = (itemView.left + dX.toInt()).coerceAtMost(itemView.right)
+                        // Plain null checks, not ?.let: let captures locals into a
+                        // Function1 per touch frame; this runs on every frame of the
+                        // gesture and must not allocate.
+                        val b = bg
+                        if (b != null) {
+                            b.setBounds(itemView.left, itemView.top, right, itemView.bottom)
+                            b.draw(c)
+                        }
+                        val ic = icon
+                        if (ic != null) {
+                            val progress = (dX / itemView.width).coerceIn(0f, 1f)
+                            ic.alpha = (80 + 175 * progress).toInt()
+                            val top = itemView.top + (itemView.height - iconSize) / 2
+                            val left = itemView.left + iconMargin
+                            ic.setBounds(left, top, left + iconSize, top + iconSize)
+                            ic.draw(c)
+                        }
+                    }
+                    super.onChildDraw(
+                        c, recyclerView, viewHolder, dX, dY,
+                        actionState, isCurrentlyActive
+                    )
                 }
 
                 override fun getSwipeThreshold(viewHolder: RecyclerView.ViewHolder) = 0.25f

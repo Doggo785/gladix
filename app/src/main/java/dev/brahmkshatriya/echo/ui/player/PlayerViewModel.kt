@@ -30,6 +30,7 @@ import dev.brahmkshatriya.echo.extensions.ExtensionUtils.getExtension
 import dev.brahmkshatriya.echo.extensions.ExtensionUtils.isClient
 import dev.brahmkshatriya.echo.extensions.MediaState
 import dev.brahmkshatriya.echo.playback.MediaItemUtils
+import dev.brahmkshatriya.echo.playback.MediaItemUtils.isPlayNext
 import dev.brahmkshatriya.echo.playback.MediaItemUtils.serverWithDownloads
 import dev.brahmkshatriya.echo.playback.MediaItemUtils.sourceIndex
 import dev.brahmkshatriya.echo.playback.MediaItemUtils.track
@@ -777,7 +778,12 @@ class PlayerViewModel(
         // announced by playback itself. Every other case confirms (unlike addToQueue, which always
         // confirms — queueing is never playback).
         if (!(browser.value?.mediaItemCount == 0 && item is Track)) app.messageFlow.emit(
-            Message(app.context.getString(R.string.adding_x_to_next, item.title))
+            Message(
+                app.context.getString(R.string.adding_x_to_next, item.title),
+                Message.Action(app.context.getString(R.string.undo)) {
+                    undoAddToNext(item)
+                }
+            )
         )
         withBrowser {
             it.sendCustomCommand(addToNextCommand, Bundle().apply {
@@ -786,6 +792,27 @@ class PlayerViewModel(
                 putBoolean("loaded", loaded)
             })
         }
+    }
+
+    // Undo for [addToNext] (swipe-to-queue snackbar and Play Next menu alike). Play Next
+    // front-inserts LIFO right after current, so the just-added item should be the first
+    // Play Next past current with this track id. Matched by track id rather than a stored
+    // index because the insert resolves asynchronously — the index is unknowable at tap time.
+    // No-op when the item hasn't landed yet (tapped instantly) or was already consumed.
+    // KNOWN LIMITATION: removes exactly one item. A menu-driven addToNext of an Album or
+    // Playlist inserts N tracks and undo leaves N-1 behind; likewise a rapid double-swipe
+    // of the same track collapses to one snackbar (SnackBarHandler dedupeKey) whose undo
+    // removes one copy. Single-remove is per spec for the swipe path; widening it to a
+    // contiguous isPlayNext run is a follow-up, not this change.
+    private fun undoAddToNext(item: EchoMediaItem) {
+        val targetId = (item as? Track)?.id
+        val currentId = playerState.current.value?.mediaItem?.mediaId
+        val currentIndex = queue.indexOfFirst { it.mediaId == currentId }
+        val from = if (currentIndex == -1) 0 else currentIndex + 1
+        val index = queue.drop(from).indexOfFirst { media ->
+            media.isPlayNext && (targetId == null || media.track?.id == targetId)
+        }.takeIf { it != -1 }?.plus(from) ?: return
+        removeQueueItem(index)
     }
 
     val progress = MutableStateFlow(0L to 0L)

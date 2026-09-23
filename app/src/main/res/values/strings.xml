@@ -3,6 +3,7 @@
     <string name="app_github_repo" translatable="false">rschwertley/gladix</string>
     <string name="okay">Okay</string>
     <string name="cancel">Cancel</string>
+    <string name="undo">Undo</string>
     <string name="clear_search_history">Clear search history</string>
     <string name="clear_search_history_confirm">Clear your entire search history? This cannot be undone.</string>
     <string name="clear">Clear</string>
