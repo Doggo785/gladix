@@ -118,13 +118,13 @@ class ShufflePlayer(
     }
 
     // Session user block (Play Next + Queue) stays pinned right after the current track when
-    // shuffling; only generated radio/context items are shuffled (Spotify model). Referential
-    // equality (`!= current`) keeps duplicates intact — at most the playing instance is excluded.
+    // shuffling; only generated radio/context items are shuffled (Spotify model). Identity
+    // comparison (`!== current`) keeps duplicates intact — at most the playing instance is excluded.
     // changeQueue() still pulls current to physical index 0, so the pinned block lands at 1..n.
     private fun List<MediaItem>.withUserBlockPinned(): List<MediaItem> {
         val current = currentMediaItem
-        val userOrdered = filter { it.isUserQueued && it != current }
-        val rest = filter { !it.isUserQueued && it != current }.shuffled()
+        val userOrdered = filter { it.isUserQueued && it !== current }
+        val rest = filter { !it.isUserQueued && it !== current }.shuffled()
         return listOfNotNull(current) + userOrdered + rest
     }
 
@@ -139,13 +139,19 @@ class ShufflePlayer(
         isFreshShuffle = false
         // Degrade to a no-op reorder rather than crash if current isn't in `list` (transient divergence);
         // the same NoSuchElementException family as the getItemAt tap-to-jump crash.
-        val currentItem = list.firstOrNull { it.mediaId == currentMediaItem?.mediaId } ?: return
+        // Identity first, mediaId fallback: a duplicate of the playing track must survive — `list - item`
+        // removes by equals() and would drop every value-equal copy.
+        val playing = currentMediaItem
+        val currentIndex = list.indexOfFirst { it === playing }
+            .takeIf { it != -1 }
+            ?: list.indexOfFirst { it.mediaId == playing?.mediaId }
+        if (currentIndex == -1) return
+        val after = list.filterIndexed { i, _ -> i != currentIndex }
         // Current+upcoming model: current stays at index 0 with NOTHING before it; everything else
         // follows as upcoming. (The old before/after split placed ~half the shuffled tracks above
         // current, stranding them — G3.) The removeMediaItems(0, currentIndex) below also heals any
         // pre-existing stranded-above state by pulling current back to index 0. Uses the inner
         // player.* calls (not the overrides), so `original` and `backStack` are left untouched.
-        val after = list - currentItem
         isRearranging = true
         try {
             if (player.currentMediaItemIndex > 0)
@@ -221,7 +227,13 @@ class ShufflePlayer(
         // out-of-range → no-op instead of IndexOutOfBounds. Guard FIRST so neither `original` nor the
         // player is half-updated. Mirrors jumpForwardTo.
         if (index !in 0 until mediaItemCount) return
-        getItemAt(index)?.let { original = original - it }
+        // By index, not by value: `original - item` removes by equals() and would drop every
+        // value-equal duplicate of the departing track (same defect family as the range overload's
+        // multiplicity fix below — a short `original` loses a track on the next unshuffle).
+        getItemAt(index)?.let { existing ->
+            val at = original.indexOf(existing)
+            if (at != -1) original = original.toMutableList().apply { removeAt(at) }
+        }
         player.removeMediaItem(index)
     }
 
