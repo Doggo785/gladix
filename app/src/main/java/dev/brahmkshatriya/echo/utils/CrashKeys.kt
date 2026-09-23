@@ -64,6 +64,30 @@ import java.util.concurrent.atomic.AtomicInteger
  * exists to diagnose, can fire several times a second. Its writes are a handful of map puts with no allocation
  * beyond the values, so this is acceptable — but do not add anything expensive to that path.
  *
+ * ⚠⚠ EVERY HEAP SAMPLE IN EVERY REPORT IS FROM THE DYING END - EXCEPT heap_first_mb. This is the
+ * general statement that notes 2 and 3 above are instances of, and it is the one to carry: stampAge
+ * re-stamps on EVERY iteration, so a checkpoint that fires in a loop reports its LAST occurrence. That
+ * is why age_s_build == age_s_conn == age_s_svc == process_age_s does NOT mean they fired together - it
+ * means each fired last, at the dying end. heap_used/headroom are sampled at those same checkpoints and
+ * inherit it. ONLY heap_first_mb is CAS-guarded (heapFirstRecorded), which is what makes a low value
+ * there - 18-22MB in the August reports - genuinely mean "the process started small".
+ *
+ * ⚠️ THE PRACTICAL COROLLARY: READ headroom BEFORE TREATING A heap_peak_mb AS A MEASUREMENT.
+ * used 255 WITH HEADROOM 0 is maxMemory on a 256MB-heap device - "the heap was full", near-tautological,
+ * NOT a quantity to account for. A 2026-09-22 ANR showed heap_peak_mb 255 with HEADROOM 84MB, so that
+ * device's maxMemory is >= ~339MB and 255 is a genuine high-water mark. SAME NUMBER, OPPOSITE
+ * EVIDENTIAL VALUE. The headroom check works precisely BECAUSE of the dying-end property above: a
+ * saturated sample tells you the ceiling, not the allocation.
+ *
+ * ⚠⚠ AND THE AUGUST 255/0 CLUSTER IS NOT OPEN - IT WAS ROOT-CAUSED IN A LATER SESSION, WHICH THE
+ * SESSION THAT RAN THE HUNT COULD NOT KNOW. Anyone landing on that elimination table will read it as
+ * an unsolved allocation mystery. IT WAS NOT AN ALLOCATION PROBLEM AT ALL: ~1050 service creations in
+ * 42-73 seconds (14-25 per second), each rebuilding the 81-item queue from disk - roughly 85,000
+ * MediaItem constructions in a minute. THE HEAP DID NOT LEAK; GC COULD NOT KEEP UP. The OOM was the
+ * CONSEQUENCE and the restart loop was the BUG. So the table's per-candidate MB figures were answering
+ * the wrong question - none of them could have summed to a ceiling reading.
+ * Do not use that 255 as a target to explain, and do not relate a later 255 to it.
+ *
  * Heap note: "used" is totalMemory - freeMemory and is sampled WITHOUT forcing a GC, so it includes garbage
  * not yet collected and can overstate live data under a high allocation rate. "headroom" is maxMemory - used,
  * i.e. room to the growth limit — NOT Runtime.freeMemory (free-within-committed, which is misleading near OOM).

@@ -68,8 +68,37 @@ class FeedAdapter(
     }
 
     private val viewPool = RecyclerView.RecycledViewPool()
+    // ⚠⚠ peek, NOT getItem, AND THE DIFFERENCE IS AN ANR. Build 1107 ANR'd on the fast-scroller
+    // drag path with this call at the bottom of the stack. THE CHAIN: a thumb drag runs
+    // PixelFastScrollViewHelper.scrollTo -> nestedScrollBy -> fill -> layoutChunk ->
+    // getItemDecorInsetsForChild -> GridAdapter.VerticalSpacingItemDecoration.getItemOffsets, which
+    // calls GridLayoutManager.SpanSizeLookup.getSpanGroupIndex. THAT METHOD WALKS: its loop is
+    // `for (i = start; i < adapterPosition; i++) getSpanSize(i)`, and `start` is 0 whenever the span
+    // cache is cold. So ONE child's decoration cost is O(position) getSpanSize calls - each routed
+    // through TWO GridAdapter.Concat levels on a media-details page - and each landing HERE.
+    // ⚠️ getItem IS NOT A LOOKUP. AsyncPagingDataDiffer.getItem does two StateFlow CAS updates
+    // and writes lastAccessedIndex, then PagingDataPresenter.get does two MORE and calls
+    // `hintReceiver.processHint(pageStore.createAccessHintForIndex(index))` - a PREFETCH SIGNAL. At
+    // O(position) calls per child that is thousands of spurious access hints per layout, which also
+    // CLOSES A LOOP: a hint triggers a page load, the insert fires onItemsAdded, GridLayoutManager
+    // clears the span-group cache, and the next walk starts from 0 again.
+    // peek returns the identical value with none of it (paging 3.5.1, AsyncPagingDataDiffer:484).
+    //
+    // ⚠⚠ IT IS A DROP-IN ONLY BECAUSE enablePlaceholders = false (PagedSource.kt). THIS IS THE
+    // PART THAT WILL BE REDISCOVERED THE HARD WAY. With placeholders OFF, every index in
+    // [0, itemCount) is a loaded item, so peek and getItem return the same non-null object. TURN
+    // PLACEHOLDERS ON AND THEY DIVERGE: peek returns null for an unloaded slot where getItem would
+    // have triggered the load - and the `?: 0` fallback below IS NOT NEUTRAL. Ordinal 0 is
+    // FeedType.Enum.Header, and getSpanSize maps Header -> count, i.e. FULL WIDTH. So enabling
+    // placeholders would silently render every unloaded row as a full-width header, with no crash
+    // and no log. If placeholders are ever enabled, this fallback must be revisited FIRST.
+    //
+    // ⚠️ onBindViewHolder MUST KEEP USING getItem - do not "finish the job" there. That call
+    // fires a hint for an item actually being displayed, which is the signal Paging is designed
+    // around. Removing the walk's hints makes that signal MORE accurate, not less: the walk was
+    // rewriting lastAccessedIndex thousands of times per layout and leaving it at position-1.
     override fun getItemViewType(position: Int) =
-        runCatching { getItem(position)!! }.getOrNull()?.type?.ordinal ?: 0
+        runCatching { peek(position)!! }.getOrNull()?.type?.ordinal ?: 0
 
     private var isPlayButtonShown = false
     private fun FeedType.toTrack(): Track? = when (this) {
@@ -240,8 +269,12 @@ class FeedAdapter(
             MediaGrid, VideoHorizontal -> 1
         }
 
+    // peek for the same reason as getItemViewType - see the note there. THIS IS THE SECOND ROUTE
+    // FROM THE SAME getItemOffsets, and changing only the other one would have left it firing
+    // access hints on the hot path. Once per child rather than O(position), so it was never the
+    // ANR, but it is the same call on the same drag and they move together.
     override fun isSectionHeader(position: Int) =
-        runCatching { getItem(position) }.getOrNull()?.type == Header
+        runCatching { peek(position) }.getOrNull()?.type == Header
 
 
     private fun clearState() {

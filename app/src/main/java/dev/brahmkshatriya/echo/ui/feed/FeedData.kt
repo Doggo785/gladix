@@ -13,6 +13,7 @@ import dev.brahmkshatriya.echo.common.models.Tab
 import dev.brahmkshatriya.echo.di.App
 import dev.brahmkshatriya.echo.extensions.ExtensionLoader
 import dev.brahmkshatriya.echo.common.models.Playlist
+import dev.brahmkshatriya.echo.common.models.Metadata
 import dev.brahmkshatriya.echo.extensions.ExtensionUtils.getExtensionOrThrow
 import dev.brahmkshatriya.echo.extensions.cache.Cached
 import dev.brahmkshatriya.echo.extensions.builtin.offline.MediaStoreUtils.searchBy
@@ -299,12 +300,36 @@ data class FeedData(
     // fix for the flash was reverted over stale-content risk and it remains open.
     val pagingFlow =
         cachedFeedTypeFlow.combineTransformLatest(loadedFeedTypeFlow) { cached, loaded ->
-            emitAll(PagedSource(loaded, cached).flow)
+            // Taken from whichever Result actually carries data - loaded first, cached as fallback -
+            // so it always describes the PagedData being wrapped. It travels WITH the data (see
+            // getFeedSourceData); it is not looked up here.
+            val metadata = (loaded?.getOrNull() ?: cached?.getOrNull())?.first
+            emitAll(
+                PagedSource(
+                    loaded?.map { it.second }, cached?.map { it.second }, metadata
+                ).flow
+            )
         }.cachedIn(scope)
 
+    /**
+     * ⚠⚠ RETURNS THE Metadata PAIRED WITH THE PagedData IT DESCRIBES, AND THE PAIRING IS THE
+     * POINT - DO NOT REPLACE IT WITH A READ FROM A SIBLING FLOW. PagedSource needs the extension's
+     * Metadata to convert a load failure into an AppException (see the note at PagedSource.transform;
+     * a wrong one names the wrong extension in the message AND opens the wrong login screen).
+     * The obvious cheaper alternative is to read the id at the pagingFlow site from
+     * loadedDataFlow/cachedDataFlow - a THIRD flow, not one of the two being combined there. That is
+     * the shape the sort-write race was: "a fresh tabId against a stale sortState, FROM TWO SEPARATE
+     * COLLECTORS", named in the comment above pagingFlow and fixed on 2026-09-06. Resolving it here,
+     * from the same `result` the PagedData is built from, makes the mismatch unrepresentable.
+     * ⚠️ NOT AN ARGUMENT FROM THE DOUBLE-RENDER FLASH. That defect is in the same comment and
+     * does NOT support this: it is explicitly "redundant work with CORRECT INPUTS". It was cited for
+     * this once, wrongly. The sort-write race is the half that applies.
+     * (Same lesson as SearchViewModel.quickFeed pairing ids with items rather than holding them in a
+     * separate field.)
+     */
     private suspend fun getFeedSourceData(
         result: Result<State<Feed.Data<Shelf>>?>
-    ): Result<PagedData<FeedType>> = withContext(Dispatchers.IO) {
+    ): Result<Pair<Metadata?, PagedData<FeedType>>> = withContext(Dispatchers.IO) {
         val tabId = selectedTabFlow.value?.id
         val data = if (feedSortState.value != null || searchQuery != null) {
             result.mapCatching { state ->
@@ -417,7 +442,14 @@ data class FeedData(
                 }.getOrThrow()
             }
         }
-        data
+        // Resolved from the SAME `result` the data above was built from. runCatching because
+        // getExtension throws on an unknown id (getExtensionOrThrow) and is MUSIC-typed - a feed from
+        // another extension type resolves to null, which simply leaves the error untransformed, i.e.
+        // exactly today's behaviour. Never let this throw: it would turn a renderable feed into a
+        // failed one over a diagnostic detail.
+        val metadata = result.getOrNull()?.extensionId
+            ?.let { id -> runCatching { getExtension(id).metadata }.getOrNull() }
+        data.map { metadata to it }
     }
 
     private companion object {

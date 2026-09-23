@@ -172,6 +172,62 @@ android {
     // the release block.
     buildTypes {
         release {
+            // ⚠⚠ THE ONLY PROJECT-LEVEL LEVER OVER STUDIO'S SELECTED BUILD VARIANT. Studio
+            // intermittently reopens on `debug` after `release` was selected. The selection is IDE state,
+            // not project state: it lives in
+            //   %LOCALAPPDATA%/Google/AndroidStudio<VERSION>/projects/<name>.<hash>/
+            //       external_build_system/modules/Echo.app.xml
+            //   as <option name="SELECTED_BUILD_VARIANT" value="release" />
+            // keyed PER STUDIO VERSION (misc.xml has ExternalStorageConfigurationManager enabled, which is
+            // also why this project has no .iml files). Studio makes a fresh directory on every update and
+            // leaves the old one behind, so the selection does not survive an update - verified 2026-09-17,
+            // five such directories existed, the four older ones dormant with `debug` and only the newest
+            // carrying `release`. `/.idea` is git-ignored, but that is NOT the cause: the variant is not
+            // stored in .idea at all.
+            // This line is the one place the choice can be expressed in the REPO.
+            //
+            // ⚠️ WHAT IS VERIFIED vs WHAT IS NOT, because the distinction decides whether this
+            // actually fixes the symptom:
+            //   VERIFIED (AGP 9.3.2, decoded from the jars): ApplicationBuildType.setDefault/isDefault
+            //     exists and is NOT deprecated; it is reachable here because
+            //     ApplicationExtension.getBuildTypes() is NamedDomainObjectContainer<ApplicationBuildType>
+            //     (it is NOT on the base BuildType); internal/ide/v2/ConvertersKt reads it when building
+            //     the v2 tooling model, and com.android.builder.model.v2.dsl.BaseConfig declares
+            //     `Boolean isDefault()`. So it genuinely reaches the IDE. It governs the INITIAL selection.
+            //   NOT VERIFIED: whether it ALSO serves as the fallback when the stored selection is missing
+            //     or unreadable - that is inside Android Studio and there is no source for it here. If the
+            //     reset persists, that is the reason, and this line is still correct but insufficient.
+            //
+            // ⚠️ DEBUG WAS DEFAULT BY CONVENTION, NOT BY DECLARATION. Nothing in this project
+            // has ever set isDefault (grep across every .kts/.gradle: zero hits), so this is making an
+            // implicit choice explicit, NOT overriding a deliberate earlier one. It also matches practice:
+            // the documented build workflow is Build Variants -> release, then Build APK(s).
+            //
+            // ⚠️ BLAST RADIUS IS THE DSL PROPERTY AND THE MODEL SERIALISER, NOTHING ELSE. Every
+            // class under com/android/build in the AGP jar referencing isDefault is either internal/dsl/
+            // (the property) or internal/ide/v2/ (the converter); the remaining hits are an unrelated
+            // isDefault on NDK ABI info. NOTHING resolves variants, substitutes dependencies, or configures
+            // tasks from it - cross-module matching is matchingFallbacks, which nightly and stable set
+            // below and which this does not touch. Two project mechanisms that read build types are also
+            // unaffected because both key on WHAT IS BEING BUILT, not on which variant is default: the
+            // updater's stable/nightly gate, and the extension-ABI guard that runs only on R8 variants.
+            //
+            // ⚠⚠ THE PROJECT'S OWN SESSION NOTES CONTRADICT THIS LINE, AND THIS LINE IS THE
+            // CURRENT ONE. Two entries predate it and will read as instructions:
+            //   • a June note: "Build variant must be set to debug in Build Variants panel"
+            //   • a "Build Variants — which goes where" section describing the selection as a
+            //     MANUAL step
+            // Both were written while `debug` was the implicit default and the selection was IDE-only
+            // state; neither is a deliberate choice of debug over release. Recorded HERE because the
+            // notes are outside this repo and may lag indefinitely — so the contradiction has to be
+            // resolvable from inside the tree, the same reason every other correction in this
+            // codebase goes inline at the wrong claim rather than into a side document.
+            // ⚠️ IF YOU CAME HERE FROM ONE OF THOSE NOTES: the manual step is no longer needed,
+            // and `release` is the project-declared default. If you WANT debug, select it — that
+            // still works and still persists per Studio version; this only changes what a fresh or
+            // updated Studio starts on.
+            isDefault = true
+
             // ⚠️ SIGNED WITH THE DEBUG KEYSTORE, DELIBERATELY (2026-09-05). Every APK shipped to GitHub
             // before this date was a debug build, so it carries the debug key's signature. Android refuses
             // an in-place upgrade across a change of signing identity, so signing release with a NEW key

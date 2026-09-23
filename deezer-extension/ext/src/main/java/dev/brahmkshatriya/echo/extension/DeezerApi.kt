@@ -78,9 +78,25 @@ class DeezerGatewayException(
  * to the login prompt - the user would be back to an unexplained playback error with nothing to
  * indicate the guard had stopped firing. Same caution as requireJsonObject in this file: test for
  * what we require (an explicit error from Deezer) rather than sniffing for what we do not want.
- * ⚠️ THE MESSAGE IS DELIBERATELY BYTE-IDENTICAL TO THE Exception IT REPLACES
- * ("Login failed: <error>"), so the existing Crashlytics issue keeps its grouping and its history
- * rather than forking into a new one at the moment the behaviour changes.
+ * ⚠⚠ TWO STRINGS, DELIBERATELY: `message` IS FOR THE USER, `errorText` IS FOR THE LOG.
+ * Do not collapse them. Same rule, and the same reason, as DeezerGatewayException twelve lines
+ * above: the generic message is what reaches a snackbar, where Deezer's internal wording would be
+ * noise, and errorText is what makes a report decidable. It rides on toString(), so it still
+ * appears in the stack trace even though it is absent from the user-facing message.
+ * ⚠️ THE MESSAGE STATES WHAT HAPPENED AND CLAIMS NOTHING ABOUT WHY, and that is a
+ * constraint rather than a style choice - see the unverified note below. "Deezer did not accept
+ * these credentials" is true of a wrong password, a suspended account, a forced reset and a
+ * region block alike. DO NOT rewrite it to say "wrong password".
+ *
+ * ⚠️ [REVERSED 2026-09-22] THIS MESSAGE WAS DELIBERATELY BYTE-IDENTICAL TO THE PLAIN
+ * Exception IT REPLACED, AND THE REVERSAL IS ALSO DELIBERATE - neither is an oversight.
+ *   WHY IT WAS: the muted Crashlytics issue would keep its grouping and its history across the
+ *     moment the behaviour changed, so the fix could be judged against the same issue that
+ *     motivated it rather than against a fresh one with no past.
+ *   WHY IT IS NOT ANY MORE: the fix is CONFIRMED FIRING IN THE FIELD (2026-09-22 - the typed
+ *     exception was raised and the retry broke, exactly as designed), so the grouping has already
+ *     done its job. Forking the issue now costs a history nobody needs again; a readable message
+ *     is worth more. EXPECT A NEW ISSUE TO APPEAR - that is this change, not a new defect.
  * ⚠️ NOT thrown for "no access_token in response" / "no ARL in response". Those are SHAPE
  * surprises, not refusals - Deezer said nothing - so they stay plain Exceptions and stay retryable.
  *
@@ -104,7 +120,9 @@ class DeezerGatewayException(
  */
 class DeezerAuthRejectedException(
     val errorText: String,
-) : Exception("Login failed: $errorText")
+) : Exception("Deezer did not accept these credentials.") {
+    override fun toString() = "DeezerAuthRejectedException(error=$errorText)"
+}
 
 class DeezerApi(private val session: DeezerSession) {
 
@@ -360,6 +378,11 @@ class DeezerApi(private val session: DeezerSession) {
                             )
                         } catch (_: DeezerAuthRejectedException) {
                             session.isArlExpired(true)
+                            // Latch the refusal so the NEXT attempt costs nothing. This block re-runs
+                            // on every Injectable.value() while it keeps throwing, and AA calls that
+                            // per extension per browse-root build - see DeezerSession
+                            // .credentialsRejected for why a cheap repeat matters more than it looks.
+                            session.setCredentialsRejected(true)
                             throw ClientException.LoginRequired()
                         }
                         DeezerExtension().setLoginUser(userList.first())

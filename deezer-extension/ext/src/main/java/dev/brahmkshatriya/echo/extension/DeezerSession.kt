@@ -52,6 +52,39 @@ class DeezerSession(
         arlExpired = expired
     }
 
+    /**
+     * Deezer has REFUSED these stored credentials. Distinct from [arlExpired], and the distinction is
+     * the point: an expired ARL is RECOVERABLE without the user (re-login silently with the stored
+     * email/pass), a refusal is NOT - only the user can fix it.
+     *
+     * ⚠⚠ IT EXISTS TO MAKE A REPEATED FAILURE CHEAP, NOT TO REMEMBER STATE FOR ITS OWN SAKE.
+     * handleArlExpiration runs inside the Injectable INJECTION BLOCK (ExtensionLoader.injected), and
+     * Injectable.value() only clears `injections` AFTER the block completes - so a block that throws
+     * leaves the injections pending and RE-RUNS ON EVERY LATER value() CALL. Android Auto calls
+     * value() for every enabled extension on every browse-root build (Extension<*>.toMediaItem), so
+     * without this flag a user with dead credentials submits a fresh rejected login to Deezer on
+     * EVERY AA ROOT BUILD - the shared-account rate-limit exposure that getArlByEmail's retry-break
+     * exists to bound, reintroduced one level up. With it, the re-run costs a boolean read and a
+     * throw. The user still gets the prompt every time; Deezer stops being asked.
+     * ⚠️ FREQUENCY, STATED HONESTLY BECAUSE IT IS THE MULTIPLIER: the AA root is built at least
+     * once per connect (measured, recorded at AndroidAutoCallback's ROOT-subscription note) and again
+     * per RENEGOTIATION (onDisconnected fires per renegotiation, not per connection). HOW OFTEN
+     * RENEGOTIATIONS HAPPEN IS NOT MEASURED ANYWHERE - do not repeat the "frequent mid-drive" claim
+     * in that file's stale-tile note, which attributes it to the onDisconnected note, which does not
+     * say it.
+     *
+     * Set where a silent re-login is refused; cleared by [DeezerExtension.setLoginUser], which runs on
+     * every successful login and on logout. Not persisted - a fresh process retries once, which is
+     * correct: the credentials may have been fixed on the Deezer side.
+     */
+    @Volatile
+    var credentialsRejected: Boolean = false
+        private set
+
+    fun setCredentialsRejected(rejected: Boolean) {
+        credentialsRejected = rejected
+    }
+
     companion object {
         @Volatile
         private var instance: DeezerSession? = null

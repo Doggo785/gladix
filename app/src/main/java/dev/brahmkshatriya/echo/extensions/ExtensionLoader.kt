@@ -141,6 +141,19 @@ class ExtensionLoader(
         if (manual) settings.edit { putString(LAST_EXTENSION_KEY, extension.id) }
         CrashKeys.onExtensionSwitch(extension.id)   // switch counter + current_extension_id (once per switch)
         current.value = extension
+        // ⚠⚠ OPEN ITEM (found 2026-09-22, UNRELATED TO ANYTHING THAT SENT YOU HERE):
+        // onExtensionSelected() RUNS TWICE ON A FRESH EXTENSION. ExtensionUtils.get is
+        // `instance.value().getOrThrow().block()`, and Injectable.value() runs the INJECTION LIST
+        // first - which already contains onExtensionSelected() (see `injected` below, the last entry
+        // in the block). So value() invokes it, and then `.block()` invokes it again.
+        // It is only this pairing: onExtensionSelected is the sole member of the injection list that
+        // is also passed as a `get` block anywhere.
+        // PRE-EXISTING and not known to be harmful - the implementations seen so far are idempotent
+        // (Deezer's re-runs handleArlExpiration, which is a no-op once the ARL is fresh). NOT
+        // measured, and NOT a licence to assume the next extension's is: a third-party
+        // onExtensionSelected doing real work would do it twice on every cold selection.
+        // Recorded here rather than left in the thread it surfaced in, which was about cancellation
+        // shapes and would have buried it.
         scope.launch {
             extension.get { onExtensionSelected() }.getOrThrow(app.throwFlow)
         }

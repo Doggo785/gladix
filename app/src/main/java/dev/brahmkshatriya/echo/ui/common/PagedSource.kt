@@ -8,17 +8,35 @@ import androidx.paging.PagingData
 import androidx.paging.PagingSource
 import androidx.paging.PagingState
 import dev.brahmkshatriya.echo.common.helpers.PagedData
+import dev.brahmkshatriya.echo.common.models.Metadata
+import dev.brahmkshatriya.echo.extensions.exceptions.AppException.Companion.toAppException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.flowOn
 
 class PagedSource<T : Any>(
     private val loaded: Result<PagedData<T>>?,
-    private val cached: Result<PagedData<T>>? = null
+    private val cached: Result<PagedData<T>>? = null,
+    /**
+     * Whose extension this page data belongs to. When supplied, a load failure is converted to an
+     * [dev.brahmkshatriya.echo.extensions.exceptions.AppException] before it reaches the UI.
+     *
+     * ⚠⚠ NULLABLE BECAUSE ONE CALLER CANNOT PAIR IT SAFELY YET, NOT BECAUSE IT IS OPTIONAL IN
+     * SPIRIT. FeedData supplies it; LyricsViewModel does not, and passing null there preserves that
+     * screen's behaviour byte-for-byte rather than half-fixing it. See the note on `transform`.
+     */
+    private val extension: Metadata? = null,
 ) : PagingSource<String, T>() {
 
     val flow = Pager(
         PagingConfig(
             pageSize = 10,
+            // ⚠⚠ FeedAdapter DEPENDS ON THIS BEING false - DO NOT FLIP IT WITHOUT READING THAT
+            // FILE FIRST. FeedAdapter.getItemViewType and isSectionHeader use PagingDataAdapter.peek
+            // rather than getItem (an ANR fix - the span-group walk calls them O(position) times per
+            // child during a fast-scroller drag). peek is equivalent to getItem ONLY while there are
+            // no placeholders: with placeholders ON it returns null for an unloaded slot, and
+            // getItemViewType's `?: 0` fallback resolves to FeedType.Enum.Header, which getSpanSize
+            // maps to FULL WIDTH. Every unloaded row would render as a full-width header, silently.
             enablePlaceholders = false,
             prefetchDistance = 20,
             // Enable Paging3 page-dropping to bound deep-scroll growth (was unbounded → OOM contributor).
@@ -50,9 +68,68 @@ class PagedSource<T : Any>(
             LoadResult.Page(page.data, key, page.continuation)
         }.getOrElse { error ->
             val cachedPage = cached?.mapCatching { it.loadPage(key) }?.getOrNull()
-            return if (cachedPage == null || cachedPage.data.isEmpty()) LoadResult.Error(error)
+            return if (cachedPage == null || cachedPage.data.isEmpty())
+                LoadResult.Error(transform(error))
             else LoadResult.Page(cachedPage.data, key, cachedPage.continuation)
         }
+    }
+
+    /**
+     * ⚠⚠ THE ONLY EXTENSION CALL PATH IN THE APP THAT DID NOT APPLY toAppException, AND THE
+     * SYMPTOM WAS A RETRY BUTTON ON AN ERROR RETRYING CANNOT FIX. Every other extension call goes
+     * through ExtensionUtils.get, which wraps failures via toAppException. `load` above did not, so a
+     * raw ClientException.LoginRequired thrown from inside an extension's paging lambda reached
+     * FeedLoadingAdapter.getStateViewType, missed its `is AppException.LoginRequired -> 3` arm
+     * (a ClientException is not an AppException), fell to `else -> 2`, and rendered RETRY.
+     * ⚠️ SO THIS IS NOT A NEW POLICY FOR THIRD-PARTY EXTENSIONS - IT REMOVES AN INCONSISTENCY.
+     * A LoginRequired from any NON-paging path already renders as a sign-in affordance for every
+     * extension; this gives the paging path the behaviour the rest of the app already has. (And where
+     * an extension's LoginRequired is genuinely ambiguous, a sign-in prompt is at worst a wasted tap,
+     * while Retry on a dead credential can never succeed.)
+     * REACHABLE, TRACED 2026-09-22: DeezerArtistClient puts handleArlExpiration() inside a
+     * PagedData.Continuous load lambda, which is exactly what `load` invokes via loadPage(key).
+     * ⚠️ WHAT UNBLOCKED THIS: an August closure held that LoginRequired could not be routed to
+     * the login shelf because it could not distinguish "user must sign in" from a recoverable stale
+     * ARL. That is no longer true - see the four-site table at DeezerExtension.handleArlExpiration.
+     * If a future extension reintroduces an ambiguous LoginRequired, THAT table is the thing to
+     * re-check, not this line.
+     * ⚠️ AND THE credentialsRejected FLAG DID NOT CAUSE THIS - IT MADE IT FAIL FAST. Before the
+     * flag the same paging load produced the same Retry button after a network round trip; the flag
+     * only removed the round trip. THE RETRY BUTTON WAS ALWAYS WRONG HERE. Do not revert the flag
+     * chasing this symptom.
+     * ⚠⚠ WHICH SURFACES THIS COVERS - AUDITED 2026-09-22 SO IT IS NOT RE-DERIVED. FeedLoadingAdapter
+     * has SIX construction sites (scope: app/src/main/java, recursive), and only the two backed by a
+     * PagedSource could ever see a RAW extension exception:
+     *   FeedAdapter (header + footer)        <- PagedSource via FeedData        COVERED (metadata passed)
+     *   LyricsItemAdapter (header + footer)  <- PagedSource via LyricsViewModel COVERED (metadata passed)
+     *   LyricsFragment.lyricsErrorAdapter    <- Cached.loadLyrics, which uses extension.getAs
+     *                                           -> ALREADY an AppException, never raw
+     *   MediaMoreBottomSheet.loadingAdapter  <- itemResultFlow <- Cached.loadMedia -> loadItem,
+     *                                           which uses getAs on EVERY branch -> already wrapped
+     * The last two set LoadState.Error by hand from a Result, which LOOKS like the same hazard and is
+     * not: their Results came through ExtensionUtils.get. So there is no third surface, and the reason
+     * is the same one that makes this function necessary - `load` is the ONLY extension call path in
+     * the app that does not already route through toAppException.
+     * ⚠️ IF A SEVENTH FeedLoadingAdapter APPEARS, THE QUESTION TO ASK IS NOT "does it show
+     * errors" BUT "where does its Result come from" - through getAs (safe) or straight off an
+     * extension lambda (needs this).
+     *
+     * ⚠⚠ DO NOT "FIX" THIS INSTEAD BY WIDENING getStateViewType's `when` TO ACCEPT A RAW
+     * ClientException.LoginRequired. FeedLoadingAdapter's LoginRequired holder does an unchecked
+     * `error as AppException.LoginRequired` in bind(), guarded ONLY by that `when` - routing a raw
+     * ClientException to holder 3 manufactures a ClassCastException there, not here. The comment at
+     * that cast cites a field-proven instance of exactly this coupling. The transform is correct
+     * PRECISELY BECAUSE it produces a genuine AppException.
+     *
+     * ⚠️ THE runCatching IS DELIBERATE AND NARROW: toAppException RETHROWS a plain
+     * CancellationException by design, and today a cancelled page load becomes LoadResult.Error like
+     * any other. Letting that rethrow escape would be a behaviour change nobody asked for, so it is
+     * caught and the original returned - status quo preserved. TimeoutCancellationException is
+     * checked BEFORE that arm inside toAppException, so it still wraps correctly.
+     */
+    private fun transform(error: Throwable): Throwable {
+        val metadata = extension ?: return error
+        return runCatching { error.toAppException(metadata) }.getOrElse { error }
     }
 
     companion object {

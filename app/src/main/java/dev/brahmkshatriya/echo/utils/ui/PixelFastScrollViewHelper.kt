@@ -332,6 +332,22 @@ class PixelFastScrollViewHelper(
      * It also clamps at both ends by itself, which is the other half of why no end anchor is needed.
      * stopScroll() first, matching RecyclerViewHelper.
      *
+     * ⚠⚠ [2026-09-22] A LATER ANR RUNS THROUGH THIS CALL AND THIS CHANGE IS NOT ITS CAUSE - IT
+     * IS WHY THE CAUSE IS VISIBLE. Build 1107 ANR'd on a thumb drag with nestedScrollBy in the stack,
+     * which reads as a regression from the switch below. IT IS THE OPPOSITE.
+     * The ANR's cost is GridLayoutManager.SpanSizeLookup.getSpanGroupIndex, reached from
+     * GridAdapter's item decoration inside layoutChunk -> getItemDecorInsetsForChild. THAT IS IN THE
+     * LAYOUT PASS, WHICH BOTH SCROLL PATHS PERFORM IDENTICALLY - scrollBy and nestedScrollBy lay out
+     * the same children the same way. GapWorker's prefetch does create+bind only
+     * (flushTaskWithDeadline -> prefetchPositionWithDeadline -> tryGetViewHolderForPositionByDeadline,
+     * plus a nested pass for carousels) and NEVER reaches getItemDecorInsetsForChild, so it adds no
+     * span-group walks at all. It is also deadline-bounded: when the main thread is saturated,
+     * prefetch degrades rather than compounding.
+     * So the span walk was ALWAYS on this path. What this change removed was the carousel-binding
+     * term sitting ON TOP of it - and removing the larger term is what left the smaller one exposed
+     * as the dominant cost. Before this change the same drag would have ANR'd with carousel binding
+     * masking the real cause. DO NOT REVERT THIS IN RESPONSE TO THAT ANR.
+     *
      * ⚠️ nestedScrollBy, NOT scrollBy — THIS IS THE NESTED-PREFETCH PATH, NOT A NESTED-SCROLLING WISH.
      * `RecyclerView.scrollBy` (RecyclerView.java:2051) calls scrollByInternal DIRECTLY and is the one
      * public scroll entry point that never posts to GapWorker. All three paths that do post go through
@@ -548,6 +564,40 @@ class PixelFastScrollViewHelper(
             gestureSpan = librarySpan
             lastFraction = fraction
             pendingPixels = 0.0
+            // ⚠⚠ THIS LINE SETS THE COST OF THE WHOLE GESTURE, AND IT IS O(DRAG DISTANCE).
+            // An absolute positioning gesture is expressed here as a RELATIVE scroll:
+            // LinearLayoutManager.scrollBy -> fill() lays out and recycles EVERY child across the
+            // delta, so dragging the thumb across a 3514-item feed lays out every item in between.
+            // THREE DISTINCT ANR/JANK COSTS HAVE NOW BEEN FOUND ON THIS ONE GESTURE, AND ALL THREE
+            // ARE PER CHILD LAID OUT:
+            //   1. nested carousel binding      - fixed 2026-09 by moving to nestedScrollBy (GapWorker)
+            //   2. the span-group walk          - mitigated 2026-09-22 by FeedAdapter using peek
+            //   3. Coil request restart on view attach (ViewTargetRequestManager
+            //      .onViewAttachedToWindow -> restart -> enqueue) - open
+            // Each fix reduces a CONSTANT. None of them changes the ORDER, because the multiplier is
+            // "how many children get laid out" and that is decided here. Expect a fourth.
+            //
+            // ⚠⚠ COALESCING TOUCH MOVES TO ONE PER FRAME DOES NOT HELP - AND IT IS THE FIRST
+            // THING ANYONE WILL REACH FOR. fill() is O(distance), so THREE 1000px scrolls and ONE
+            // 3000px scroll lay out the SAME CHILDREN and do the same per-child work. Coalescing
+            // saves per-pass overhead only. Do not spend a build on it.
+            //
+            // ⚠️ THE ORDER-OF-GROWTH FIX IS ABSOLUTE POSITIONING - scrollToPositionWithOffset,
+            // which discards the layout and builds ONE SCREEN regardless of distance. It divides all
+            // three costs at once, including a fourth nobody has found. TWO OBSTACLES, BOTH REAL:
+            //   (a) IT SUPERSEDES THE SEPTEMBER DECISION RATHER THAN EXTENDING IT. nestedScrollBy was
+            //       chosen because it is the only public API reaching nestedScrollByInternal, i.e. the
+            //       only one that posts to GapWorker - see the note above. scrollToPositionWithOffset
+            //       gets no GapWorker, so carousel binding returns to the synchronous pass, for ONE
+            //       screen instead of N. Probably a large net win; that is a MEASUREMENT, not an
+            //       argument, and it must be measured before the switch.
+            //   (b) ⚠⚠ IT NEEDS A PIXEL->POSITION MAPPING, WHICH MEANS CONFRONTING
+            //       getScrollRange() RATHER THAN WORKING AROUND IT - AND THAT IS THE SAME UNSTABLE
+            //       MODEL BEHIND THE "STOPS TWO-THIRDS OF THE WAY DOWN" SEARCH FAULT recorded above
+            //       (4082/5918 = 0.69). SO THE STRUCTURAL FIX FOR THE DRAG ANRs AND THE FIX FOR THE
+            //       SEARCH SCROLLER FAULT ARE THE SAME PIECE OF WORK. Anyone scoping either one
+            //       separately is scoping half of it and will meet the other half mid-build. This is
+            //       the single most useful thing on this line: PLAN THEM TOGETHER.
             val jump = offset - view.computeVerticalScrollOffset()
             if (jump != 0) {
                 logDrag(jump)

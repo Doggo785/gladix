@@ -172,9 +172,63 @@ class DeezerExtension : HomeFeedClient, TrackClient, LikeClient, RadioClient,
         session.settings = settings
     }
 
+    /**
+     * ⚠⚠ THE runCatching LETS ClientException.LoginRequired THROUGH AND SWALLOWS THE REST,
+     * AND THAT ASYMMETRY IS THE POINT. It used to swallow everything, which meant THE EARLIEST
+     * MOMENT WE KNOW THE CREDENTIALS ARE DEAD WAS THE ONE MOMENT WE SAID NOTHING: a user whose
+     * stored credentials had gone stale got silence at app open and only met the sign-in prompt
+     * when they next tapped a track.
+     * The chain that produces it, traced rather than assumed: handleArlExpiration -> api.makeUser()
+     * -> callApi("deezer.getUserData") -> the invalid-CSRF branch -> a silent re-login -> refused
+     * -> DeezerAuthRejectedException -> converted there to LoginRequired. The conversion was always
+     * working; this line was discarding its result.
+     *
+     * ⚠️ EVERYTHING ELSE IS STILL SWALLOWED, DELIBERATELY. Selecting an extension must not
+     * fail because a background token refresh hit a network error - that would make the extension
+     * unselectable while offline. Only the one exception the user can ACT on gets through.
+     *
+     * ⚠⚠ CancellationException IS STILL SWALLOWED HERE. THE SHAPE IS NOW ESTABLISHED -
+     * RETHROW-CORRECT - AND IT IS STILL NOT CHANGED HERE, because that is a separate decision from
+     * the LoginRequired rethrow above. Recorded in full so it is not re-derived.
+     *
+     * THE THIRD WORKED INSTANCE OF THE THREE-SHAPES RULE, AND THE DISCRIMINATOR IS: WHAT IS WAITING
+     * ON COMPLETION?
+     *   CoroutineUtils.futureCatching  RETHROW IS WRONG. It bridges a coroutine to a
+     *     ListenableFuture; a rethrow leaves the future uncompleted and Media3 waits forever. The
+     *     exception has no destination that satisfies the future's contract. (Still parked, on
+     *     exactly that blocker.)
+     *   ContextUtils.listenFuture      OPPOSITE POLARITY - swallowing IS the fix there.
+     *   THIS SITE                      RETHROW IS CORRECT. Three reasons, in order of weight:
+     *     (a) Nothing is waiting on a completion signal. This is a plain suspend function in a
+     *         coroutine-to-coroutine chain, so cancellation has a well-defined destination - the
+     *         caller's Job - and nothing is stranded by letting it travel there.
+     *     (b) The swallow does not merely LOSE an exception, it CORRUPTS STATE. Injectable.value()
+     *         runs `injections.forEach { it(t) }` and only then `injections = emptyList()`. A
+     *         swallowed cancellation lets the forEach complete, so the injection list is marked DONE
+     *         though the ARL refresh never ran - and can never re-run for that instance. Rethrowing
+     *         leaves the injections pending and the block self-heals on the next value().
+     *         Sharper still, the same function then behaves two ways: the plain assignment
+     *         `injections = emptyList()` executes (no cancellation check), while the suspending
+     *         `injectionsMap.values.forEach` throws at its first suspension point and
+     *         `injectionsMap.clear()` never runs. The LIST leaks into "done"; the MAP correctly
+     *         stays pending.
+     *     (c) The rest of the path already obeys the convention - ExtensionUtils.get routes through
+     *         toAppException, which has `is CancellationException -> throw this`. This is the ONLY
+     *         link in the chain that breaks it.
+     * ⚠️ AND IT IS REACHABLE, WHICH IS WHY IT IS NOT INERT. onExtensionSelected has two call
+     * sites with OPPOSITE exposure: ExtensionLoader.setupMusicExtension launches it on a
+     * SupervisorJob scope that nothing ever cancels, but ExtensionLoader.injected puts it in the
+     * INJECTION BLOCK, which runs lazily on whichever coroutine first calls Injectable.value() -
+     * LoginViewModel's viewModelScope, an AA future, any collectLatest block. Those cancel routinely.
+     * ⚠️ RESOLVING THIS TELLS US NOTHING ABOUT futureCatching. Its blocker is a property of
+     * the FUTURE BRIDGE, not of cancellation handling, so a verdict here does not transfer. Three
+     * sites, three answers, one shared symptom - which is the rule's point, not a counterexample.
+     */
     override suspend fun onExtensionSelected() {
         session.settings?.let { setSettings(it) }
-        runCatching { handleArlExpiration() }
+        runCatching { handleArlExpiration() }.getOrElse {
+            if (it is ClientException.LoginRequired) throw it
+        }
     }
 
     //<============= HomeTab =============>
@@ -643,6 +697,20 @@ class DeezerExtension : HomeFeedClient, TrackClient, LikeClient, RadioClient,
 
             api.getArlByEmail(email, password, 3)
             val userList = api.makeUser(email, password)
+            // ⚠⚠ CLEARED HERE AS WELL AS IN setLoginUser, AND THE DUPLICATION IS THE FIX.
+            // setLoginUser is the CANONICAL clear, but it is driven by the host's DB flow
+            // (ExtensionLoader combines db.currentUsersFlow), so on the USER-INITIATED login path it
+            // fires LATER: onLogin returns -> afterLogin writes Room -> the flow emits -> only then
+            // setLoginUser. In that window the latch is still set and handleArlExpiration would
+            // short-circuit on credentials that were JUST accepted - a spurious sign-in prompt, and a
+            // reachable one if AA rebuilds a browse root while someone re-logs in on the phone.
+            // Same asynchrony the May work hit, and the same remedy it used: a synchronous write in
+            // onLogin beside the existing updateCredentials.
+            // ⚠️ AFTER success, never at entry: a FAILED attempt must leave a still-valid latch
+            // alone. Nothing above this line can be reached if getArlByEmail threw.
+            // The silent re-login path needs none of this - callApi's CSRF branch calls setLoginUser
+            // directly and synchronously, and `session` is a singleton, so it clears immediately.
+            session.setCredentialsRejected(false)
             return userList
         } else {
             session.updateCredentials(arl = data["arl"] ?: "")
@@ -656,12 +724,20 @@ class DeezerExtension : HomeFeedClient, TrackClient, LikeClient, RadioClient,
                     sid = extras["sid"] ?: ""
                 )
             }
+            // Same reasoning as the email/pass branch above - a successful ARL login proves the
+            // stored credentials work, so the refusal latch must not outlive it.
+            session.setCredentialsRejected(false)
             return userList
         }
     }
 
     override fun setLoginUser(user: User?) {
         likedTrackIds = null
+        // THE ONLY PLACE THE REFUSAL LATCH IS CLEARED, and it covers both directions: a successful
+        // login (new credentials, so the old refusal is stale) and a logout (nothing left to refuse).
+        // Chosen over onLogin because this is the chokepoint the host drives - it runs on login, on
+        // logout, and on a user switch, whereas onLogin misses the last two.
+        session.setCredentialsRejected(false)
         if (user != null) {
             session.updateCredentials(
                 arl = user.extras["arl"] ?: "",
@@ -735,6 +811,24 @@ class DeezerExtension : HomeFeedClient, TrackClient, LikeClient, RadioClient,
      * calls callApi("deezer.getUserData"). A re-login is only reached by coming back through
      * callApi's invalid-CSRF branch, where DeezerAuthRejectedException is already converted to
      * ClientException.LoginRequired. A guard here would look correct, compile, and never fire.
+     * ⚠⚠ [2026-09-22] THE AUGUST CLOSURE THAT KEPT THIS AMBIGUOUS IS NOW INVALID, AND THAT
+     * UNBLOCKS A FIX ELSEWHERE. The closure read: "LoginRequired carries nothing ... RETRY IS
+     * ARGUABLY CORRECT FOR THE ARL CASE, so routing the raw form to the login shelf would send ARL
+     * failures to a login screen that leads nowhere." That was true while a recoverable stale ARL
+     * could surface as LoginRequired. IT NO LONGER CAN.
+     * EVERY LoginRequired THE DEEZER EXTENSION CAN THROW, enumerated 2026-09-22 (scope: a recursive
+     * grep of deezer-extension/ext/src/main/java - FOUR sites, no others):
+     *   DeezerApi, CSRF catch      a silent re-login was REFUSED          -> sign in
+     *   DeezerApi, getToken 403    the auth endpoint refused the creds    -> sign in
+     *   this file, flag branch     already-latched refusal                -> sign in
+     *   this file, isArlExpired    creds ABSENT and the ARL is expired    -> sign in
+     * The silently-recoverable case is the THIRD branch below - `runCatching { api.makeUser() }` -
+     * which swallows everything and never throws. So no ambiguous LoginRequired can escape, and a
+     * sign-in affordance is now the correct rendering for all four.
+     * ⚠️ IF A FIFTH THROW SITE IS EVER ADDED, CHECK IT AGAINST THIS TABLE FIRST. One that can
+     * mean "recoverable without the user" would reopen the August problem, and the consumer of that
+     * decision is PagedSource.load - see the note there.
+     *
      * ⚠️ AND THE RECORDED "LoginRequired CARRIES NOTHING" GAP IS ABOUT THE `else if
      * (isArlExpired)` BRANCH ONLY - the one where credentials are ABSENT, so "user must sign in"
      * and "internal token went stale, no user action possible" genuinely cannot be told apart.
@@ -747,6 +841,13 @@ class DeezerExtension : HomeFeedClient, TrackClient, LikeClient, RadioClient,
         val isArlExpired = session.arlExpired || creds.arl.isEmpty()
         if (isArlExpired || creds.sid.isEmpty() || creds.token.isEmpty()) {
             if (creds.email.isNotEmpty() && creds.pass.isNotEmpty()) {
+                // ⚠⚠ ALREADY REFUSED ONCE - FAIL WITHOUT TOUCHING THE NETWORK. Same outcome as
+                // letting makeUser() run (it would reach callApi's invalid-CSRF branch, re-login, be
+                // refused, and convert to this exact exception), at none of the cost: no round trip,
+                // no rejected credential re-submitted to a shared-account endpoint, and the
+                // Injectable mutex is not held across a network call. Cleared on the next successful
+                // login - see DeezerSession.credentialsRejected.
+                if (session.credentialsRejected) throw ClientException.LoginRequired()
                 api.makeUser()
             } else if (isArlExpired) {
                 throw ClientException.LoginRequired()
