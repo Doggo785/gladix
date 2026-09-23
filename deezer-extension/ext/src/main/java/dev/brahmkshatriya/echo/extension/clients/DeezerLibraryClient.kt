@@ -96,7 +96,7 @@ class DeezerLibraryClient(
         if (id == TabId.TRACKS.id)
             return arr.mapNotNull { el -> (el as? JsonObject)?.let { graftFavTrack(it).toShelf() } }
         val items = parser.run { arr.mapNotNull { it.jsonObject.toEchoMediaItem()?.toShelf() } }
-        if (id == TabId.PLAYLISTS.id) return listOf(favoritesCard().toShelf()) + items
+        if (id == TabId.PLAYLISTS.id) return prependCardToPlaylists(items)
         return items
     }
 
@@ -136,10 +136,16 @@ class DeezerLibraryClient(
             extras = mapOf(DeezerPlaylistClient.FAVORITES_EXTRA to "1")
         )
 
-        private fun withFavoritesCard(title: String, shelf: Shelf?): Shelf? {
+        // Head-of-shelf placement for both Playlists surfaces. Internal for tests;
+        // loadAll (All tab carousel) and prependCardToPlaylists (Playlists tab rows)
+        // are the only callers.
+        internal fun withFavoritesCard(title: String, shelf: Shelf?): Shelf? {
             val card = favoritesCard()
             val list = (shelf as? Shelf.Lists.Items)?.list.orEmpty()
             return Shelf.Lists.Items(id = title, title = title, list = listOf(card) + list)
         }
+
+        internal fun prependCardToPlaylists(items: List<Shelf>): List<Shelf> =
+            listOf(favoritesCard().toShelf()) + items
     }
 }

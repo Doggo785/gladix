@@ -42,7 +42,8 @@ class DeezerPlaylistClient(private val deezerExtension: DeezerExtension, private
         // a real playlist, so api.playlist() would return an error body and `results!!` would
         // NPE. The card already carries everything the detail header shows (title; cover is
         // the playlist placeholder), so returning it unchanged loses nothing.
-        if (playlist.extras.containsKey(FAVORITES_EXTRA)) return playlist
+        // Keyed on the extra rather than the id's shape, same rule as above: ids are opaque.
+        if (isFavoritesPlaylist(playlist)) return playlist
         deezerExtension.handleArlExpiration()
         val jsonObject = api.playlist(playlist)
         val resultsObject = jsonObject["results"]!!.jsonObject
@@ -52,7 +53,7 @@ class DeezerPlaylistClient(private val deezerExtension: DeezerExtension, private
     fun loadTracks(playlist: Playlist): Feed<Track> = PagedData.Single {
         deezerExtension.handleArlExpiration()
         playlist.extras[SMART_TRACKLIST_EXTRA]?.let { return@Single smartTracklistTracks(it) }
-        if (playlist.extras.containsKey(FAVORITES_EXTRA)) return@Single favoritesTracks()
+        if (isFavoritesPlaylist(playlist)) return@Single favoritesTracks()
         // Tracks come from the dedicated playlist.getSongs (the app/deezer-py authoritative path), NOT from
         // deezer.pagePlaylist's inline SONGS (a summary that can carry a wrong same-named-artist twin).
         // pagePlaylist is still used for playlist METADATA in loadPlaylist above.
@@ -222,13 +223,7 @@ class DeezerPlaylistClient(private val deezerExtension: DeezerExtension, private
         val data = (json["results"] as? JsonObject)?.get("data")?.jsonArray
             ?: JsonArray(emptyList())
         val base = data.filterIsInstance<JsonObject>().map { parser.graftFavTrack(it) }
-        return base.mapIndexed { index, track ->
-            // NEXT only, no "playlist_id": this id is synthetic and DeezerUtil.log would
-            // report an unresolvable playlist context (same reasoning as smartTracklistTracks).
-            track.copy(
-                extras = track.extras + mapOf("NEXT" to base.getOrNull(index + 1)?.id.orEmpty())
-            )
-        }
+        return withNextExtras(base)
     }
 
     companion object {
@@ -238,5 +233,22 @@ class DeezerPlaylistClient(private val deezerExtension: DeezerExtension, private
         // Set by DeezerLibraryClient.favoritesCard; routes the virtual Favorite Tracks card
         // through the passthrough above and favoritesTracks(). Same precedent as above.
         const val FAVORITES_EXTRA = "favorites"
+
+        // Routing predicate for the virtual card. Keyed on the extra, never the id's shape:
+        // ids are opaque strings. Internal for tests; the branches above are the only callers.
+        internal fun isFavoritesPlaylist(playlist: Playlist): Boolean =
+            playlist.extras.containsKey(FAVORITES_EXTRA)
+
+        // NEXT-chain stamping shared by favoritesTracks. NEXT only, no "playlist_id": the
+        // favorites id is synthetic and DeezerUtil.log would report an unresolvable playlist
+        // context (same reasoning as smartTracklistTracks above). Internal for tests.
+        internal fun withNextExtras(tracks: List<Track>): List<Track> =
+            tracks.mapIndexed { index, track ->
+                track.copy(
+                    extras = track.extras + mapOf(
+                        "NEXT" to tracks.getOrNull(index + 1)?.id.orEmpty()
+                    )
+                )
+            }
     }
 }
