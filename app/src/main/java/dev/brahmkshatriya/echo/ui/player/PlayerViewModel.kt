@@ -760,7 +760,7 @@ class PlayerViewModel(
 
 
     fun addToQueue(id: String, item: EchoMediaItem, loaded: Boolean) = viewModelScope.launch {
-        if (item !is Track) app.messageFlow.emit(
+        app.messageFlow.emit(
             Message(app.context.getString(R.string.adding_x_to_queue, item.title))
         )
         withBrowser {
