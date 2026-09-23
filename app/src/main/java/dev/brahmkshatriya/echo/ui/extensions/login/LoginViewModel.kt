@@ -13,6 +13,7 @@ import dev.brahmkshatriya.echo.extensions.ExtensionUtils.getAs
 import dev.brahmkshatriya.echo.extensions.ExtensionUtils.getExtensionFlow
 import dev.brahmkshatriya.echo.extensions.db.models.UserEntity.Companion.toCurrentUser
 import dev.brahmkshatriya.echo.extensions.db.models.UserEntity.Companion.toEntity
+import dev.brahmkshatriya.echo.extensions.exceptions.AppException
 import dev.brahmkshatriya.echo.extensions.exceptions.AppException.Companion.toAppException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -108,13 +109,27 @@ class LoginViewModel(
     init {
         viewModelScope.launch {
             val extension = extension.first { it != null }!!
-            val totalClients = extension.get {
+            val clientsResult = extension.get {
                 listOfNotNull(
                     if (this is LoginClient.WebView) 1 else 0,
                     if (this is LoginClient.CustomInput) forms.size
                     else 0,
                 ).sum()
-            }.getOrNull() ?: 0
+            }
+            val totalClients = clientsResult.getOrElse {
+                // Cooperative cancellation is not a capability answer.
+                if (it is CancellationException) throw it
+                // A LoginRequired escaping the capability query means the extension is DEMANDING
+                // a login (e.g. a credential refresh inside onExtensionSelected) - the opposite
+                // of "unsupported". Offer the method selector instead of the "not supported"
+                // dead end: the Selector probes the raw instance without running injections,
+                // and the actual onLogin calls surface their real errors via afterLogin.
+                if (it is AppException.LoginRequired) {
+                    addFragmentFlow.emit(FragmentType.Selector)
+                    return@launch
+                }
+                0
+            }
             val client = extension.instance.value().getOrNull()
             when (totalClients) {
                 0 -> loginNotSupported(extension.name)
