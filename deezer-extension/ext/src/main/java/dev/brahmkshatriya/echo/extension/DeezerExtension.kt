@@ -58,6 +58,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.supervisorScope
+import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -173,6 +174,21 @@ class DeezerExtension : HomeFeedClient, TrackClient, LikeClient, RadioClient,
     }
 
     /**
+     * ⚠⚠ FORK 2026-09-23: THE RETHROW IS REMOVED - THE "RETHROW IS CORRECT" CONCLUSION BELOW
+     * DID NOT SURVIVE CONTACT WITH THE LOGIN SCREEN. Rethrowing LoginRequired from
+     * onExtensionSelected poisons the Injectable: a throwing injection block is never cleared,
+     * so EVERY later value() re-runs it and re-throws. That bricks LoginViewModel.init (the
+     * failed capability query reads as "Login is not supported") AND every onLogin (same
+     * value() path) - for never-logged-in sessions AND latched refusals alike. Verified on
+     * device: fresh installs hit the "not supported" dead end with the rethrow, and get login
+     * methods without it.
+     * The rejected-sign-in prompt the rethrow served is NOT lost: every OTHER
+     * handleArlExpiration call site (loads, playback, PagedSource) still throws, and
+     * ExceptionUtils routes AppException.LoginRequired to the login screen with a Login
+     * action. Selection time just stops being a second, fatal source.
+     * CancellationException is still rethrown (structured concurrency); everything else,
+     * LoginRequired included, is swallowed here and only here.
+     *
      * ⚠⚠ THE runCatching LETS ClientException.LoginRequired THROUGH AND SWALLOWS THE REST,
      * AND THAT ASYMMETRY IS THE POINT. It used to swallow everything, which meant THE EARLIEST
      * MOMENT WE KNOW THE CREDENTIALS ARE DEAD WAS THE ONE MOMENT WE SAID NOTHING: a user whose
@@ -224,22 +240,19 @@ class DeezerExtension : HomeFeedClient, TrackClient, LikeClient, RadioClient,
      * the FUTURE BRIDGE, not of cancellation handling, so a verdict here does not transfer. Three
      * sites, three answers, one shared symptom - which is the rule's point, not a counterexample.
      */
+    // SwallowedException: the catch-all below is deliberate - see the FORK note above.
+    @Suppress("SwallowedException")
     override suspend fun onExtensionSelected() {
         session.settings?.let { setSettings(it) }
-        runCatching { handleArlExpiration() }.getOrElse {
-            // Rethrow EXCEPT on a never-logged-in session. With no credentials at all (no
-            // email/pass, no ARL) and no recorded refusal, nothing is "required" - the user
-            // simply never signed in - and throwing here is not just noisy, it is FATAL:
-            // this runs inside the Injectable injection block, and a throwing block is never
-            // cleared, so EVERY later value() re-runs it and re-throws. That bricks the login
-            // screen itself (LoginViewModel.init maps the failed capability query to
-            // "Login is not supported") AND any later onLogin (same value() path) - login can
-            // never complete. A session holding credentials, or a latched refusal, still throws,
-            // so the rejected-sign-in prompt this rethrow was added for is preserved.
-            val creds = session.credentials
-            val neverLoggedIn = !session.credentialsRejected &&
-                creds.email.isEmpty() && creds.pass.isEmpty() && creds.arl.isEmpty()
-            if (!neverLoggedIn && it is ClientException.LoginRequired) throw it
+        try {
+            handleArlExpiration()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            // Swallowed deliberately - see the FORK note above. LoginRequired in particular must
+            // never escape the injection block: it would poison every later value() and brick
+            // both the login screen and onLogin. The sign-in prompt still surfaces from the
+            // data-path handleArlExpiration call sites via ExceptionUtils.
         }
     }
 
