@@ -173,7 +173,7 @@
     <string name="loading_radio_for_x">Chargement de la radio pour %1$s</string>
     <string name="playing_x">Lecture de %1$s</string>
     <string name="adding_x_to_queue">Ajout de %1$s à la liste</string>
-    <string name="adding_x_to_next">Ajout de %1$s aux suivants</string>
+    <string name="adding_x_to_next">Lecture ensuite de %1$s</string>
     <string name="all">Tout</string>
     <string name="edit_playlist">Modifier la Playlist</string>
     <string name="x_followers">%1$s Abonnés</string>
@@ -256,7 +256,7 @@
     </plurals>
     <string name="unfollowed_x">%1$s Plus Suivi·e</string>
     <string name="download_started">Téléchargement Démarré</string>
-    <string name="add_to_next">Ajouter à la suite</string>
+    <string name="add_to_next">Lire ensuite</string>
     <string name="add_to_queue">Ajouter à la liste</string>
     <string name="scroll_animations">Animations de Défilement</string>
     <string name="moving_x">Déplacement de %1$s</string>
