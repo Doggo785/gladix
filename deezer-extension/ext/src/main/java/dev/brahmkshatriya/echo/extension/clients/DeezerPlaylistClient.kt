@@ -38,6 +38,11 @@ class DeezerPlaylistClient(private val deezerExtension: DeezerExtension, private
         // Keyed on the extra rather than on the id's shape: ids are opaque strings and "inspired-by-1"
         // happens to be non-numeric today, which is an observation about one id, not a contract.
         if (playlist.extras.containsKey(SMART_TRACKLIST_EXTRA)) return playlist
+        // Virtual Favorite Tracks card (synthesized by DeezerLibraryClient): the id is not
+        // a real playlist, so api.playlist() would return an error body and `results!!` would
+        // NPE. The card already carries everything the detail header shows (title; cover is
+        // the playlist placeholder), so returning it unchanged loses nothing.
+        if (playlist.extras.containsKey(FAVORITES_EXTRA)) return playlist
         deezerExtension.handleArlExpiration()
         val jsonObject = api.playlist(playlist)
         val resultsObject = jsonObject["results"]!!.jsonObject
@@ -47,6 +52,7 @@ class DeezerPlaylistClient(private val deezerExtension: DeezerExtension, private
     fun loadTracks(playlist: Playlist): Feed<Track> = PagedData.Single {
         deezerExtension.handleArlExpiration()
         playlist.extras[SMART_TRACKLIST_EXTRA]?.let { return@Single smartTracklistTracks(it) }
+        if (playlist.extras.containsKey(FAVORITES_EXTRA)) return@Single favoritesTracks()
         // Tracks come from the dedicated playlist.getSongs (the app/deezer-py authoritative path), NOT from
         // deezer.pagePlaylist's inline SONGS (a summary that can carry a wrong same-named-artist twin).
         // pagePlaylist is still used for playlist METADATA in loadPlaylist above.
@@ -206,8 +212,31 @@ class DeezerPlaylistClient(private val deezerExtension: DeezerExtension, private
         }
     }
 
+    /**
+     * Tracks for the virtual Favorite Tracks card: same favorite_song.getList endpoint and
+     * FALLBACK graft as the Library Tracks shelf. An empty likes list is a legitimately empty
+     * playlist, not an error — degrade to empty, never throw.
+     */
+    private suspend fun favoritesTracks(): List<Track> {
+        val json = api.getTracks()
+        val data = (json["results"] as? JsonObject)?.get("data")?.jsonArray
+            ?: JsonArray(emptyList())
+        val base = data.filterIsInstance<JsonObject>().map { parser.graftFavTrack(it) }
+        return base.mapIndexed { index, track ->
+            // NEXT only, no "playlist_id": this id is synthetic and DeezerUtil.log would
+            // report an unresolvable playlist context (same reasoning as smartTracklistTracks).
+            track.copy(
+                extras = track.extras + mapOf("NEXT" to base.getOrNull(index + 1)?.id.orEmpty())
+            )
+        }
+    }
+
     companion object {
         // Set by DeezerParser.toSmartTracklist; the sole routing signal for the two branches above.
         const val SMART_TRACKLIST_EXTRA = "smarttracklist"
+
+        // Set by DeezerLibraryClient.favoritesCard; routes the virtual Favorite Tracks card
+        // through the passthrough above and favoritesTracks(). Same precedent as above.
+        const val FAVORITES_EXTRA = "favorites"
     }
 }
