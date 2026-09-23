@@ -773,6 +773,9 @@ class PlayerViewModel(
     }
 
     fun addToNext(id: String, item: EchoMediaItem, loaded: Boolean) = viewModelScope.launch {
+        // No snackbar for a lone track into an empty queue: that is effectively a play, already
+        // announced by playback itself. Every other case confirms (unlike addToQueue, which always
+        // confirms — queueing is never playback).
         if (!(browser.value?.mediaItemCount == 0 && item is Track)) app.messageFlow.emit(
             Message(app.context.getString(R.string.adding_x_to_next, item.title))
         )

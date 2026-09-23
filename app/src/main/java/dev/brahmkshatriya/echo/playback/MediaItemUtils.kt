@@ -75,7 +75,7 @@ object MediaItemUtils {
 
     fun MediaItem.withUserQueued(kind: String): MediaItem {
         val bundle = Bundle().apply {
-            putAll(mediaMetadata.extras!!)
+            mediaMetadata.extras?.let(::putAll)
             putString(USER_QUEUED, kind)
         }
         val item = buildUpon()

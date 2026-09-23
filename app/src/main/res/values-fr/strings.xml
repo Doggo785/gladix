@@ -173,7 +173,7 @@
     <string name="loading_radio_for_x">Chargement de la radio pour %1$s</string>
     <string name="playing_x">Lecture de %1$s</string>
     <string name="adding_x_to_queue">Ajout de %1$s à la liste</string>
-    <string name="adding_x_to_next">Lecture ensuite de %1$s</string>
+    <string name="adding_x_to_next">Lecture de %1$s ensuite</string>
     <string name="all">Tout</string>
     <string name="edit_playlist">Modifier la Playlist</string>
     <string name="x_followers">%1$s Abonnés</string>
