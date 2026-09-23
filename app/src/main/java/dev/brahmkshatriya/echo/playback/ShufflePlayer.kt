@@ -123,9 +123,9 @@ class ShufflePlayer(
     // changeQueue() still pulls current to physical index 0, so the pinned block lands at 1..n.
     private fun List<MediaItem>.withUserBlockPinned(): List<MediaItem> {
         val current = currentMediaItem
-        val userOrdered = filter { it.isUserQueued && it !== current }
-        val rest = filter { !it.isUserQueued && it !== current }.shuffled()
-        return listOfNotNull(current) + userOrdered + rest
+        val (head, pinned, rest) =
+            UserBlock.partition(this, { it === current }, { it.isUserQueued })
+        return listOfNotNull(head) + pinned + rest.shuffled()
     }
 
     // CrossfadePlayer must override setAudioAttributes() to broadcast to both internal players.
@@ -261,8 +261,10 @@ class ShufflePlayer(
     // current guard that keeps current at index 0 lives in QueueFragment (movement flags / onMove).
     override fun moveMediaItem(currentIndex: Int, newIndex: Int) {
         // Stale queue-drag: a source position captured against a snapshot, arriving after the timeline
-        // shifted → out-of-range → no-op. Guard FIRST so neither `original` nor the player is half-updated.
+        // shifted → out-of-range → no-op instead of IndexOutOfBounds. Guard FIRST so neither `original` nor the
+        // player is half-updated. Both ends guarded: the target comes from the same snapshot as the source.
         if (currentIndex !in 0 until mediaItemCount) return
+        if (newIndex !in 0 until mediaItemCount) return
         val item = if (!isShuffled) getItemAt(currentIndex) else null
         if (item != null) {
             original = original.toMutableList().apply {
@@ -278,6 +280,8 @@ class ShufflePlayer(
         // (PlayerViewModel.moveQueueItems), so a moved item is by definition hand-placed and joins
         // the session user block as Queue. Via the replaceMediaItem override so `original` follows.
         // No-op when already flagged, and guarded against a timeline that shifted mid-drag.
+        // Drag order is authoritative (I3): a drop that inverts Next-before-Queue is kept as dropped —
+        // later inserts still anchor on block boundaries, but nothing re-sorts the user's hand order.
         val target = newIndex.coerceIn(0, mediaItemCount - 1)
         val moved = runCatching { player.getMediaItemAt(target) }.getOrNull()
         if (moved != null && !moved.isUserQueued) {

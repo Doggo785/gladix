@@ -1002,20 +1002,16 @@ class PlayerCallback(
         SessionResult(RESULT_SUCCESS)
     }
 
-    // Sizes of the session user block sitting after the current track: (playNext, queue).
-    // Counts every flagged item after current (not just a contiguous run) so a drag-interleaved
-    // timeline still inserts inside the block rather than inside the radio. Main-thread only —
-    // every caller invokes it inside player.with.
-    private fun Player.userBlockAfterCurrent(): Pair<Int, Int> {
-        var next = 0
-        var queued = 0
-        for (i in currentMediaItemIndex + 1 until mediaItemCount) {
-            when (runCatching { getMediaItemAt(i).userQueuedKind }.getOrNull()) {
-                USER_QUEUED_NEXT -> next++
-                USER_QUEUED_QUEUE -> queued++
-            }
+    // Insert index for a new Queue item: right after the LAST flagged item past current.
+    // A count is only the block end when the block is contiguous — drag promotion interleaves
+    // radio items into it, so [UserBlock.queueInsertIndex] anchors on the last flagged index.
+    // Main-thread only — every caller invokes it inside player.with.
+    private fun Player.queueInsertIndex(): Int {
+        val current = currentMediaItemIndex
+        val flagged = (current + 1 until mediaItemCount).map {
+            runCatching { getMediaItemAt(it).userQueuedKind }.getOrNull() != null
         }
-        return next to queued
+        return UserBlock.queueInsertIndex(current, flagged)
     }
 
     private fun addToQueue(player: Player, args: Bundle) = scope.future {
@@ -1064,6 +1060,7 @@ class PlayerCallback(
                 addedContext ?: MediaItemUtils.trackRadioPlaceholder(track)
             )
         }.withUserQueued(USER_QUEUED_QUEUE)
+        var inserted = false
         player.with {
             if (queueEpochOrZero != epoch) {
                 Log.d(
@@ -1075,11 +1072,15 @@ class PlayerCallback(
             if (mediaItemCount == 0) {
                 addMediaItems(mediaItems)
             } else {
-                val (nextCount, queueCount) = userBlockAfterCurrent()
-                addMediaItems(currentMediaItemIndex + 1 + nextCount + queueCount, mediaItems)
+                // Spotify block, FIFO — after the last flagged item, ahead of generated radio.
+                addMediaItems(queueInsertIndex(), mediaItems)
             }
             prepare()
+            inserted = true
         }
+        // A dropped stale insert must not report success: the snackbar already fired optimistically,
+        // so the result is the only honest signal left (today unconsumed, kept truthful anyway).
+        if (!inserted) return@future error
         SessionResult(RESULT_SUCCESS)
     }
 
@@ -1126,6 +1127,7 @@ class PlayerCallback(
                 addedContext ?: MediaItemUtils.trackRadioPlaceholder(track)
             )
         }.withUserQueued(USER_QUEUED_NEXT)
+        var inserted = false
         player.with {
             if (queueEpochOrZero != epoch) {
                 Log.d(
@@ -1141,7 +1143,9 @@ class PlayerCallback(
                 addMediaItems(currentMediaItemIndex + 1, mediaItems)
             }
             prepare()
+            inserted = true
         }
+        if (!inserted) return@future error
         SessionResult(RESULT_SUCCESS)
     }
 
