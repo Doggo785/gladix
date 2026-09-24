@@ -15,6 +15,7 @@ import dev.brahmkshatriya.echo.common.clients.SaveClient
 import dev.brahmkshatriya.echo.common.clients.ShareClient
 import dev.brahmkshatriya.echo.common.helpers.PagedData
 import dev.brahmkshatriya.echo.common.models.Album
+import dev.brahmkshatriya.echo.common.models.Artist
 import dev.brahmkshatriya.echo.common.models.EchoMediaItem
 import dev.brahmkshatriya.echo.common.models.Feed
 import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeed
@@ -150,6 +151,15 @@ abstract class MediaDetailsViewModel(
             // Albums are cached durably too as of this change, so pull-to-refresh has to bust theirs or the
             // gesture does nothing for 24h on an album page.
             is Album -> bustAlbumTracksCache(app, i.id)
+            // Same contract for the per-artist liked menu: a manual refresh re-fetches the
+            // likes instead of serving the session cache, so what the user sees is fresh.
+            // Wrapped defensively: bustLikedCache is best-effort, and an extension built
+            // against an older :common without it must degrade to no-op, not crash.
+            is Artist -> runCatching {
+                extensionFlow.value?.getIf<LikeClient, Any?>(app.throwFlow) {
+                    bustLikedCache()
+                }
+            }
             else -> {}
         }
         refreshFlow.emit(Unit)
