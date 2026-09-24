@@ -31,6 +31,7 @@ import dev.brahmkshatriya.echo.extensions.ExtensionUtils.isClient
 import dev.brahmkshatriya.echo.extensions.MediaState
 import dev.brahmkshatriya.echo.playback.MediaItemUtils
 import dev.brahmkshatriya.echo.playback.MediaItemUtils.isPlayNext
+import dev.brahmkshatriya.echo.playback.MediaItemUtils.isQueued
 import dev.brahmkshatriya.echo.playback.MediaItemUtils.serverWithDownloads
 import dev.brahmkshatriya.echo.ui.feed.SwipeToQueue
 import dev.brahmkshatriya.echo.playback.MediaItemUtils.sourceIndex
@@ -761,9 +762,21 @@ class PlayerViewModel(
     }
 
 
-    fun addToQueue(id: String, item: EchoMediaItem, loaded: Boolean) = viewModelScope.launch {
+    fun addToQueue(
+        id: String,
+        item: EchoMediaItem,
+        loaded: Boolean,
+        undoable: Boolean = false,
+    ) = viewModelScope.launch {
+        // Undo is opt-in: the swipe snackbar offers it, the Queue menu keeps its
+        // plain confirmation (unchanged callers pass nothing). Queueing is never
+        // playback, so the message always shows — including into an empty queue,
+        // where the track lands paused (PlayerCallback never sets playWhenReady).
         app.messageFlow.emit(
-            Message(app.context.getString(R.string.adding_x_to_queue, item.title))
+            if (undoable) Message(
+                app.context.getString(R.string.adding_x_to_queue, item.title),
+                Message.Action(app.context.getString(R.string.undo)) { undoAddToQueue(item) },
+            ) else Message(app.context.getString(R.string.adding_x_to_queue, item.title))
         )
         withBrowser {
             it.sendCustomCommand(addToQueueCommand, Bundle().apply {
@@ -795,18 +808,34 @@ class PlayerViewModel(
         }
     }
 
-    // Undo for [addToNext] (swipe-to-queue snackbar and Play Next menu alike).
-    // Index math lives in SwipeToQueue.undoIndex (unit-tested); this only resolves
-    // the queue into id lists and removes what it returns.
-    // KNOWN LIMITATION: removes exactly one item. A menu-driven addToNext of an Album or
-    // Playlist inserts N tracks and undo leaves N-1 behind; likewise a rapid double-swipe
-    // of the same track collapses to one snackbar (SnackBarHandler dedupeKey) whose undo
-    // removes one copy. Single-remove is per spec for the swipe path; widening it to a
+    // Undo for [addToNext] — the Play Next MENU item only: the swipe moved to
+    // [addToQueue] / undoAddToQueue. Index math lives in SwipeToQueue.undoIndex
+    // (unit-tested); this only resolves the queue into id lists and removes what
+    // it returns.
+    // KNOWN LIMITATION: removes exactly one item. A menu-driven addToNext of an Album
+    // or Playlist inserts N tracks and undo leaves N-1 behind. Widening it to a
     // contiguous isPlayNext run is a follow-up, not this change.
     private fun undoAddToNext(item: EchoMediaItem) {
         val index = SwipeToQueue.undoIndex(
             mediaIds = queue.map { it.mediaId },
             isPlayNext = queue.map { it.isPlayNext },
+            trackIds = queue.map { it.track?.id },
+            currentMediaId = playerState.current.value?.mediaItem?.mediaId,
+            targetTrackId = (item as? Track)?.id
+        ) ?: return
+        removeQueueItem(index)
+    }
+
+    // Undo for [addToQueue] (swipe-to-queue snackbar; the Queue menu passes
+    // undoable = false). Queue inserts land at the tail of the user block, so the
+    // target is the LAST queue-flagged copy past current — index math in
+    // SwipeToQueue.queueUndoIndex (unit-tested). Same single-remove limitation as
+    // undoAddToNext: a multi-track add would leave N-1 behind; unreachable today
+    // because only the swipe path (one track at a time) passes undoable = true.
+    private fun undoAddToQueue(item: EchoMediaItem) {
+        val index = SwipeToQueue.queueUndoIndex(
+            mediaIds = queue.map { it.mediaId },
+            isQueue = queue.map { it.isQueued },
             trackIds = queue.map { it.track?.id },
             currentMediaId = playerState.current.value?.mediaItem?.mediaId,
             targetTrackId = (item as? Track)?.id

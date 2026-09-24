@@ -1,8 +1,8 @@
 package dev.brahmkshatriya.echo.ui.feed
 
 /**
- * Pure decision math for swipe-right-to-play-next ([FeedAdapter.getTouchHelper])
- * and its snackbar Undo ([dev.brahmkshatriya.echo.ui.player.PlayerViewModel.undoAddToNext]).
+ * Pure decision math for swipe-right-to-queue ([FeedAdapter.getTouchHelper])
+ * and its snackbar Undo ([dev.brahmkshatriya.echo.ui.player.PlayerViewModel.undoAddToQueue]).
  *
  * Everything here is framework-free on purpose: no View, no ViewHolder, no MediaItem.
  * The touch helper and the ViewModel call these so the behavior is tested, not copied.
@@ -96,5 +96,43 @@ internal object SwipeToQueue {
             if (targetTrackId == null || trackIds.getOrNull(i) == targetTrackId) return i
         }
         return null
+    }
+
+    /**
+     * Undo index for a Queue add (the swipe's path): FIFO lands at the tail of
+     * the user block, after the last user-flagged item past current — see
+     * [dev.brahmkshatriya.echo.playback.UserBlock.queueInsertIndex]. So the
+     * just-added copy is the LAST queue-flagged match past current, the mirror
+     * of [undoIndex]'s first-Play-Next rule (LIFO front-insert). A Play Next
+     * copy of the same track never wins: only USER_QUEUED_QUEUE-flagged rows
+     * qualify. Same id-matching rationale as [undoIndex] — the insert resolves
+     * asynchronously, the index is unknowable at swipe time.
+     *
+     * @param mediaIds queue mediaIds in order.
+     * @param isQueue parallel flags (USER_QUEUED_QUEUE stamp present).
+     * @param trackIds parallel resolved track ids, null when unresolvable.
+     * @param currentMediaId currently playing mediaId, null when unknown.
+     * @param targetTrackId added track id; the swipe path always passes one
+     *   (only track rows are swipeable), null kept for symmetry with [undoIndex]
+     *   — then the last queue-flagged row past current wins.
+     * @return queue index to remove, or null when the item hasn't landed yet or
+     *   was already consumed.
+     */
+    fun queueUndoIndex(
+        mediaIds: List<String>,
+        isQueue: List<Boolean>,
+        trackIds: List<String?>,
+        currentMediaId: String?,
+        targetTrackId: String?
+    ): Int? {
+        val currentIndex =
+            if (currentMediaId == null) NO_POSITION else mediaIds.indexOf(currentMediaId)
+        val from = if (currentIndex == NO_POSITION) 0 else currentIndex + 1
+        var match = NO_POSITION
+        for (i in from until mediaIds.size) {
+            if (!isQueue.getOrElse(i) { false }) continue
+            if (targetTrackId == null || trackIds.getOrNull(i) == targetTrackId) match = i
+        }
+        return match.takeIf { it != NO_POSITION }
     }
 }
