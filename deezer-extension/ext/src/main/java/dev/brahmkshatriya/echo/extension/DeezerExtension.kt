@@ -328,6 +328,9 @@ class DeezerExtension : HomeFeedClient, TrackClient, LikeClient, RadioClient,
             }
             else -> {}
         }
+        // The likes content changed: the per-artist menu must rebuild from fresh data,
+        // not from the session cache below.
+        bustLikedCache()
     }
 
     override suspend fun isItemLiked(item: EchoMediaItem): Boolean {
@@ -343,6 +346,37 @@ class DeezerExtension : HomeFeedClient, TrackClient, LikeClient, RadioClient,
         return dataArray.mapNotNull {
             runCatching { it.jsonObject["SNG_ID"]?.jsonPrimitive?.content }.getOrNull()
         }.toHashSet()
+    }
+
+    /**
+     * Session cache of the RAW favorite_song.getList entries (unparsed [JsonObject]s).
+     * Raw, not parsed: the per-artist menu pre-filters by artist id on the raw form
+     * ([DeezerParser.mentionsArtist]) and only parses the handful of matches, so a
+     * 10k-likes library costs one download per TTL instead of one download + 10k
+     * parses per artist page.
+     *
+     * @Volatile, no mutex: concurrent duplicate fetches are harmless (same endpoint,
+     * last write wins) and callers here are already serialized per page load.
+     * Failures are never cached — a failed page simply retries on the next one.
+     * Invalidated on like/unlike (above), on user change/logout (below), on manual
+     * refresh ([bustLikedCache] via LikeClient), and by age ([LIKED_TTL_MS]).
+     */
+    @Volatile
+    private var likedEntriesCache: Pair<Long, List<JsonObject>>? = null
+
+    suspend fun getLikedEntriesCached(forceRefresh: Boolean = false): List<JsonObject> {
+        val cached = likedEntriesCache
+        val now = System.currentTimeMillis()
+        if (!forceRefresh && cached != null && now - cached.first < LIKED_TTL_MS) return cached.second
+        val data = api.getTracks()["results"]?.jsonObject?.get("data")?.jsonArray
+            ?: throw Exception("Failed to load liked tracks")
+        val fresh = data.filterIsInstance<JsonObject>()
+        likedEntriesCache = now to fresh
+        return fresh
+    }
+
+    override suspend fun bustLikedCache() {
+        likedEntriesCache = null
     }
 
     override suspend fun listEditablePlaylists(track: Track?): List<Pair<Playlist, Boolean>> {
@@ -758,6 +792,7 @@ class DeezerExtension : HomeFeedClient, TrackClient, LikeClient, RadioClient,
 
     override fun setLoginUser(user: User?) {
         likedTrackIds = null
+        likedEntriesCache = null
         // THE ONLY PLACE THE REFUSAL LATCH IS CLEARED, and it covers both directions: a successful
         // login (new credentials, so the old refusal is stale) and a logout (nothing left to refuse).
         // Chosen over onLogin because this is the chokepoint the host drives - it runs on login, on
@@ -888,5 +923,10 @@ class DeezerExtension : HomeFeedClient, TrackClient, LikeClient, RadioClient,
 
     companion object {
         private const val DEFAULT_TYPE = "grid"
+
+        // Session-cache age for the raw likes entries: at most one full download per
+        // 10 minutes per session. In-app like/unlike, user change and manual refresh
+        // bust unconditionally, so this bounds only likes edited from another device.
+        private const val LIKED_TTL_MS = 10L * 60 * 1000
     }
 }
