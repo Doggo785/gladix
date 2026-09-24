@@ -611,6 +611,26 @@ class DeezerParser(private val session: DeezerSession) {
         )
     }
 
+    /**
+     * Cheap pre-filter answering "could this favorite_song.getList entry involve this
+     * artist?" WITHOUT the full [graftFavTrack]/[toTrack] parse. Mirrors exactly where
+     * [toTrack] reads artists from (ARTISTS array, ART_ID fallback, and both again inside
+     * FALLBACK), so a `true` here parses to a track containing the artist and a `false`
+     * can be skipped safely. Used by the per-artist liked menu to avoid parsing thousands
+     * of unrelated likes on every artist page.
+     */
+    fun JsonObject.mentionsArtist(artistId: String): Boolean {
+        val d = unwrap()
+        if (d.hasArtist(artistId)) return true
+        val fb = d["FALLBACK"] as? JsonObject ?: return false
+        return fb.hasArtist(artistId)
+    }
+
+    private fun JsonObject.hasArtist(artistId: String): Boolean {
+        if (str("ART_ID") == artistId) return true
+        return arr("ARTISTS")?.any { (it as? JsonObject)?.str("ART_ID") == artistId } == true
+    }
+
     fun JsonObject.toTrack(): Track {
         val data = unwrap()
         val md5 = data.str("ALB_PICTURE")
