@@ -11,8 +11,8 @@ import org.junit.Test
  *
  * SCOPE NOTE: two behaviors cannot run here (no Espresso/Robolectric offline) and
  * stay device-verified on hardware: the end-to-end "swipe adds the track and the
- * snackbar shows", and the animated snap-back under scroll/paging updates. What
- * decides those paths — gating, haptic timing, restore targeting, undo lookup,
+ * snackbar shows", and the snap-back under scroll/paging updates. What decides
+ * those paths — gating, haptic timing, release commit, undo lookup,
  * decor math — is extracted into SwipeToQueue and pinned below.
  */
 class SwipeToQueueTest {
@@ -84,63 +84,36 @@ class SwipeToQueueTest {
         assertFalse(SwipeToQueue.shouldBuzz(true, true, -300f, 1000))
     }
 
-    // Snap-back targeting: each position goes to its own adapter.
+    // Release decision: ItemTouchHelper never commits a swipe anymore (its two
+    // commit paths are disabled in getSwipeThreshold/getSwipeEscapeVelocity, so
+    // no SWIPE_SUCCESS — and therefore no parked leftover — can ever exist).
+    // The add is ours, decided on release at the same 0.25 the haptic crossed.
 
     @Test
-    fun `live binding position targets the binding adapter`() {
-        assertEquals(
-            SwipeToQueue.RestoreTarget.BindingAdapter(7),
-            SwipeToQueue.restoreTarget(
-                bindingPos = 7,
-                absolutePos = SwipeToQueue.NO_POSITION,
-                layoutPos = SwipeToQueue.NO_POSITION
-            )
-        )
+    fun `release past the threshold commits`() {
+        assertTrue(SwipeToQueue.pastThreshold(300f, 1000))
     }
 
     @Test
-    fun `binding position wins when everything is live`() {
-        assertEquals(
-            SwipeToQueue.RestoreTarget.BindingAdapter(7),
-            SwipeToQueue.restoreTarget(bindingPos = 7, absolutePos = 12, layoutPos = 12)
-        )
+    fun `release exactly at the threshold commits`() {
+        assertTrue(SwipeToQueue.pastThreshold(250f, 1000))
     }
 
     @Test
-    fun `recycled row falls back to the recycler adapter position`() {
-        // Row recycled mid-gesture by a paging refresh: binding dead, absolute live.
-        assertEquals(
-            SwipeToQueue.RestoreTarget.RecyclerAdapter(12),
-            SwipeToQueue.restoreTarget(
-                bindingPos = SwipeToQueue.NO_POSITION,
-                absolutePos = 12,
-                layoutPos = SwipeToQueue.NO_POSITION
-            )
-        )
+    fun `release below the threshold does not commit`() {
+        assertFalse(SwipeToQueue.pastThreshold(249f, 1000))
     }
 
     @Test
-    fun `layout position is the last resort`() {
-        assertEquals(
-            SwipeToQueue.RestoreTarget.RecyclerAdapter(12),
-            SwipeToQueue.restoreTarget(
-                bindingPos = SwipeToQueue.NO_POSITION,
-                absolutePos = SwipeToQueue.NO_POSITION,
-                layoutPos = 12
-            )
-        )
+    fun `rtl release past the threshold commits`() {
+        // updateDxDy clamps to the allowed side, so RTL releases are negative;
+        // the distance still counts, only the sign encodes the layout direction.
+        assertTrue(SwipeToQueue.pastThreshold(-300f, 1000))
     }
 
     @Test
-    fun `dead everywhere rebinds nothing`() {
-        assertEquals(
-            SwipeToQueue.RestoreTarget.None,
-            SwipeToQueue.restoreTarget(
-                bindingPos = SwipeToQueue.NO_POSITION,
-                absolutePos = SwipeToQueue.NO_POSITION,
-                layoutPos = SwipeToQueue.NO_POSITION
-            )
-        )
+    fun `release on a zero-width row does not commit`() {
+        assertFalse(SwipeToQueue.pastThreshold(300f, 0))
     }
 
     // Undo lookup: first Play Next past current with the added track id.

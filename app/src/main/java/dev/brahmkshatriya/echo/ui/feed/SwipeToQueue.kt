@@ -51,28 +51,19 @@ internal object SwipeToQueue {
         (itemLeft + dX.toInt()).coerceAtMost(itemRight)
 
     /**
-     * Where to send the snap-back rebind after a swipe.
+     * Decide the add at release. ItemTouchHelper never commits a swipe anymore
+     * (see getSwipeThreshold/getSwipeEscapeVelocity in FeedAdapter), so this is
+     * the single commit condition, at the same fraction the haptic crossed.
      *
-     * The pairing rule is load-bearing on concat-backed screens: a binding-adapter
-     * position must go to the binding adapter, while absolute/layout positions are
-     * relative to the RecyclerView's (concat) adapter. Mixing them rebinds the
-     * wrong row. All dead ([NO_POSITION] everywhere) means the row no longer exists
-     * and needs no rebind at all — never a notifyDataSetChanged, which would discard
-     * the paging adapter's diff state for nothing.
+     * Distance in either horizontal direction: updateDxDy clamps mDx to the
+     * allowed side, so the sign only encodes LTR vs RTL — matching the abs()
+     * ItemTouchHelper itself used to commit with.
+     *
+     * @param dX last drawn translation of the gesture (an active frame only).
+     * @param itemWidth swiped row width; 0 means nothing to measure.
      */
-    sealed interface RestoreTarget {
-        data class BindingAdapter(val position: Int) : RestoreTarget
-        data class RecyclerAdapter(val position: Int) : RestoreTarget
-        data object None : RestoreTarget
-    }
-
-    fun restoreTarget(bindingPos: Int, absolutePos: Int, layoutPos: Int): RestoreTarget =
-        when {
-            bindingPos != NO_POSITION -> RestoreTarget.BindingAdapter(bindingPos)
-            absolutePos != NO_POSITION -> RestoreTarget.RecyclerAdapter(absolutePos)
-            layoutPos != NO_POSITION -> RestoreTarget.RecyclerAdapter(layoutPos)
-            else -> RestoreTarget.None
-        }
+    fun pastThreshold(dX: Float, itemWidth: Int): Boolean =
+        itemWidth > 0 && kotlin.math.abs(dX) >= SWIPE_THRESHOLD * itemWidth
 
     /**
      * Undo index for a Play Next add. Play Next front-inserts LIFO right after

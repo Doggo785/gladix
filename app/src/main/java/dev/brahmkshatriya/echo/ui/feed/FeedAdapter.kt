@@ -375,15 +375,49 @@ class FeedAdapter(
                 }
 
                 // Exactly-once haptic per swipe: fired when the gesture crosses the
-                // trigger threshold (Spotify-style immediate confirmation), or on
-                // release for a fast fling that never drew a past-threshold frame.
+                // trigger threshold (Spotify-style immediate confirmation). No
+                // release-time fallback: the add itself now requires a drawn frame
+                // past that same threshold, so a commit without a buzz is impossible.
                 private var hapticPending = true
+
+                // The row owning the current gesture and the last translation its
+                // active frames drew. Needed because ItemTouchHelper no longer
+                // reports swipes (commits disabled below): the add is decided here,
+                // on release, from these two values.
+                private var gestureRow: RecyclerView.ViewHolder? = null
+                private var gestureDx = 0f
 
                 override fun onSelectedChanged(
                     viewHolder: RecyclerView.ViewHolder?, actionState: Int
                 ) {
                     super.onSelectedChanged(viewHolder, actionState)
-                    if (actionState == ItemTouchHelper.ACTION_STATE_SWIPE) hapticPending = true
+                    when {
+                        actionState == ItemTouchHelper.ACTION_STATE_SWIPE -> {
+                            hapticPending = true
+                            gestureRow = viewHolder
+                            gestureDx = 0f
+                        }
+
+                        actionState == ItemTouchHelper.ACTION_STATE_IDLE &&
+                            viewHolder == null -> {
+                            val row = gestureRow
+                            val dx = gestureDx
+                            gestureRow = null
+                            gestureDx = 0f
+                            commitRelease(row, dx)
+                        }
+                    }
+                }
+
+                // The add, decided at release: past the shared 0.25 threshold or
+                // nothing. The row detached mid-gesture (scroll stole it) is gone —
+                // no add, and the snackbar never gets an anchorless view.
+                private fun commitRelease(row: RecyclerView.ViewHolder?, dx: Float) {
+                    if (row == null || row.itemView.parent == null) return
+                    if (!SwipeToQueue.pastThreshold(dx, row.itemView.width)) return
+                    val feed = (row as? MediaViewHolder)?.feed ?: return
+                    val track = feed.item as? Track ?: return
+                    listener.onTrackSwiped(row.itemView, feed.extensionId, track)
                 }
 
                 private fun buzz(view: View) {
@@ -435,36 +469,13 @@ class FeedAdapter(
                 }
 
                 override fun onSwiped(viewHolder: RecyclerView.ViewHolder, direction: Int) {
-                    val feed = (viewHolder as? MediaViewHolder)?.feed
-                    val track = feed?.item as? Track
-                    if (track != null) {
-                        if (hapticPending) buzz(viewHolder.itemView)
-                        listener.onTrackSwiped(viewHolder.itemView, feed.extensionId, track)
-                    }
-                    // Snap-back: posted so ItemTouchHelper finishes its swipe cleanup
-                    // first and the recover animation brings the row home instead of
-                    // fighting the rebind. Target picked by SwipeToQueue.restoreTarget.
-                    val recyclerView = viewHolder.itemView.parent as? RecyclerView
-                    when (val target = SwipeToQueue.restoreTarget(
-                        viewHolder.bindingAdapterPosition,
-                        viewHolder.absoluteAdapterPosition,
-                        viewHolder.layoutPosition
-                    )) {
-                        is SwipeToQueue.RestoreTarget.BindingAdapter -> {
-                            val adapter = viewHolder.bindingAdapter
-                            if (recyclerView != null) recyclerView.post {
-                                adapter?.notifyItemChanged(target.position)
-                            } else adapter?.notifyItemChanged(target.position)
-                        }
-
-                        is SwipeToQueue.RestoreTarget.RecyclerAdapter -> {
-                            if (recyclerView != null) recyclerView.post {
-                                recyclerView.adapter?.notifyItemChanged(target.position)
-                            }
-                        }
-
-                        SwipeToQueue.RestoreTarget.None -> Unit
-                    }
+                    // Unreachable: getSwipeThreshold/getSwipeEscapeVelocity below
+                    // disable both commit paths, so ItemTouchHelper never reports a
+                    // successful swipe — which is exactly what used to park a
+                    // finished animation (re-applying translationX = ±width every
+                    // frame) and poison the next ACTION_DOWN re-grab (mInitialTouchX
+                    // -= mX started the gesture at +width: teleport + instant
+                    // commit). The add lives in commitRelease via onSelectedChanged.
                 }
 
                 override fun onChildDraw(
@@ -476,6 +487,14 @@ class FeedAdapter(
                     actionState: Int,
                     isCurrentlyActive: Boolean
                 ) {
+                    // Last drawn translation of an active gesture: the only record
+                    // of how far the finger went (ItemTouchHelper's own mDx is
+                    // private and its commits are disabled), read on release.
+                    if (actionState == ItemTouchHelper.ACTION_STATE_SWIPE &&
+                        isCurrentlyActive
+                    ) {
+                        gestureDx = dX
+                    }
                     if (actionState == ItemTouchHelper.ACTION_STATE_SWIPE &&
                         dX > 0f && viewHolder is MediaViewHolder
                     ) {
@@ -511,8 +530,26 @@ class FeedAdapter(
                     )
                 }
 
+                // Disabling BOTH commit paths is the fix for the row stuck to the
+                // right. A commit (SWIPE_SUCCESS) parks its finished animation with
+                // mIsPendingCleanup = true — never cleared by the helper — which
+                // re-applies translationX = ±RecyclerView.width on every frame until
+                // the row is touched or leaves the window; and it leaves mX = ±width
+                // in the list, which the next ACTION_DOWN feeds back as
+                // `mInitialTouchX -= animation.mX`, starting the re-grab at +width
+                // (row teleports right and commits instantly). With commits dead:
+                // swipeIfNecessary always returns 0, every release runs the native
+                // cancel animation — a real slide home, no leftover state — and the
+                // add is decided in onSelectedChanged at release instead.
+                // Distance: `width * Float.MAX_VALUE` overflows to Infinity for any
+                // laid-out width, and abs(mDx) can never reach it.
                 override fun getSwipeThreshold(viewHolder: RecyclerView.ViewHolder) =
-                    SwipeToQueue.SWIPE_THRESHOLD
+                    Float.MAX_VALUE
+
+                // Fling commits (`absXVelocity >= escapeVelocity`) die the same way.
+                override fun getSwipeEscapeVelocity(defaultEscapeVelocity: Float) =
+                    Float.MAX_VALUE
+
                 override fun onMove(
                     recyclerView: RecyclerView,
                     viewHolder: RecyclerView.ViewHolder,
