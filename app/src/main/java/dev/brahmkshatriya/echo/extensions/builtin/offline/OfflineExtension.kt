@@ -332,10 +332,34 @@ class OfflineExtension(
         (find(artist) ?: notInLibrary("artist", artist.id)).toArtist()
 
     override suspend fun loadFeed(artist: Artist): Feed<Shelf> {
-        return (find(artist) ?: notInLibrary("artist", artist.id)).run {
+        val library = getLibrary()
+        return (library.artistMap[artist.id.toLongOrNull()] ?: notInLibrary("artist", artist.id)).run {
             val tracks = songList.ifEmpty { null }?.toList()
             val albums = albumList.map { it.toAlbum() }.ifEmpty { null }
+            // Liked tracks of this artist, like Deezer's per-artist liked section:
+            // a full-width menu card opening the whole list (same shape as
+            // DeezerArtistClient). Same id scheme ("<id>_liked") and same count extra
+            // so Unified dresses both with the localized title + subtitle.
+            // Hidden when empty.
+            val liked = library.likedPlaylist?.songList
+                ?.filter { it.artists.any { a -> a.id == artist.id } }
+                ?.toList().orEmpty()
+            val likedShelf = liked.takeIf { it.isNotEmpty() }?.let { likedTracks ->
+                Shelf.Category(
+                    "${artist.id}_liked",
+                    context.getString(R.string.liked_music),
+                    likedTracks.toShelves(
+                        Feed.Buttons(showPlayAndShuffle = true, customTrackList = likedTracks)
+                    ),
+                    context.resources.getQuantityString(
+                        R.plurals.number_tracks, likedTracks.size, likedTracks.size
+                    ),
+                    image = likedTracks.firstOrNull()?.cover,
+                    extras = mapOf("liked_count" to likedTracks.size.toString())
+                )
+            }
             listOfNotNull(
+                likedShelf?.let { listOf(it) },
                 tracks?.let {
                     val id = "${artist.id}_tracks"
                     listOf(
