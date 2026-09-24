@@ -809,36 +809,43 @@ class PlayerViewModel(
     }
 
     // Undo for [addToNext] — the Play Next MENU item only: the swipe moved to
-    // [addToQueue] / undoAddToQueue. Index math lives in SwipeToQueue.undoIndex
-    // (unit-tested); this only resolves the queue into id lists and removes what
-    // it returns.
+    // [addToQueue] / undoAddToQueue. First-match index math in
+    // SwipeToQueue.undoIndex (unit-tested); removal shared with undoAddToQueue.
     // KNOWN LIMITATION: removes exactly one item. A menu-driven addToNext of an Album
     // or Playlist inserts N tracks and undo leaves N-1 behind. Widening it to a
     // contiguous isPlayNext run is a follow-up, not this change.
-    private fun undoAddToNext(item: EchoMediaItem) {
-        val index = SwipeToQueue.undoIndex(
-            mediaIds = queue.map { it.mediaId },
-            isPlayNext = queue.map { it.isPlayNext },
-            trackIds = queue.map { it.track?.id },
-            currentMediaId = playerState.current.value?.mediaItem?.mediaId,
-            targetTrackId = (item as? Track)?.id
-        ) ?: return
-        removeQueueItem(index)
-    }
+    private fun undoAddToNext(item: EchoMediaItem) =
+        undoUserBlockAdd(item, queue.map { it.isPlayNext }, SwipeToQueue::undoIndex)
 
     // Undo for [addToQueue] (swipe-to-queue snackbar; the Queue menu passes
-    // undoable = false). Queue inserts land at the tail of the user block, so the
-    // target is the LAST queue-flagged copy past current — index math in
-    // SwipeToQueue.queueUndoIndex (unit-tested). Same single-remove limitation as
-    // undoAddToNext: a multi-track add would leave N-1 behind; unreachable today
-    // because only the swipe path (one track at a time) passes undoable = true.
-    private fun undoAddToQueue(item: EchoMediaItem) {
-        val index = SwipeToQueue.queueUndoIndex(
-            mediaIds = queue.map { it.mediaId },
-            isQueue = queue.map { it.isQueued },
-            trackIds = queue.map { it.track?.id },
-            currentMediaId = playerState.current.value?.mediaItem?.mediaId,
-            targetTrackId = (item as? Track)?.id
+    // undoable = false). Queue inserts land at the tail of the user block, so
+    // SwipeToQueue.queueUndoIndex targets the LAST queue-flagged copy past current
+    // (unit-tested). Same single-remove limitation as undoAddToNext: a multi-track
+    // add would leave N-1 behind; unreachable today because only the swipe path
+    // (one track at a time) passes undoable = true.
+    private fun undoAddToQueue(item: EchoMediaItem) =
+        undoUserBlockAdd(item, queue.map { it.isQueued }, SwipeToQueue::queueUndoIndex)
+
+    // Shared body of the two undo paths: resolve the queue into id lists, apply
+    // the caller's index rule (first match for LIFO Play Next, last for FIFO
+    // Queue), remove what it returns.
+    private fun undoUserBlockAdd(
+        item: EchoMediaItem,
+        flags: List<Boolean>,
+        findIndex: (
+            mediaIds: List<String>,
+            flags: List<Boolean>,
+            trackIds: List<String?>,
+            currentMediaId: String?,
+            targetTrackId: String?
+        ) -> Int?,
+    ) {
+        val index = findIndex(
+            queue.map { it.mediaId },
+            flags,
+            queue.map { it.track?.id },
+            playerState.current.value?.mediaItem?.mediaId,
+            (item as? Track)?.id
         ) ?: return
         removeQueueItem(index)
     }

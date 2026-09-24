@@ -87,16 +87,9 @@ internal object SwipeToQueue {
         trackIds: List<String?>,
         currentMediaId: String?,
         targetTrackId: String?
-    ): Int? {
-        val currentIndex =
-            if (currentMediaId == null) NO_POSITION else mediaIds.indexOf(currentMediaId)
-        val from = if (currentIndex == NO_POSITION) 0 else currentIndex + 1
-        for (i in from until mediaIds.size) {
-            if (!isPlayNext.getOrElse(i) { false }) continue
-            if (targetTrackId == null || trackIds.getOrNull(i) == targetTrackId) return i
-        }
-        return null
-    }
+    ): Int? = scanForUndo(
+        mediaIds, isPlayNext, trackIds, currentMediaId, targetTrackId, takeLast = false
+    )
 
     /**
      * Undo index for a Queue add (the swipe's path): FIFO lands at the tail of
@@ -124,14 +117,37 @@ internal object SwipeToQueue {
         trackIds: List<String?>,
         currentMediaId: String?,
         targetTrackId: String?
+    ): Int? = scanForUndo(
+        mediaIds, isQueue, trackIds, currentMediaId, targetTrackId, takeLast = true
+    )
+
+    /**
+     * Shared scan behind [undoIndex] and [queueUndoIndex]: walk flagged rows from
+     * past current and match the added track id (any flagged row when the id is
+     * unknown). The only difference between the rules is which match counts —
+     * Play Next front-inserts LIFO, so its add is the FIRST match; Queue appends
+     * FIFO at the tail, so its add is the LAST ([takeLast]).
+     *
+     * @return queue index to remove, or null when nothing matches.
+     */
+    private fun scanForUndo(
+        mediaIds: List<String>,
+        flagged: List<Boolean>,
+        trackIds: List<String?>,
+        currentMediaId: String?,
+        targetTrackId: String?,
+        takeLast: Boolean
     ): Int? {
         val currentIndex =
             if (currentMediaId == null) NO_POSITION else mediaIds.indexOf(currentMediaId)
         val from = if (currentIndex == NO_POSITION) 0 else currentIndex + 1
         var match = NO_POSITION
         for (i in from until mediaIds.size) {
-            if (!isQueue.getOrElse(i) { false }) continue
-            if (targetTrackId == null || trackIds.getOrNull(i) == targetTrackId) match = i
+            if (!flagged.getOrElse(i) { false }) continue
+            if (targetTrackId == null || trackIds.getOrNull(i) == targetTrackId) {
+                if (!takeLast) return i
+                match = i
+            }
         }
         return match.takeIf { it != NO_POSITION }
     }
