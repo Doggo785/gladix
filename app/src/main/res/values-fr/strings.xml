@@ -213,6 +213,7 @@
     <string name="repeat_off">Ne Pas Répéter</string>
     <string name="library">Bibliothèque</string>
     <string name="playlist_liked">Aimés</string>
+    <string name="liked_music">Titres likés</string>
     <string name="extensions">Extensions</string>
     <string name="home">Accueil</string>
     <string name="settings">Paramètres</string>
