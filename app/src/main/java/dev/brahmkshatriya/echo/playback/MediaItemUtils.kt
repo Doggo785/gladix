@@ -425,6 +425,7 @@ object MediaItemUtils {
     val MediaItem.userQueuedKind get() = mediaMetadata.extras.userQueuedKind
     val MediaItem.isUserQueued get() = userQueuedKind != null
     val MediaItem.isPlayNext get() = userQueuedKind == USER_QUEUED_NEXT
+    val MediaItem.isQueued get() = userQueuedKind == USER_QUEUED_QUEUE
 
     private fun Streamable.SubtitleType.toMimeType() = when (this) {
         Streamable.SubtitleType.VTT -> MimeTypes.TEXT_VTT

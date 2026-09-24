@@ -7,7 +7,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Decision math for swipe-right-to-play-next. Pure JVM — no player, no views.
+ * Decision math for swipe-right-to-queue. Pure JVM — no player, no views.
  *
  * SCOPE NOTE: two behaviors cannot run here (no Espresso/Robolectric offline) and
  * stay device-verified on hardware: the end-to-end "swipe adds the track and the
@@ -245,6 +245,156 @@ class SwipeToQueueTest {
                 mediaIds = listOf("c", "m1", "m2"),
                 isPlayNext = listOf(false, true, true),
                 trackIds = listOf("c", "t", "t")
+            )
+        )
+    }
+
+    // Queue undo lookup: the swipe now adds with addToQueue (FIFO at the tail of
+    // the user block), so its undo targets the LAST queue-flagged copy past
+    // current. FIFO inserts land after the block, so the just-added copy is the
+    // newest one — the mirror image of undoIndex, which takes the FIRST Play
+    // Next (LIFO front-insert).
+
+    // Queue shapes: C = current, N = Play Next, Q = session Queue, R = radio.
+    private fun queueUndo(
+        mediaIds: List<String>,
+        isQueue: List<Boolean>,
+        trackIds: List<String?>,
+        current: String? = "c",
+        target: String? = "t"
+    ) = SwipeToQueue.queueUndoIndex(mediaIds, isQueue, trackIds, current, target)
+
+    @Test
+    fun `queue undo finds the added track past current`() {
+        assertEquals(
+            1, queueUndo(
+                mediaIds = listOf("c", "m1"),
+                isQueue = listOf(false, true),
+                trackIds = listOf("c", "t")
+            )
+        )
+    }
+
+    @Test
+    fun `queue undo skips radio between current and the add`() {
+        // [C, R, Q(t)] — radio sits between current and the user block.
+        assertEquals(
+            2, queueUndo(
+                mediaIds = listOf("c", "r", "m1"),
+                isQueue = listOf(false, false, true),
+                trackIds = listOf("c", "r", "t")
+            )
+        )
+    }
+
+    @Test
+    fun `queue undo skips a play next with the same track id`() {
+        // [C, N(t), Q(t)] — a Play Next copy of the same track is not the add.
+        assertEquals(
+            2, queueUndo(
+                mediaIds = listOf("c", "m0", "m1"),
+                isQueue = listOf(false, false, true),
+                trackIds = listOf("c", "t", "t")
+            )
+        )
+    }
+
+    @Test
+    fun `queue undo skips a queue copy with the wrong track id`() {
+        // [C, Q(other), Q(t)] — an older queue entry is not the just-added one.
+        assertEquals(
+            2, queueUndo(
+                mediaIds = listOf("c", "m0", "m1"),
+                isQueue = listOf(false, true, true),
+                trackIds = listOf("c", "other", "t")
+            )
+        )
+    }
+
+    @Test
+    fun `queue undo of duplicates takes the last`() {
+        // FIFO lands after the block, so the newest copy of a re-swiped track is
+        // the last one — the opposite of undoIndex's "takes the first".
+        assertEquals(
+            2, queueUndo(
+                mediaIds = listOf("c", "m1", "m2"),
+                isQueue = listOf(false, true, true),
+                trackIds = listOf("c", "t", "t")
+            )
+        )
+    }
+
+    @Test
+    fun `queue undo ignores queue copies at or before current`() {
+        // Stale copy before current must never win over the fresh one past it.
+        assertEquals(
+            2, queueUndo(
+                mediaIds = listOf("m0", "c", "m1"),
+                isQueue = listOf(true, false, true),
+                trackIds = listOf("t", "c", "t")
+            )
+        )
+    }
+
+    @Test
+    fun `queue undo with unknown current searches from the head`() {
+        assertEquals(
+            1, queueUndo(
+                mediaIds = listOf("m1", "m2"),
+                isQueue = listOf(true, true),
+                trackIds = listOf("t", "t"),
+                current = null
+            )
+        )
+    }
+
+    @Test
+    fun `queue undo with a consumed current searches from the head`() {
+        assertEquals(
+            0, queueUndo(
+                mediaIds = listOf("m1"),
+                isQueue = listOf(true),
+                trackIds = listOf("t"),
+                current = "gone"
+            )
+        )
+    }
+
+    @Test
+    fun `queue undo misses when the add has not landed yet`() {
+        assertNull(
+            queueUndo(
+                mediaIds = listOf("c", "r"),
+                isQueue = listOf(false, false),
+                trackIds = listOf("c", "r")
+            )
+        )
+    }
+
+    @Test
+    fun `queue undo misses on an empty queue`() {
+        assertNull(queueUndo(emptyList(), emptyList(), emptyList()))
+    }
+
+    @Test
+    fun `queue undo misses when current is last`() {
+        assertNull(
+            queueUndo(
+                mediaIds = listOf("r", "c"),
+                isQueue = listOf(false, false),
+                trackIds = listOf("r", "c")
+            )
+        )
+    }
+
+    @Test
+    fun `queue undo of a non-track add takes the last queue copy`() {
+        assertEquals(
+            2, queueUndo(
+                mediaIds = listOf("c", "m0", "m1"),
+                isQueue = listOf(false, true, true),
+                trackIds = listOf("c", "x", "y"),
+                target = null
             )
         )
     }

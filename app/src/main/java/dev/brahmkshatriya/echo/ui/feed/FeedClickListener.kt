@@ -231,7 +231,10 @@ open class FeedClickListener(
         if (extensionId == null) return notFoundSnack(R.string.extension)
         if (track == null) return notFoundSnack(R.string.track)
         val vm by fragment.activityViewModels<PlayerViewModel>()
-        vm.addToNext(extensionId, track, false)
+        // Swipe means Queue (FIFO at the tail of the user block, before generated
+        // radio), not Play Next — the menu keeps Play Next. Undo lives on this
+        // snackbar only; see PlayerViewModel.addToQueue.
+        vm.addToQueue(extensionId, track, false, undoable = true)
         return true
     }
 }
