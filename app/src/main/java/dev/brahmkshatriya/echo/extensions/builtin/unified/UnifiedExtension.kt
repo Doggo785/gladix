@@ -75,6 +75,11 @@ class UnifiedExtension(
     companion object {
         const val UNIFIED_ID = "unified"
         const val EXTENSION_ID = "extension_id"
+        // Must match DeezerArtistClient.LIKED_COUNT_EXTRA — the count travels in the
+        // liked card's extras so the localized title can carry it ("Titres likés (12)").
+        // Kept as a duplicated string (not a shared const) because the app module must
+        // not depend on the sideloadable extension's internals.
+        private const val LIKED_COUNT_EXTRA = "liked_count"
         val metadata = Metadata(
             "UnifiedExtension",
             "",
@@ -577,8 +582,46 @@ class UnifiedExtension(
         val extension = extensions().get(id)
         return extension.client<ArtistClient, Feed<Shelf>> {
             loadFeed(artist).injectExtensionId(extension)
+        }.localizeLikedTitle()
+    }
+
+    /**
+     * Dresses the per-artist liked menu with the localized title plus a count subtitle.
+     *
+     * The Deezer extension has no Context so it emits the English fallback title and no
+     * subtitle; the offline extension already titles via Context. Both use a stable id
+     * scheme ("liked_<artistId>" Deezer, "<artistId>_liked" offline — see
+     * DeezerArtistClient) and carry the count in the "liked_count" extra, which are the
+     * only signals used here, never the title text.
+     * Top-level shelves only: the liked menu is never nested inside a Category.
+     */
+    private fun Feed<Shelf>.localizeLikedTitle(): Feed<Shelf> {
+        val title = context.getString(R.string.liked_music)
+        return copy(getPagedData = { tab ->
+            val (data, buttons, bg) = getPagedData(tab)
+            data.map { result ->
+                result.getOrThrow().map { it.withLikedTitle(title) }
+            }.toFeedData(buttons, bg)
+        })
+    }
+
+    private fun Shelf.withLikedTitle(title: String): Shelf {
+        if (!isLikedShelfId(id)) return this
+        val count = extras[LIKED_COUNT_EXTRA]?.toIntOrNull()
+        val subtitle = count?.let {
+            context.resources.getQuantityString(R.plurals.number_tracks, it, it)
+        }
+        return when (this) {
+            is Shelf.Lists.Tracks -> copy(title = title, subtitle = subtitle)
+            is Shelf.Lists.Items -> copy(title = title, subtitle = subtitle)
+            is Shelf.Lists.Categories -> copy(title = title, subtitle = subtitle)
+            is Shelf.Category -> copy(title = title, subtitle = subtitle)
+            is Shelf.Item -> this
         }
     }
+
+    private fun isLikedShelfId(id: String) =
+        id.startsWith("liked_") || id.endsWith("_liked")
 
     override suspend fun loadPlaylist(playlist: Playlist): Playlist {
         val extId = playlist.extras.extensionId
@@ -787,6 +830,18 @@ class UnifiedExtension(
     override suspend fun isItemLiked(item: EchoMediaItem): Boolean {
         if (item !is Track) throw ClientException.NotSupported("IsItemLiked only supports Track")
         return db.isLiked(item)
+    }
+
+    /**
+     * Forwards the manual-refresh bust to every sub-extension holding a likes cache
+     * (Deezer's session snapshot). Best-effort per extension: one failing or outdated
+     * sub-extension must not block the others, and Unified's own Liked playlist needs
+     * no bust — it reads the live DB on every load.
+     */
+    override suspend fun bustLikedCache() {
+        extensions().forEach { ext ->
+            runCatching { ext.clientOrNull<LikeClient, Unit> { bustLikedCache() } }
+        }
     }
 
     override suspend fun hideItem(item: EchoMediaItem, shouldHide: Boolean) {

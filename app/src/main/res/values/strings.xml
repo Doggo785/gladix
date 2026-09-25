@@ -51,6 +51,7 @@
     </plurals>
     <string name="playlist_liked">Liked</string>
     <string name="playlist_liked_desc">Your liked tracks</string>
+    <string name="liked_music">Liked Music</string>
     <string name="unknown">Unknown</string>
     <string name="like">Like</string>
     <string name="unlike">Unlike</string>
