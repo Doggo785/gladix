@@ -369,7 +369,11 @@ class DeezerExtension : HomeFeedClient, TrackClient, LikeClient, RadioClient,
         val now = System.currentTimeMillis()
         if (!forceRefresh && cached != null && now - cached.first < LIKED_TTL_MS) return cached.second
         val data = api.getTracks()["results"]?.jsonObject?.get("data")?.jsonArray
-            ?: throw Exception("Failed to load liked tracks")
+            // IllegalStateException, not Exception: the gateway answered with an error
+            // body instead of results.data, i.e. a broken contract, not a generic failure.
+            // (Codacy ErrorProne flags a bare Exception here.) The caller swallows it
+            // into "no liked menu" either way.
+            ?: throw IllegalStateException("Failed to load liked tracks")
         val fresh = data.filterIsInstance<JsonObject>()
         likedEntriesCache = now to fresh
         return fresh
