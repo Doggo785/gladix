@@ -1,3 +1,11 @@
+### Moved to Evoe
+
+This fork is archived and read-only. Continue at https://github.com/Doggo785/evoe.
+
+Evoe has its own name and package name, no fork link, and takes upstream commits only when needed. Thanks to Echo for the base player and to rschwertley for the Gladix work on Deezer, Auto, TV, and playback.
+
+---
+
 # Gladix
 
 A personal Android music player — a fork of [Echo](https://github.com/brahmkshatriya/echo) by brahmkshatriya, with the Deezer extension bundled and substantial work on Android Auto, Android TV, playback stability and everyday UX.
